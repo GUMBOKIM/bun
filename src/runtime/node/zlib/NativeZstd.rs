@@ -109,7 +109,7 @@ mod _impl {
             this_value: JsWrapper<'_, Self>,
             cx: &mut JsScope<'_>,
             init_params_array: JsLocal<'_>,
-            pledged_src_size: JsLocal<'_>,
+            pledged_src_size: Option<f64>,
             write_state: JsLocal<'_>,
             process_callback: JsLocal<'_>,
             dictionary: JsLocal<'_>,
@@ -121,7 +121,6 @@ mod _impl {
             self.throw_unless_idle(global)?;
 
             let init_params_array_value = init_params_array.to_js();
-            let pledged_src_size_value = pledged_src_size.to_js();
             let write_state_value = write_state.to_js();
             let process_callback_value = process_callback.to_js();
 
@@ -160,15 +159,29 @@ mod _impl {
                 write_js_callback.with_async_context_if_needed(global),
             );
 
-            let mut pledged_src_size: u64 = u64::MAX;
-            if pledged_src_size_value.is_number() {
-                pledged_src_size = u64::from(validators::validate_uint32(
-                    global,
-                    pledged_src_size_value,
-                    format_args!("pledgedSrcSize"),
-                    false,
-                )?);
-            }
+            // Node's messages: https://github.com/nodejs/node/blob/v26.12.1/src/node_zlib.cc#L1007-L1026
+            let pledged_src_size: u64 = match pledged_src_size {
+                None => u64::MAX,
+                Some(size) => {
+                    if size.trunc() != size || size.abs() > jsc::MAX_SAFE_INTEGER as f64 {
+                        return Err(global
+                            .err(
+                                jsc::ErrorCode::OUT_OF_RANGE,
+                                format_args!("pledgedSrcSize must be a safe integer"),
+                            )
+                            .throw());
+                    }
+                    if size < 0.0 {
+                        return Err(global
+                            .err(
+                                jsc::ErrorCode::OUT_OF_RANGE,
+                                format_args!("pledgedSrcSize must be non-negative"),
+                            )
+                            .throw());
+                    }
+                    size as u64
+                }
+            };
 
             // Bind the ArrayBuffer view to a local so the borrowed byte_slice()
             // outlives the `stream.init` call below (E0716 otherwise).
@@ -244,7 +257,11 @@ mod _impl {
     }
 
     enum State {
-        Compress(OwnedCCtx),
+        Compress {
+            cctx: OwnedCCtx,
+            /// Input that the first frame has taken. `None` without a pledge, and after that frame ends.
+            consumed_src_size: Option<u64>,
+        },
         Decompress(OwnedDCtx),
     }
 
@@ -334,7 +351,10 @@ mod _impl {
                             c"ERR_ZLIB_INITIALIZATION_FAILED".as_ptr(),
                         );
                     }
-                    self.state = Some(State::Compress(state));
+                    self.state = Some(State::Compress {
+                        cctx: state,
+                        consumed_src_size: (pledged_src_size != u64::MAX).then_some(0),
+                    });
                     Error::OK
                 }
                 NodeMode::ZSTD_DECOMPRESS => {
@@ -362,7 +382,7 @@ mod _impl {
         pub(crate) fn set_params(&mut self, key: c_uint, value: u32) -> Error {
             let result = match &self.state {
                 // SAFETY: FFI — `cctx` is live.
-                Some(State::Compress(cctx)) => unsafe {
+                Some(State::Compress { cctx, .. }) => unsafe {
                     c::ZSTD_CCtx_setParameter(cctx.as_ptr(), key, value as c_int)
                 },
                 // SAFETY: FFI — `dctx` is live.
@@ -437,27 +457,44 @@ mod _impl {
         }
 
         pub(crate) fn do_work(&mut self) {
-            self.remaining = match &self.state {
+            self.remaining = match &mut self.state {
                 // Driven before `init()`.
                 None => return,
-                // SAFETY: input/output point to caller-kept-alive buffers (set_buffers).
-                Some(State::Compress(cctx)) => unsafe {
-                    c::ZSTD_compressStream2(
-                        cctx.as_ptr(),
-                        &raw mut self.output,
-                        &raw mut self.input,
-                        // cast c_int → ZSTD_EndDirective (c_uint)
-                        self.flush as c_uint,
-                    )
-                },
-                Some(State::Decompress(dctx)) => {
-                    // SAFETY: as above.
-                    let mut ret = unsafe {
-                        c::ZSTD_decompressStream(
-                            dctx.as_ptr(),
+                Some(State::Compress {
+                    cctx,
+                    consumed_src_size,
+                }) => {
+                    let input_pos = self.input.pos;
+                    // SAFETY: input/output point to caller-kept-alive buffers (set_buffers).
+                    let mut remaining = unsafe {
+                        c::ZSTD_compressStream2(
+                            cctx.as_ptr(),
                             &raw mut self.output,
                             &raw mut self.input,
+                            // cast c_int → ZSTD_EndDirective (c_uint)
+                            self.flush as c_uint,
                         )
+                    };
+                    // zstd does not compare the pledge with the input if a frame's first call is ZSTD_e_end (nodejs/node#64601), nor for a frame of several worker jobs.
+                    if let Some(consumed) = *consumed_src_size {
+                        let consumed = consumed + (self.input.pos - input_pos) as u64;
+                        if remaining == 0 && self.flush as c_uint == c::ZSTD_e_end {
+                            *consumed_src_size = None;
+                            if consumed != self.pledged_src_size {
+                                // zstd's ERROR(): an error result is the negated code.
+                                remaining = (c::ZSTD_error_srcSize_wrong as usize).wrapping_neg();
+                            }
+                        } else {
+                            *consumed_src_size = Some(consumed);
+                        }
+                    }
+                    remaining
+                }
+                Some(State::Decompress(dctx)) => {
+                    let dctx = dctx.as_ptr();
+                    // SAFETY: as above.
+                    let mut ret = unsafe {
+                        c::ZSTD_decompressStream(dctx, &raw mut self.output, &raw mut self.input)
                     };
                     // ret == 0 is frame-complete; mirrors NativeZlib::do_work_inflate's GUNZIP loop.
                     while ret == 0
@@ -467,7 +504,7 @@ mod _impl {
                         // SAFETY: as above.
                         ret = unsafe {
                             c::ZSTD_decompressStream(
-                                dctx.as_ptr(),
+                                dctx,
                                 &raw mut self.output,
                                 &raw mut self.input,
                             )
