@@ -38,6 +38,7 @@ use super::cares_jsc::error_to_deferred;
 use crate::generated_bindgen::dns::LookupOptions;
 use crate::generated_bindgen::dns_internals::ResolverOptions;
 use crate::socket::socket_address::inet::INET6_ADDRSTRLEN;
+use crate::socket::socket_address::parse_ip_address;
 use crate::timer::{EventLoopTimer, EventLoopTimerState, EventLoopTimerTag};
 use bun_cares_sys::c_ares_draft as c_ares;
 
@@ -1396,8 +1397,9 @@ pub(crate) mod internal {
         (0..len)
             .map(|i| {
                 let address = addresses.get_index(global, i as u32)?.to_utf8(global)?;
-                match bun_core::ip_address::to_ip_address(address.slice()) {
-                    Some(ip) => Ok(Address::from_ip(ip, 0)),
+                // The parse of the connect paths: a `%zone` becomes the scope id.
+                match parse_ip_address(address.slice(), 0) {
+                    Some(addr) => Ok(addr),
                     None => Err(global.throw_invalid_arguments(format_args!(
                         "addresses[{i}] is not an IPv4 or IPv6 literal"
                     ))),
@@ -2076,6 +2078,14 @@ impl RecordType {
     pub(crate) const DEFAULT: Self = RecordType::A;
 }
 
+/// `ip` without the `%zone` that a socket prints after a link-local address: c-ares reads none.
+fn without_zone(ip: &[u8]) -> &[u8] {
+    match strings::index_of_char_usize(ip, b'%') {
+        Some(zone) => &ip[..zone],
+        None => ip,
+    }
+}
+
 /// Non-NaN, integer-truncated `0..=65535`, else `ERR_SOCKET_BAD_PORT`.
 fn to_port_number(double: f64, global: &JSGlobalObject) -> JsResult<u16> {
     if double.is_nan() {
@@ -2555,7 +2565,7 @@ impl Resolver {
         let Some(query) = query else {
             return Ok(promise);
         };
-        channel.get_host_by_addr(ip, Box::new(query));
+        channel.get_host_by_addr(without_zone(ip), Box::new(query));
 
         // SAFETY: `bun_vm()` returns the live VM back-ptr.
         self.request_sent(global_this.bun_vm());
@@ -3177,7 +3187,7 @@ impl Resolver {
         let port: u16 = to_port_number(port_value, global_this)?;
 
         let mut buf = [0u8; 128];
-        let ip = strings::copy_z(&mut buf, addr_s).and_then(|text| {
+        let ip = strings::copy_z(&mut buf, without_zone(addr_s)).and_then(|text| {
             let v4 = bun_cares_sys::pton::<4>(text).map(IpAddr::from);
             v4.or_else(|| bun_cares_sys::pton::<16>(text).map(IpAddr::from))
         });
