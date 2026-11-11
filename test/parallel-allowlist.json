@@ -1902,6 +1902,6 @@
     "aot/a-constructor-inside-what-an-entry-exports-keeps-its-features.test.ts",
     "aot/order-file.test.ts",
     "aot/type-errors-that-several-projects-are-asked-about.test.ts",
-    "aot/a-spy-on-the-length-or-name-of-a-function-stays-and-is-what-bind-reads.test.ts"
+    "aot/a-spy-on-what-a-compiled-function-answers-for-but-does-not-store.test.ts"
   ]
 }
