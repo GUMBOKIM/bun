@@ -34,6 +34,17 @@ pub enum Encoding {
     Repeat = 3,
 }
 
+impl Encoding {
+    pub(crate) fn from_low_bits(bits: u8) -> Self {
+        match bits & 3 {
+            0 => Self::Basic,
+            1 => Self::Rle,
+            2 => Self::Compressed,
+            _ => Self::Repeat,
+        }
+    }
+}
+
 pub const MIN_MATCH: u32 = 3;
 pub const INITIAL_REPEAT_OFFSETS: [u32; 3] = [1, 4, 8];
 /// Sequence counts from here on take 3 bytes.
@@ -67,13 +78,13 @@ pub const MATCH_LENGTH_BITS: [u8; MAX_MATCH_LENGTH_CODE + 1] = [
 ];
 
 /// A predefined distribution. -1 is a probability of less than 1.
-pub struct Distribution {
-    pub counts: &'static [i16],
+pub struct Distribution<'a> {
+    pub counts: &'a [i16],
     pub table_log: u32,
 }
 
 #[rustfmt::skip]
-pub const DEFAULT_LITERAL_LENGTHS: Distribution = Distribution {
+pub const DEFAULT_LITERAL_LENGTHS: Distribution<'static> = Distribution {
     counts: &[
         4, 3, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1,
         2, 2, 2, 2, 2, 2, 2, 2, 2, 3, 2, 1, 1, 1, 1, 1,
@@ -83,7 +94,7 @@ pub const DEFAULT_LITERAL_LENGTHS: Distribution = Distribution {
 };
 
 #[rustfmt::skip]
-pub const DEFAULT_MATCH_LENGTHS: Distribution = Distribution {
+pub const DEFAULT_MATCH_LENGTHS: Distribution<'static> = Distribution {
     counts: &[
         1, 4, 3, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1,
         1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
@@ -94,7 +105,7 @@ pub const DEFAULT_MATCH_LENGTHS: Distribution = Distribution {
 };
 
 #[rustfmt::skip]
-pub const DEFAULT_OFFSETS: Distribution = Distribution {
+pub const DEFAULT_OFFSETS: Distribution<'static> = Distribution {
     counts: &[
         1, 1, 1, 1, 1, 1, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1,
         1, 1, 1, 1, 1, 1, 1, 1, -1, -1, -1, -1, -1,

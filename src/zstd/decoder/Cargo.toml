@@ -11,3 +11,7 @@ workspace = true
 
 # None: JavaScriptCore's test programs link this crate without the rest of Bun.
 [dependencies]
+
+[[test]]
+name = "decode"
+path = "tests/decode.rs"

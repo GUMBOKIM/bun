@@ -10,13 +10,33 @@
 )]
 #![warn(unused_must_use)]
 
+mod array;
+mod bits;
+mod block;
 mod cpu;
+mod decompress;
+mod dictionary;
 mod error;
 pub mod format;
+mod frame;
+mod fse;
+mod huffman;
+mod literals;
 mod output;
+mod sequence_tables;
+mod sequences;
+mod stream;
 mod xxhash;
 
 pub use cpu::with_bmi2;
+pub use decompress::decompress;
+pub use dictionary::Dictionary;
 pub use error::{Error, Result};
+pub use frame::{
+    ContentSize, FrameLen, decompressed_size, frame_content_size, frame_len, may_start_frame,
+};
+pub use fse::{TableDescription, read_normalized_counts};
+pub use huffman::{HuffmanWeights, read_huffman_weights};
 pub use output::Output;
+pub use stream::{Decoder, Status};
 pub use xxhash::XxHash64;

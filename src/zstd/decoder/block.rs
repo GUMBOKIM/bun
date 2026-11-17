@@ -1,0 +1,193 @@
+//! Compressed blocks, and what one leaves for the next.
+
+use crate::cpu::with_bmi2;
+use crate::dictionary::{Dictionary, Entropy};
+use crate::error::{Error, Result};
+use crate::format::{Encoding, INITIAL_REPEAT_OFFSETS, LONG_SEQUENCE_COUNT};
+use crate::huffman::HuffmanTable;
+use crate::literals::{LITERALS_PADDING, LiteralsHeader};
+use crate::sequence_tables::{Kind, PREDEFINED_TABLES, SequenceTables};
+use crate::sequences::{Destination, run_sequences};
+
+/// Where the table is that a block can repeat.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+enum Source {
+    #[default]
+    None,
+    Predefined,
+    Dictionary,
+    Own,
+}
+
+/// Asks for memory when a block takes it.
+#[derive(Default)]
+pub(crate) struct BlockDecoder {
+    literals: Vec<u8>,
+    huffman: HuffmanTable,
+    huffman_source: Source,
+    /// One at most.
+    sequence_tables: Vec<SequenceTables>,
+    /// By [`Kind`].
+    sequence_sources: [Source; 3],
+    repeat_offsets: [u32; 3],
+}
+
+/// The number of sequences, and how many bytes it takes.
+fn read_sequence_count(section: &[u8]) -> Result<(usize, usize)> {
+    match *section {
+        [count @ ..0x80, ..] => Ok((count.into(), 1)),
+        [high @ 0x80..=0xFE, low, ..] => Ok((usize::from(high - 0x80) << 8 | usize::from(low), 2)),
+        [0xFF, low, high, ..] => Ok((
+            usize::from(u16::from_le_bytes([low, high])) + LONG_SEQUENCE_COUNT,
+            3,
+        )),
+        _ => Err(Error::SrcSizeWrong),
+    }
+}
+
+impl BlockDecoder {
+    /// All blocks of the frame go with the same `dictionary`.
+    pub(crate) fn start_frame(&mut self, dictionary: Option<&Dictionary<'_>>) {
+        let entropy = dictionary.and_then(Dictionary::entropy);
+        let source = entropy.map_or(Source::None, |_| Source::Dictionary);
+        self.huffman_source = source;
+        self.sequence_sources = [source; 3];
+        self.repeat_offsets = entropy.map_or(INITIAL_REPEAT_OFFSETS, |it| it.repeat_offsets);
+    }
+
+    /// Returns how many bytes it wrote.
+    pub(crate) fn decode(
+        &mut self,
+        block: &[u8],
+        dictionary: Option<&Dictionary<'_>>,
+        mut destination: Destination<'_, '_>,
+    ) -> Result<usize> {
+        let entropy = dictionary.and_then(Dictionary::entropy);
+        let has_table = self.huffman_source != Source::None;
+        let (len_max, room) = (destination.block_len_max, destination.out.room());
+        let header = LiteralsHeader::read(block, has_table, len_max, room)?;
+        let section = block.get(header.section_len..).ok_or(Error::Internal)?;
+        let has_only_literals = section == [0];
+
+        let literals = match header.in_place(block) {
+            Some(literals) => literals,
+            None => {
+                let padded = if has_only_literals {
+                    let written = destination.out.written();
+                    (destination.out).lend_with_slack(written, header.count, header.count)
+                } else {
+                    header.room_in(&mut self.literals)?
+                };
+                let out = padded.get_mut(..header.count).ok_or(Error::Internal)?;
+                let (own, source) = (&mut self.huffman, self.huffman_source);
+                with_bmi2(
+                    #[inline(always)]
+                    || {
+                        let start = header.read_tree(block, own)?;
+                        let table = match entropy {
+                            Some(entropy) if source == Source::Dictionary && !header.has_tree() => {
+                                &entropy.huffman
+                            }
+                            _ => own,
+                        };
+                        header.decode(block, start, table, out)
+                    },
+                )?;
+                if header.has_tree() {
+                    self.huffman_source = Source::Own;
+                }
+                if has_only_literals {
+                    destination.out.commit(header.count);
+                    return Ok(header.count);
+                }
+                (self.literals.get(..header.count + LITERALS_PADDING)).ok_or(Error::Internal)?
+            }
+        };
+
+        let (count, count_len) = read_sequence_count(section)?;
+        let descriptions = section.get(count_len..).ok_or(Error::Internal)?;
+        let (mut len, mut last_literals) = (0, literals);
+        if count != 0 {
+            let (own, sources) = (&mut self.sequence_tables, &mut self.sequence_sources);
+            let (tables, stream) = select_tables(descriptions, own, sources, entropy)?;
+            if room == 0 {
+                return Err(Error::DstSizeTooSmall);
+            }
+            let start = block.len() - stream.len();
+            let offsets = &mut self.repeat_offsets;
+            (len, last_literals) = run_sequences(
+                tables,
+                block,
+                start,
+                count,
+                literals,
+                offsets,
+                &mut destination,
+            )?;
+        } else if !descriptions.is_empty() {
+            return Err(Error::CorruptionDetected);
+        }
+        let padding = last_literals.split_last_chunk::<LITERALS_PADDING>();
+        let (last_literals, _) = padding.ok_or(Error::Internal)?;
+        destination.check_block_len(len + last_literals.len())?;
+        destination.out.commit(len);
+        destination.out.append(last_literals);
+        Ok(len + last_literals.len())
+    }
+}
+
+/// Returns the tables, and what follows their descriptions in `src`.
+fn select_tables<'t, 's>(
+    src: &'s [u8],
+    own: &'t mut Vec<SequenceTables>,
+    sources: &mut [Source; 3],
+    entropy: Option<&'t Entropy>,
+) -> Result<(&'t SequenceTables, &'s [u8])> {
+    let (&modes, mut src) = src.split_first().ok_or(Error::SrcSizeWrong)?;
+    if modes & 3 != 0 {
+        return Err(Error::CorruptionDetected);
+    }
+    let encodings = [6, 4, 2].map(|shift| Encoding::from_low_bits(modes >> shift));
+    for (source, encoding) in sources.iter_mut().zip(encodings) {
+        *source = match encoding {
+            Encoding::Basic => Source::Predefined,
+            Encoding::Repeat if *source == Source::None => return Err(Error::CorruptionDetected),
+            Encoding::Repeat => *source,
+            Encoding::Rle | Encoding::Compressed => Source::Own,
+        };
+    }
+    let shared = |source| match source {
+        Source::Predefined => Some(&PREDEFINED_TABLES),
+        Source::Dictionary => entropy.map(|entropy| &entropy.sequences),
+        _ => None,
+    };
+    let [first, second, third] = *sources;
+    if let Some(tables) = shared(first).filter(|_| first == second && second == third) {
+        return Ok((tables, src));
+    }
+
+    if own.is_empty() {
+        own.try_reserve_exact(1)?;
+        own.push(SequenceTables::EMPTY);
+    }
+    let own = own.first_mut().ok_or(Error::Internal)?;
+    for ((kind, encoding), source) in Kind::ALL.into_iter().zip(encodings).zip(sources) {
+        let len = match encoding {
+            Encoding::Compressed => with_bmi2(
+                #[inline(always)]
+                || own.read(kind, src),
+            )?,
+            Encoding::Rle => {
+                own.set_rle(kind, *src.first().ok_or(Error::CorruptionDetected)?)?;
+                1
+            }
+            _ => 0,
+        };
+        src = src.get(len..).ok_or(Error::Internal)?;
+        if let Some(tables) = shared(*source) {
+            own.copy_from(tables, kind);
+        }
+        *source = Source::Own;
+    }
+    Ok((own, src))
+}

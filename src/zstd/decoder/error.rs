@@ -46,6 +46,14 @@ errors! {
     NoForwardProgressInputEmpty = 82, c"ZSTD_error_noForwardProgress_inputEmpty", c"Operation made no progress over multiple calls, due to input being empty";
 }
 
+impl core::fmt::Display for Error {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(self.message().to_str().unwrap_or_default())
+    }
+}
+
+impl core::error::Error for Error {}
+
 impl From<std::collections::TryReserveError> for Error {
     fn from(_: std::collections::TryReserveError) -> Self {
         Self::MemoryAllocation
