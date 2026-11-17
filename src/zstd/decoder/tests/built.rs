@@ -456,6 +456,21 @@ fn long_lengths() -> Result<()> {
 }
 
 #[test]
+fn long_matches_of_long_periods() -> Result<()> {
+    let mut frame = Frame::new(17, Vec::new());
+    frame.raw(&Noise(8).bytes(9000));
+    for offset in [1, 20, 513, 2047, 2048, 2049, 4097, 8999] {
+        let sequence = Sequence {
+            literal_len: 3,
+            offset_value: offset + 3,
+            match_len: 20_000,
+        };
+        frame.compressed(&raw(Noise(9).bytes(12)), &[sequence; 4]);
+    }
+    frame.check()
+}
+
+#[test]
 #[cfg_attr(miri, ignore = "takes tens of megabytes")]
 fn far_matches() -> Result<()> {
     let mut noise = Noise(6);

@@ -90,7 +90,7 @@ pub(crate) struct State {
 }
 
 /// The rows of a decoding table, from the first. `PADDED` is 8 more than there can be.
-pub(crate) struct States<const PADDED: usize, const SYMBOLS_MAX: usize> {
+pub(crate) struct Spread<const PADDED: usize, const SYMBOLS_MAX: usize> {
     symbols: [u8; PADDED],
     /// Where in `symbols` that of the next row is, modulo the size of the table.
     index: usize,
@@ -100,7 +100,7 @@ pub(crate) struct States<const PADDED: usize, const SYMBOLS_MAX: usize> {
     ranks: [u16; SYMBOLS_MAX],
 }
 
-impl<const PADDED: usize, const SYMBOLS_MAX: usize> States<PADDED, SYMBOLS_MAX> {
+impl<const PADDED: usize, const SYMBOLS_MAX: usize> Spread<PADDED, SYMBOLS_MAX> {
     const MAX: usize = PADDED - 8;
     pub(crate) const EMPTY: Self = Self {
         symbols: [0; _],
@@ -113,7 +113,7 @@ impl<const PADDED: usize, const SYMBOLS_MAX: usize> States<PADDED, SYMBOLS_MAX> 
     /// To be called on [`Self::EMPTY`]. `counts` add up to `1 << table_log`, which is at most [`Self::MAX`].
     #[inline(always)]
     #[expect(clippy::indexing_slicing, reason = "below the lengths")]
-    pub(crate) const fn spread(&mut self, counts: &[i16], table_log: u32) {
+    pub(crate) const fn fill(&mut self, counts: &[i16], table_log: u32) {
         let size = 1 << table_log;
         let step = fse_table_step(size);
         let Self { symbols, ranks, .. } = self;

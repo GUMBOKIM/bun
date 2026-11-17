@@ -14,7 +14,7 @@ const CREDIBLE_SIZE: u64 = 16 << 20;
 /// ...or this many times what has turned out to be there.
 const CREDIBLE_FACTOR: u64 = 8;
 const STAND_IN_LEN: usize = 1024;
-/// More output than this is not moved to make room for the overshoot.
+/// More output than this is not moved to make room for the overshoot, and does not double if its end is in sight.
 const CHEAP_TO_MOVE: usize = 1 << 20;
 
 pub(crate) struct Destination<'o, 'a> {
@@ -28,6 +28,8 @@ pub(crate) struct Destination<'o, 'a> {
     room: usize,
     /// How long the block can get.
     limit: usize,
+    /// As far as is known.
+    pub(crate) is_last_frame: bool,
 }
 
 pub(crate) struct Loan<'a> {
@@ -47,6 +49,7 @@ impl<'o, 'a> Destination<'o, 'a> {
     ) -> Self {
         Self {
             room,
+            is_last_frame: false,
             limit: frame.block_len_max().min(room),
             out,
             frame,
@@ -77,7 +80,7 @@ impl<'o, 'a> Destination<'o, 'a> {
     /// Ends the block with `bytes`, behind `len` bytes of what was lent. Returns its length.
     pub(crate) fn finish(mut self, len: usize, bytes: &[u8]) -> Result<usize> {
         self.check_block_len(len + bytes.len())?;
-        self.reserve(len + bytes.len())?;
+        self.reserve(len + bytes.len(), len + bytes.len())?;
         self.out.commit(len);
         Ok(len + self.out.append(bytes))
     }
@@ -85,22 +88,28 @@ impl<'o, 'a> Destination<'o, 'a> {
     /// `content` is that of an RLE block.
     pub(crate) fn finish_repeated(mut self, content: &[u8], count: usize) -> Result<usize> {
         self.check_block_len(count)?;
-        self.reserve(count)?;
+        self.reserve(count, count)?;
         (self.out).append_repeated(*content.first().ok_or(Error::Internal)?, count);
         Ok(count)
     }
 
-    /// For `len` bytes from the start of the block on.
+    /// For `len` bytes from the start of the block on. If that takes more memory, for `wanted`, or the rest of the frame.
     #[inline]
-    fn reserve(&mut self, len: usize) -> Result<()> {
+    fn reserve(&mut self, len: usize, wanted: usize) -> Result<()> {
         if !self.out.grows() || len <= self.out.reserved_room() {
             return Ok(());
         }
         let written = self.history_len as u64;
         let credible = CREDIBLE_SIZE.max(written.saturating_mul(CREDIBLE_FACTOR));
         let size = self.frame.content_size.filter(|&size| size <= credible);
-        let left = size.map_or(0, |size| size.saturating_sub(written) as usize + OVERSHOOT);
-        self.out.reserve(len.max(left))
+        match size.map(|size| size.saturating_sub(written) as usize + OVERSHOOT) {
+            Some(left) if left < len => self.out.reserve(len),
+            Some(left) if self.is_last_frame && self.out.len_to_move() > CHEAP_TO_MOVE => {
+                self.out.reserve_exact(left)
+            }
+            Some(left) => self.out.reserve(left),
+            None => self.out.reserve(wanted),
+        }
     }
 
     /// Writes a sequence that fits behind the first `len` bytes of the block, and nothing behind it.
@@ -115,7 +124,7 @@ impl<'o, 'a> Destination<'o, 'a> {
         if end > self.limit {
             return Err(Error::Internal);
         }
-        self.reserve(end)?;
+        self.reserve(end, end)?;
         self.out.write_ahead(len, literals);
         len += literals.len();
         if let Some(distance @ 1..) = offset.checked_sub(self.history_len + len) {
@@ -183,16 +192,9 @@ impl<'o, 'a> Destination<'o, 'a> {
     /// With `len` bytes for the block, as far as it may go. If possible also `more`, and the overshoot.
     pub(crate) fn lend(&mut self, len: usize, more: usize) -> Result<Loan<'_>> {
         let wanted = (len + more).min(self.limit) + OVERSHOOT;
-        if self.out.grows() {
-            let overshoot = if self.out.len_to_move() <= CHEAP_TO_MOVE {
-                OVERSHOOT
-            } else {
-                0
-            };
-            if len.min(self.limit) + overshoot > self.out.reserved_room() {
-                self.reserve(wanted)?;
-            }
-        }
+        let is_cheap_to_move = self.out.len_to_move() <= CHEAP_TO_MOVE;
+        let overshoot = if is_cheap_to_move { OVERSHOOT } else { 0 };
+        self.reserve(len.min(self.limit) + overshoot, wanted)?;
         let detached_len = self.history_len - self.position();
         let lent = (self.out).lend_with_slack(self.history_len, wanted, self.limit + OVERSHOOT);
         let (detached, out) = lent

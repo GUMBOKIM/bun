@@ -34,7 +34,7 @@ fn decompress_frames(
             _ if !can_hold_headers(src) => return Err(Error::SrcSizeWrong),
             Ok(Header::Frame(header)) => {
                 is_first = false;
-                decompress_frame(&mut blocks, header, src, out, dictionary)?
+                decompress_frame(&mut blocks, header, src, false, out, dictionary)?
             }
             Ok(Header::Incomplete(_)) => return Err(Error::SrcSizeWrong),
             Err(Error::PrefixUnknown) if !is_first => return Err(Error::SrcSizeWrong),
@@ -54,11 +54,12 @@ pub(crate) fn check_dictionary(
     Ok(())
 }
 
-/// `src` starts with `header`. Returns what follows the frame.
+/// `src` starts with `header`. `is_last` is a hint. Returns what follows the frame.
 pub(crate) fn decompress_frame<'s>(
     blocks: &mut BlockDecoder,
     header: &FrameHeader,
     src: &'s [u8],
+    is_last: bool,
     out: &mut Output<'_>,
     dictionary: Option<&Dictionary<'_>>,
 ) -> Result<&'s [u8]> {
@@ -76,7 +77,8 @@ pub(crate) fn decompress_frame<'s>(
         let history_len = out.written() - history_start;
         let external = dictionary.map(Dictionary::history).unwrap_or_default();
         let room = out.room();
-        let destination = Destination::new(out, header, history_len, external, room);
+        let mut destination = Destination::new(out, header, history_len, external, room);
+        destination.is_last_frame = is_last;
         let len = match block.block_type() {
             BlockType::Compressed if content.len() > header.block_len_max() => {
                 Err(Error::SrcSizeWrong)

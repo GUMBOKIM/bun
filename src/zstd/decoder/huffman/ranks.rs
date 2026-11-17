@@ -1,3 +1,5 @@
+//! Sorting symbols by the length of their codes.
+
 use super::{HuffmanWeights, QUICK_LEN, QUICK_LOG};
 use crate::array::At;
 

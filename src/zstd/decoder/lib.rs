@@ -24,7 +24,6 @@ mod fse;
 mod huffman;
 mod literals;
 mod output;
-mod sequence_tables;
 mod sequences;
 mod stream;
 mod xxhash;

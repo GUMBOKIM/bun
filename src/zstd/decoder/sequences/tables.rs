@@ -11,34 +11,34 @@ use crate::format::{
     MATCH_LENGTH_BITS, MATCH_LENGTH_TABLE_LOG_MAX, MAX_LITERAL_LENGTH_CODE, MAX_MATCH_LENGTH_CODE,
     MAX_OFFSET_CODE, MIN_MATCH, OFFSET_TABLE_LOG_MAX,
 };
-use crate::fse::{States, read_counts};
+use crate::fse::{Spread, read_counts};
 
-/// More bits than a reader ever has, so that it takes care.
+/// More bits than a reader ever has, so that it goes on with care.
 const NEEDS_CARE: u8 = 128;
 
 #[derive(Clone, Copy)]
 #[repr(C, align(8))]
-pub(crate) struct LengthRow {
+pub(super) struct LengthRow {
     /// Of both kinds, plus [`NEEDS_CARE`] if the length may not fit in 16 bits.
-    pub(crate) total_bits: u8,
-    pub(crate) state_bits: Width,
-    pub(crate) extra_bits: Width,
+    pub(super) total_bits: u8,
+    pub(super) state_bits: Width,
+    pub(super) extra_bits: Width,
     /// To which `state_bits` are added.
-    pub(crate) next: u16,
+    pub(super) next: u16,
     /// To which `extra_bits` are added: the low bits of [`Self::full_base`].
-    pub(crate) base: u16,
+    pub(super) base: u16,
 }
 
 #[derive(Clone, Copy)]
 #[repr(C, align(8))]
-pub(crate) struct OffsetRow {
+pub(super) struct OffsetRow {
     /// Of both kinds, plus [`NEEDS_CARE`] if the offset may not fit in 31 bits.
-    pub(crate) total_bits: u8,
-    pub(crate) state_bits: Width,
-    pub(crate) extra_bits: Width,
-    pub(crate) next: u8,
+    pub(super) total_bits: u8,
+    pub(super) state_bits: Width,
+    pub(super) extra_bits: Width,
+    pub(super) next: u8,
     /// The sum is -2, -1 or 0 for a repeated offset.
-    pub(crate) base: i32,
+    pub(super) base: i32,
 }
 
 impl LengthRow {
@@ -54,7 +54,7 @@ impl LengthRow {
         }
     }
 
-    pub(crate) fn full_base(self) -> u32 {
+    pub(super) fn full_base(self) -> u32 {
         u32::from(self.base) | (self.extra_bits as u32 & 16) << 12
     }
 }
@@ -120,15 +120,15 @@ impl CodeKind {
     }
 }
 
-pub(crate) const LENGTH_ROWS: usize = 1 << LITERAL_LENGTH_TABLE_LOG_MAX;
+pub(super) const LENGTH_ROWS: usize = 1 << LITERAL_LENGTH_TABLE_LOG_MAX;
 const _: () = assert!(LITERAL_LENGTH_TABLE_LOG_MAX == MATCH_LENGTH_TABLE_LOG_MAX);
 
 /// One of each [`CodeKind`].
 #[repr(C)]
 pub(crate) struct SequenceTables {
-    pub(crate) literal_lengths: [LengthRow; LENGTH_ROWS],
-    pub(crate) match_lengths: [LengthRow; LENGTH_ROWS],
-    pub(crate) offsets: [OffsetRow; 1 << OFFSET_TABLE_LOG_MAX],
+    pub(super) literal_lengths: [LengthRow; LENGTH_ROWS],
+    pub(super) match_lengths: [LengthRow; LENGTH_ROWS],
+    pub(super) offsets: [OffsetRow; 1 << OFFSET_TABLE_LOG_MAX],
     logs: [u32; 3],
 }
 
@@ -157,7 +157,7 @@ impl SequenceTables {
     };
 
     #[inline(always)]
-    pub(crate) fn log(&self, kind: CodeKind) -> u32 {
+    pub(super) fn log(&self, kind: CodeKind) -> u32 {
         *self.logs.at(kind as usize)
     }
 
@@ -166,8 +166,8 @@ impl SequenceTables {
     const fn fill(&mut self, kind: CodeKind, distribution: &Distribution<'_>) {
         let log = distribution.table_log;
         self.logs[kind as usize] = log;
-        let mut states = States::<{ LENGTH_ROWS + 8 }, CODES_MAX>::EMPTY;
-        states.spread(distribution.counts, log);
+        let mut states = Spread::<{ LENGTH_ROWS + 8 }, CODES_MAX>::EMPTY;
+        states.fill(distribution.counts, log);
         macro_rules! fill {
             ($rows:expr, $codes:expr) => {{
                 let mut rows = first_rows($rows, log);
@@ -248,7 +248,7 @@ impl SequenceTables {
     }
 
     /// Whether so many matches are out of the cache that it pays to ask for them ahead of time.
-    pub(crate) fn has_many_far_offsets(&self) -> bool {
+    pub(super) fn has_many_far_offsets(&self) -> bool {
         let log = self.log(CodeKind::Offset);
         let rows = self.offsets.iter().take(1 << log);
         let far = rows.filter(|row| row.extra_bits as u32 > 22).count();

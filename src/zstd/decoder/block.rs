@@ -7,8 +7,7 @@ use crate::error::{Error, Result};
 use crate::format::{CodeKind, Encoding, INITIAL_REPEAT_OFFSETS, LONG_SEQUENCE_COUNT};
 use crate::huffman::HuffmanTable;
 use crate::literals::{LITERALS_PADDING, LiteralsHeader};
-use crate::sequence_tables::{PREDEFINED_TABLES, SequenceTables};
-use crate::sequences::run_sequences;
+use crate::sequences::{PREDEFINED_TABLES, SequenceTables, run_sequences};
 
 /// Where the table is that a block can repeat.
 #[derive(Clone, Copy, PartialEq, Eq, Default)]

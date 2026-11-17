@@ -203,13 +203,8 @@ impl Decoder {
                 && let Some(len) = self.len_in_one_pass(header, input, out)
             {
                 let frame = input.get(..len).ok_or(Error::Internal)?;
-                decompress_frame(
-                    &mut self.blocks,
-                    header,
-                    frame,
-                    out,
-                    self.dictionary.as_ref(),
-                )?;
+                let (is_last, dictionary) = (len == input.len(), self.dictionary.as_ref());
+                decompress_frame(&mut self.blocks, header, frame, is_last, out, dictionary)?;
                 self.stage = Stage::Idle;
                 self.idle_steps = 0;
                 return Ok((len, Status::Complete));

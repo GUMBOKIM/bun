@@ -6,7 +6,7 @@ use crate::array::allocate;
 use crate::error::{Error, Result};
 use crate::format::{BLOCK_LEN_MAX, CodeKind, DICTIONARY_MAGIC};
 use crate::huffman::HuffmanTable;
-use crate::sequence_tables::SequenceTables;
+use crate::sequences::SequenceTables;
 
 /// What frames can refer to besides their own content.
 pub struct Dictionary<'a> {

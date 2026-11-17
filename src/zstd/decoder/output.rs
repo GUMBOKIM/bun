@@ -2,6 +2,10 @@
 
 use crate::error::{Error, Result};
 
+/// Above this, glibc up to 2.39 copies with `rep movsb`, which crawls on Zen 3 and 4 if the target is a few bytes ahead
+/// of the source in its page: https://sourceware.org/bugzilla/show_bug.cgi?id=30994
+const PIECE_LEN: usize = 2048;
+
 /// A slice, or the spare capacity of a `Vec`.
 pub struct Output<'a> {
     target: Target<'a>,
@@ -20,15 +24,64 @@ enum Target<'a> {
     Ring(&'a mut Vec<u8>),
 }
 
+impl Target<'_> {
+    #[inline]
+    fn bytes(&self) -> &[u8] {
+        match self {
+            Self::Slice(slice) => slice,
+            Self::Vec(vec) | Self::Ring(vec) => vec,
+        }
+    }
+
+    #[inline]
+    fn capacity(&self) -> usize {
+        match self {
+            Self::Slice(slice) => slice.len(),
+            Self::Vec(vec) | Self::Ring(vec) => vec.capacity(),
+        }
+    }
+
+    /// At least `len`, for which there is capacity.
+    #[inline]
+    fn bytes_mut(&mut self, len: usize) -> &mut [u8] {
+        match self {
+            Self::Slice(slice) => slice,
+            Self::Vec(vec) | Self::Ring(vec) => {
+                if vec.len() < len {
+                    vec.resize(len, 0);
+                }
+                vec
+            }
+        }
+    }
+
+    /// Cut off at `start`, if `len` bytes from there have to be appended.
+    #[inline]
+    fn to_extend(&mut self, start: usize, len: usize) -> Option<&mut Vec<u8>> {
+        match self {
+            Self::Vec(vec) | Self::Ring(vec) if (start..start + len).contains(&vec.len()) => {
+                vec.truncate(start);
+                Some(vec)
+            }
+            _ => None,
+        }
+    }
+
+    #[inline]
+    fn write(&mut self, start: usize, bytes: &[u8]) {
+        let end = start + bytes.len();
+        debug_assert!(start <= self.bytes().len() && end <= self.capacity());
+        if let Some(vec) = self.to_extend(start, bytes.len()) {
+            vec.extend_from_slice(bytes);
+        } else if let Some(to) = self.bytes_mut(0).get_mut(start..end) {
+            to.copy_from_slice(bytes);
+        }
+    }
+}
+
 impl<'a> Output<'a> {
     pub fn slice(slice: &'a mut [u8]) -> Self {
-        Self {
-            start: 0,
-            position: 0,
-            end: slice.len(),
-            grows: false,
-            target: Target::Slice(slice),
-        }
+        Self::resume_slice(slice, 0)
     }
 
     /// Appends at most `max` bytes.
@@ -86,22 +139,16 @@ impl<'a> Output<'a> {
         self.end - self.position
     }
 
-    /// The room for which there is memory.
-    #[inline]
-    pub(crate) fn reserved_room(&self) -> usize {
-        match &self.target {
-            Target::Vec(vec) => self.room().min(vec.capacity() - self.position),
-            _ => self.room(),
-        }
-    }
-
     /// How far [`lend_with_slack`](Self::lend_with_slack) can go.
     #[inline]
     pub(crate) fn room_with_slack(&self) -> usize {
-        match &self.target {
-            Target::Slice(slice) => slice.len() - self.position,
-            Target::Vec(vec) | Target::Ring(vec) => vec.capacity() - self.position,
-        }
+        self.target.capacity() - self.position
+    }
+
+    /// The room for which there is memory.
+    #[inline]
+    pub(crate) fn reserved_room(&self) -> usize {
+        self.room().min(self.room_with_slack())
     }
 
     pub(crate) fn grows(&self) -> bool {
@@ -113,13 +160,31 @@ impl<'a> Output<'a> {
         self.position
     }
 
-    /// For the next `len` bytes.
+    /// With how many bytes are missing for the next `len`.
+    #[inline]
+    fn to_grow(&mut self, len: usize) -> Option<(&mut Vec<u8>, usize)> {
+        match &mut self.target {
+            Target::Vec(vec) if self.grows => {
+                let missing = (self.position + len).saturating_sub(vec.len());
+                Some((vec, missing))
+            }
+            _ => None,
+        }
+    }
+
+    /// For the next `len` bytes, or more.
     #[inline]
     pub(crate) fn reserve(&mut self, len: usize) -> Result<()> {
-        if let (Target::Vec(vec), true) = (&mut self.target, self.grows) {
-            vec.try_reserve((self.position + len).saturating_sub(vec.len()))?;
-        }
-        Ok(())
+        let result = self
+            .to_grow(len)
+            .map(|(vec, missing)| vec.try_reserve(missing));
+        Ok(result.unwrap_or(Ok(()))?)
+    }
+
+    /// For the last `len` bytes.
+    pub(crate) fn reserve_exact(&mut self, len: usize) -> Result<()> {
+        let result = (self.to_grow(len)).map(|(vec, missing)| vec.try_reserve_exact(missing));
+        Ok(result.unwrap_or(Ok(()))?)
     }
 
     /// Writes as many as there is room for, and returns how many.
@@ -135,14 +200,14 @@ impl<'a> Output<'a> {
     #[inline]
     pub(crate) fn write_ahead(&mut self, ahead: usize, bytes: &[u8]) {
         let start = self.position + ahead;
-        match &mut self.target {
-            _ if bytes.is_empty() => {}
-            Target::Vec(vec) | Target::Ring(vec) if vec.len() < start + bytes.len() => {
-                vec.truncate(start);
-                vec.extend_from_slice(bytes);
+        let address = self.target.bytes().as_ptr().addr().wrapping_add(start);
+        let lead_in_page = address.wrapping_sub(bytes.as_ptr().addr()) % 4096;
+        if bytes.len() > PIECE_LEN && (1..32).contains(&lead_in_page) {
+            for (index, piece) in bytes.chunks(PIECE_LEN).enumerate() {
+                self.target.write(start + index * PIECE_LEN, piece);
             }
-            Target::Vec(vec) | Target::Ring(vec) => copy_to(vec, start, bytes),
-            Target::Slice(slice) => copy_to(slice, start, bytes),
+        } else if !bytes.is_empty() {
+            self.target.write(start, bytes);
         }
     }
 
@@ -151,25 +216,21 @@ impl<'a> Output<'a> {
     pub(crate) fn repeat_ahead(&mut self, ahead: usize, distance: usize, len: usize) -> Result<()> {
         let mut to = self.position + ahead;
         let from = to.checked_sub(distance).filter(|&from| from < to);
-        let (from, end) = (from.ok_or(Error::Internal)?, to + len);
+        let (mut from, end) = (from.ok_or(Error::Internal)?, to + len);
         while to < end {
-            let len = (to - from).min(end - to);
-            let bytes = match &mut self.target {
-                Target::Vec(vec) | Target::Ring(vec) if (to..to + len).contains(&vec.len()) => {
-                    vec.truncate(to);
-                    vec.extend_from_within(from..from + len);
-                    to += len;
-                    continue;
-                }
-                Target::Vec(vec) | Target::Ring(vec) => vec.as_mut_slice(),
-                Target::Slice(slice) => &mut **slice,
-            };
-            let (written, room) = bytes.split_at_mut_checked(to).ok_or(Error::Internal)?;
-            copy_to(
-                room,
-                0,
-                written.get(from..from + len).ok_or(Error::Internal)?,
-            );
+            let len = (to - from).min(end - to).min(PIECE_LEN);
+            if let Some(vec) = self.target.to_extend(to, len) {
+                vec.extend_from_within(from..from + len);
+            } else {
+                let parts = self.target.bytes_mut(0).split_at_mut_checked(to);
+                let (written, room) = parts.ok_or(Error::Internal)?;
+                let piece = written.get(from..from + len).ok_or(Error::Internal)?;
+                (room.get_mut(..len).ok_or(Error::Internal)?).copy_from_slice(piece);
+            }
+            // Until it is as long as a piece, the distance doubles.
+            if len < to - from {
+                from += len;
+            }
             to += len;
         }
         Ok(())
@@ -178,83 +239,51 @@ impl<'a> Output<'a> {
     /// Writes `byte` up to `count` times.
     pub(crate) fn append_repeated(&mut self, byte: u8, count: usize) {
         let end = self.position + count.min(self.reserved_room());
-        let bytes = match &mut self.target {
-            Target::Vec(vec) | Target::Ring(vec) if vec.len() < end => {
-                vec.truncate(self.position);
-                vec.resize(end, byte);
-                &mut []
-            }
-            Target::Vec(vec) | Target::Ring(vec) => vec.as_mut_slice(),
-            Target::Slice(slice) => &mut **slice,
-        };
-        (bytes.get_mut(self.position..end).unwrap_or_default()).fill(byte);
+        if let Some(vec) = self.target.to_extend(self.position, end - self.position) {
+            vec.resize(end, byte);
+        } else if let Some(to) = self.target.bytes_mut(0).get_mut(self.position..end) {
+            to.fill(byte);
+        }
         self.position = end;
     }
 
     /// The last `len` bytes that were written.
     #[inline]
     pub(crate) fn last_written(&self, len: usize) -> &[u8] {
-        let bytes = match &self.target {
-            Target::Slice(slice) => &**slice,
-            Target::Vec(vec) | Target::Ring(vec) => vec.as_slice(),
-        };
-        (bytes.get(self.position - len.min(self.written())..self.position)).unwrap_or_default()
+        let start = self.position - len.min(self.written());
+        (self.target.bytes().get(start..self.position)).unwrap_or_default()
     }
 
     /// Like [`lend`](Self::lend), with the last `kept` bytes that were written. It goes beyond the room if there is memory
     /// for it, and up to `most` bytes if that comes for free.
     #[inline]
     pub(crate) fn lend_with_slack(&mut self, kept: usize, len: usize, most: usize) -> &mut [u8] {
-        let bytes = match &mut self.target {
-            Target::Slice(slice) => &mut **slice,
-            Target::Vec(vec) | Target::Ring(vec) => {
-                let end = vec.capacity().min(self.position + len);
-                if vec.len() < end {
-                    vec.resize(end, 0);
-                }
-                vec.as_mut_slice()
-            }
-        };
-        let end = bytes.len().min(self.position + most);
-        let start = self.position - kept.min(self.position - self.start);
+        let start = self.position - kept.min(self.written());
+        let (end, most) = (
+            self.position + len.min(self.room_with_slack()),
+            self.position + most,
+        );
+        let bytes = self.target.bytes_mut(end);
+        let end = bytes.len().min(most);
         bytes.get_mut(start..end).unwrap_or_default()
     }
 
     /// What was written, and up to `len` bytes of the room behind it. These count once they are [`commit`](Self::commit)ted.
     pub fn lend(&mut self, len: usize) -> &mut [u8] {
         let end = self.position + len.min(self.reserved_room());
-        let bytes = match &mut self.target {
-            Target::Slice(slice) => &mut **slice,
-            Target::Vec(vec) | Target::Ring(vec) => {
-                if vec.len() < end {
-                    vec.resize(end, 0);
-                }
-                vec.as_mut_slice()
-            }
-        };
-        bytes.get_mut(self.start..end).unwrap_or_default()
+        (self.target.bytes_mut(end).get_mut(self.start..end)).unwrap_or_default()
     }
 
     #[inline]
     pub fn commit(&mut self, len: usize) {
-        let lent_end = match &self.target {
-            Target::Slice(slice) => slice.len(),
-            Target::Vec(vec) | Target::Ring(vec) => vec.len(),
-        };
-        debug_assert!(len <= self.room() && self.position + len <= lent_end);
-        self.position = lent_end.min(self.position + len.min(self.room()));
+        let most = self.room().min(self.target.bytes().len() - self.position);
+        debug_assert!(len <= most);
+        self.position += len.min(most);
     }
 
     /// Forgets all but the first `written` bytes.
     pub fn rewind(&mut self, written: usize) {
         self.position = self.position.min(self.start.saturating_add(written));
-    }
-}
-
-fn copy_to(target: &mut [u8], position: usize, bytes: &[u8]) {
-    debug_assert!(position + bytes.len() <= target.len());
-    if let Some(target) = target.get_mut(position..position + bytes.len()) {
-        target.copy_from_slice(bytes);
     }
 }
 

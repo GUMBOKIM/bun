@@ -518,6 +518,21 @@ fn a_growing_output_takes_what_the_content_needs() -> Result<()> {
         .step_growing(&known, &mut out, usize::MAX)
         .1?;
     assert_eq!((out.len(), out.capacity()), (32 << 20, (32 << 20) + 32));
+    // Twice the capacity is too much, unless more follows. The last block is a literal and a match.
+    let last_block = hex("450000 0861 01 54 010200 04");
+    let known = [
+        hex("28b52ffd 8038 04002000"),
+        block(2).repeat(16),
+        last_block,
+    ]
+    .concat();
+    for (input, capacity) in [(known.clone(), (2 << 20) + 36), (known.repeat(2), 4 << 20)] {
+        let mut out = Vec::with_capacity(2 << 20);
+        Decoder::new()
+            .step_growing(&input, &mut out, usize::MAX)
+            .1?;
+        assert_eq!((out.len(), out.capacity()), ((2 << 20) + 4, capacity));
+    }
     let claimed = [hex("28b52ffd c038 0000000000010000"), blocks(2)].concat();
     let mut out = Vec::new();
     let (_, status) = Decoder::new().step_growing(&claimed, &mut out, usize::MAX);
@@ -550,6 +565,24 @@ fn what_is_lent_counts_once_it_is_committed() {
         out.rewind(3);
     }
     assert_eq!((&slice, &vec[..]), (b"abxy", &b"abx"[..]));
+}
+
+#[test]
+fn long_copies_land_at_every_distance_from_their_source() {
+    let from: Vec<u8> = (0..5000).map(|it: u32| (it % 251) as u8).collect();
+    let mut vec = Vec::<u8>::with_capacity(4096 + 40 + from.len());
+    let same_in_page = from.as_ptr().addr().wrapping_sub(vec.as_ptr().addr()) % 4096;
+    for (start, lent) in (same_in_page..same_in_page + 40).zip([0, 3000].into_iter().cycle()) {
+        vec.resize(start, 0);
+        let mut out = Output::spare_capacity(&mut vec, usize::MAX);
+        out.lend(lent);
+        assert_eq!(out.append(&from), from.len());
+        drop(out);
+        assert!(vec[start..] == from);
+        vec[start..].fill(0);
+        assert_eq!(Output::slice(&mut vec[start..]).append(&from), from.len());
+        assert!(vec[start..] == from);
+    }
 }
 
 #[test]

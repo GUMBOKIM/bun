@@ -4,7 +4,7 @@ use crate::array::At;
 use crate::bits::{BackwardBits, Width};
 use crate::error::{Error, Result};
 use crate::format::HUFFMAN_TABLE_LOG_MAX;
-use crate::fse::{States, read_counts};
+use crate::fse::{Spread, read_counts};
 
 const TABLE_LOG_MAX: u32 = 6;
 const STATES_MAX: usize = 1 << TABLE_LOG_MAX;
@@ -142,8 +142,8 @@ fn decompress(src: &[u8], weights: &mut [u8; 256]) -> Result<usize> {
         return Err(Error::CorruptionDetected);
     }
     let counts = counts.get(..=max_symbol).ok_or(Error::Internal)?;
-    let mut states = States::<{ STATES_MAX + 8 }, 128>::EMPTY;
-    states.spread(counts, log);
+    let mut states = Spread::<{ STATES_MAX + 8 }, 128>::EMPTY;
+    states.fill(counts, log);
     let mut table = [Row {
         weight: 0,
         bits: Width::W0,
