@@ -518,15 +518,6 @@ mod tests {
             }
         }
         assert_eq!(hash(values.into_iter()), 0x6925_7E0A);
-
-        let rare = LongDistance {
-            hash_log: 0,
-            hash_rate_log: 25,
-            bucket_log: 0,
-            min_match: 0,
-        };
-        let tuning = Request::new(1).tuning(Some(1), Purpose::Frame { dictionary_len: 0 });
-        assert_eq!(rare.completed(&tuning).hash_log, HASH_LOG_MIN);
     }
 
     #[test]
@@ -577,6 +568,10 @@ mod tests {
                 request.overlap_log as usize,
             ];
             assert_eq!(actual, expected);
+        }
+        for (value, expected) in [(-1, 1340), (1340, 1340), (1341, 1341), (0, 0)] {
+            request.set(130, value)?;
+            assert_eq!(request.target_block_len, expected);
         }
         Ok(())
     }

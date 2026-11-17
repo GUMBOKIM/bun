@@ -547,3 +547,8 @@ fn costs_are_logarithms() {
         assert_eq!(cost, (-(share as f64 / 256.0).log2() * 256.0) as u16);
     }
 }
+
+#[test]
+fn offset_codes_are_numbers_of_bits() {
+    assert!(OFFSET_BITS.into_iter().eq(0..32));
+}

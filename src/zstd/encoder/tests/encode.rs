@@ -147,7 +147,7 @@ fn too_little_room_is_an_error() -> Result<()> {
         sample(3000),
         noise(300),
         vec![7; 140_000],
-        [vec![7; 131_072], sample(300)].concat(),
+        [vec![7; 131_072], sample(2000)].concat(),
         [noise(131_072), vec![7; 3]].concat(),
     ];
     for input in inputs {
@@ -192,6 +192,43 @@ fn there_has_to_be_room_for_the_longest_header() {
 }
 
 #[test]
+fn fields_of_the_header_are_as_short_as_possible() -> Result<()> {
+    let header = |id: u32, pledged| -> Result<_> {
+        let dictionary = [&DICTIONARY[..4], &id.to_le_bytes(), &DICTIONARY[8..]].concat();
+        let mut encoder = encoder(&[(WINDOW_LOG, 10)], &dictionary)?;
+        encoder.set_pledged_len(pledged)?;
+        let mut out = Vec::with_capacity(100);
+        write(&mut encoder, b"a", Flush, usize::MAX, &mut out)?;
+        Ok(out[4..out.len() - 4].to_vec())
+    };
+    let ids: [(_, &[_]); _] = [
+        (0, &[0, 0]),
+        (1, &[1, 0, 1]),
+        (0xFF, &[1, 0, 0xFF]),
+        (0x100, &[2, 0, 0, 1]),
+        (0xFFFF, &[2, 0, 0xFF, 0xFF]),
+        (0x1_0000, &[3, 0, 0, 0, 1, 0]),
+    ];
+    for (id, expected) in ids {
+        assert_eq!(header(id, None)?, expected);
+    }
+    let sizes: [(_, &[_]); _] = [
+        (0xFF, &[0x20, 0xFF]),
+        (0x100, &[0x60, 0, 0]),
+        (0x400, &[0x60, 0, 3]),
+        (0x401, &[0x40, 0, 1, 3]),
+        (0x1_00FF, &[0x40, 0, 0xFF, 0xFF]),
+        (0x1_0100, &[0x80, 0, 0, 1, 1, 0]),
+        (0xFFFF_FFFE, &[0x80, 0, 0xFE, 0xFF, 0xFF, 0xFF]),
+        (0xFFFF_FFFF, &[0xC0, 0, 0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0]),
+    ];
+    for (size, expected) in sizes {
+        assert_eq!(header(0, Some(size))?, expected);
+    }
+    Ok(())
+}
+
+#[test]
 fn the_bound_has_a_margin_for_short_inputs() {
     let bounds = [
         (0, Some(64)),
@@ -203,7 +240,6 @@ fn the_bound_has_a_margin_for_short_inputs() {
         (131_072, Some(131_584)),
         (1 << 32, Some((1 << 32) + (1 << 24))),
         (0xFF00_FF00_FF00_FE00, Some(0xFFFF_FFFF_FFFF_FEFE)),
-        (0xFF00_FF00_FF00_FEFF, Some(usize::MAX - 2)),
         (0xFF00_FF00_FF00_FF00, None),
         (usize::MAX, None),
     ];
@@ -386,5 +422,22 @@ fn a_damaged_dictionary_is_refused_when_a_frame_starts() -> Result<()> {
         let result = step(&mut encoder(&[], &DICTIONARY[..len])?, b"a", 100, End);
         assert_eq!(result.2, Ok(Status::Complete), "{len}");
     }
+    Ok(())
+}
+
+#[test]
+fn what_is_a_dictionary_for_the_decoder_is_one_for_the_encoder() -> Result<()> {
+    let mut accepted = 0;
+    for position in 8..112 {
+        for bit in 0..8 {
+            let mut changed = DICTIONARY.to_vec();
+            changed[position] ^= 1 << bit;
+            let result = step(&mut encoder(&[], &changed)?, b"a", 100, End).2;
+            let is_accepted = Dictionary::new(&changed).is_ok();
+            assert_eq!(result.is_ok(), is_accepted, "{position} {bit}");
+            accepted += usize::from(is_accepted);
+        }
+    }
+    assert_eq!(accepted, 143);
     Ok(())
 }

@@ -498,9 +498,9 @@ fn a_refused_dictionary_replaces_the_one_before() -> Result<()> {
 
 #[test]
 fn a_window_that_stays_too_large_is_given_up() {
-    // Windows of 1, 2 and 8 KiB, which take 3 times as much
+    // Windows of 1, 2.5 and 3.5 KiB
     let [small, medium, large] =
-        ["00", "08", "18"].map(|window| hex(&format!("28b52ffd 00{window} 010000")));
+        ["00", "0a", "0e"].map(|window| hex(&format!("28b52ffd 00{window} 010000")));
     let frames_until_it_allocates = |decoder: &mut Decoder, frame: &[u8]| {
         (1..200).find(|_| {
             let mut out = Output::slice(&mut []);
@@ -528,7 +528,15 @@ fn a_window_that_stays_too_large_is_given_up() {
 fn the_default_limit_is_128_mib() -> Result<()> {
     let header = |size: u32| [&hex("28b52ffd a0")[..], &size.to_le_bytes()].concat();
     let mut decoder = Decoder::new();
-    decoder.set_parameter(100, 10)?;
+    let result = step(&mut decoder, &header((1 << 27) + 2), 0).2;
+    assert_eq!(result, Err(Error::WindowTooLarge));
+    decoder.reset_session();
+    let at_limit = header((1 << 27) + 1);
+    GRANTS.set(Some(0));
+    let (_, status) = decoder.step(&at_limit, &mut Output::slice(&mut []));
+    assert_eq!(status, Err(Error::MemoryAllocation));
+
+    decoder.reset_session();
     decoder.set_parameter(100, 0)?;
     // It gets as far as asking for the memory.
     let at_limit = header(1 << 27);
@@ -539,6 +547,14 @@ fn the_default_limit_is_128_mib() -> Result<()> {
     let result = step(&mut decoder, &header((1 << 27) + 1), 0).2;
     assert_eq!(result, Err(Error::WindowTooLarge));
     Ok(())
+}
+
+#[test]
+fn huffman_codes_have_at_most_12_bits() {
+    let table_log = |weights| read_huffman_weights(&hex(weights)).map(|it| it.table_log);
+    assert_eq!(table_log("8b cba987654321"), Ok(12));
+    let result = table_log("8d cccba987654321");
+    assert_eq!(result, Err(Error::CorruptionDetected));
 }
 
 #[test]

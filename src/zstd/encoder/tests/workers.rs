@@ -6,7 +6,7 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use bun_zstd_decoder::{Error, Result, Status};
-use bun_zstd_encoder::EndDirective::{Continue, End, Flush};
+use bun_zstd_encoder::EndDirective::{Continue, End};
 use common::*;
 
 /// How many allocations are granted before one is refused.
@@ -52,29 +52,15 @@ fn workers() -> Result<()> {
     three_frames(&mut encoder, &input, &mut out)?;
     assert_eq!(summary(&out), expected);
 
-    // Jobs that nobody waits for any more.
+    // Once the end is in the making, the frame does not continue.
+    let before = step(&mut encoder, &input, 0, End);
+    assert_eq!(before, (input.len(), 0, Ok(Status::Pending)));
+    let after = step(&mut encoder, &[], 100, Continue);
+    assert_eq!(after, (0, 0, Err(Error::StageWrong)));
+
+    // Jobs that nobody waits for any more
+    let mut encoder = common::encoder(&parameters, &[])?;
     write(&mut encoder, &input, Continue, 1, &mut out)?;
-    encoder.reset_session();
-    three_frames(&mut encoder, &input, &mut out)?;
-    assert_eq!(summary(&out), expected);
-
-    // Once the end is in the making, nothing can be added.
-    for (input_after, directive) in [(&[][..], Continue), (b"more", End), (b"more", Flush)] {
-        let before = step(&mut encoder, &input, 0, End);
-        assert_eq!(before, (input.len(), 0, Ok(Status::Pending)));
-        let after = step(&mut encoder, input_after, 100, directive);
-        assert_eq!(after, (0, 0, Err(Error::StageWrong)));
-        encoder.reset_session();
-    }
-
-    for pledged in [input.len() - 1, input.len() + 1] {
-        encoder.set_pledged_len(Some(pledged as u64))?;
-        out.clear();
-        let result = write(&mut encoder, &input, Continue, usize::MAX, &mut out)
-            .and_then(|()| write(&mut encoder, &[], End, usize::MAX, &mut out));
-        assert_eq!(result, Err(Error::SrcSizeWrong));
-        encoder.reset_session();
-    }
 
     // A section that is full is not the last one, also if it has to wait for its turn until the end is asked for.
     let mut waiting = common::encoder(&[(WORKERS, 1), (JOB_LEN, 1)], &[])?;

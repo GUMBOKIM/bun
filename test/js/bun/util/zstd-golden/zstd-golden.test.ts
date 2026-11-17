@@ -7,8 +7,8 @@
 //   stored/   of blocks, tables and sequences chosen at random, some with a field or a byte changed
 //   encoded/  what such data compresses to, some with a bit changed or the end cut off
 //
-// Nearly all results are those of zstd 1.5.7. A case is here because it tells src/zstd from a version with one small
-// mistake.
+// The results are those of zstd 1.5.7. A case is here because it tells src/zstd from a version with one small mistake,
+// or takes a branch that no other takes.
 import { describe, expect, test } from "bun:test";
 import { decodeDifferences, encodeDifferences, inParts, loadCases } from "./observe";
 
@@ -18,11 +18,11 @@ describe("zstd compresses and decompresses the way it was recorded to", () => {
   test("there are cases of all kinds", () => {
     const kinds = Object.entries(Object.groupBy([...cases.encode, ...cases.decode], c => c.name.split("/")[0]));
     expect(Object.fromEntries(kinds.map(([kind, some]) => [kind, some!.length]))).toEqual({
-      mixed: 111,
-      small: 99,
-      workers: 33,
-      encoded: 31,
-      stored: 111,
+      mixed: 135,
+      small: 89,
+      workers: 37,
+      encoded: 30,
+      stored: 122,
     });
   });
 

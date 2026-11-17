@@ -189,6 +189,20 @@ mod tests {
 
         assert_eq!(summary(&[[9, 1 << 30, 50]], 9, 7, 1)?, (31, 0xD43B_B9AF));
 
+        // Up to the last offset code of the predefined table, and one more
+        for (code, strategy, expected) in [
+            (28, 1, (73, 0x7C1A_00C5)),
+            (28, 5, (73, 0x7C1A_00C5)),
+            (29, 1, (77, 0x96F1_D3CC)),
+            (29, 5, (77, 0x96F1_D3CC)),
+        ] {
+            let list = (0..6).map(|it| [9 + it, (1 << (code - it % 2)) + it, 50 + it % 3]);
+            assert_eq!(
+                summary(&list.collect::<Vec<_>>(), 20, 7, strategy)?,
+                expected
+            );
+        }
+
         // No code much more frequent than the others
         let match_lens: Vec<_> = (3..35).chain([35, 37, 39, 41, 43, 47, 51, 59]).collect();
         for (count, expected) in [

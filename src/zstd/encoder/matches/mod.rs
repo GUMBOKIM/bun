@@ -621,6 +621,17 @@ mod tests {
     }
 
     #[test]
+    fn a_tree_is_not_filled_for_nothing() -> Result<()> {
+        for is_abandoned in [false, true] {
+            let mut state = state(7)?;
+            state.load::<{ Owner::Frame }>(b"0123456789abcdef", || is_abandoned);
+            let is_empty = state.tables.split_mut().hash.iter().all(|&it| it == 0);
+            assert_eq!(is_empty, is_abandoned);
+        }
+        Ok(())
+    }
+
+    #[test]
     fn indices_with_tags_tell_16_mb_apart() -> Result<()> {
         let content = vec![0; 1 << 24];
         assert_eq!(state(2)?.loadable(&content).len(), (1 << 24) - 2);

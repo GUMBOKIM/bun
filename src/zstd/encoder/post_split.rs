@@ -168,3 +168,37 @@ pub(crate) fn write(
     }
     Ok(())
 }
+
+#[test]
+fn records_no_more_splits_than_there_is_room_for() -> Result<()> {
+    use crate::parameters::{Purpose, Request};
+
+    // Four quarters that have little in common
+    let mut all = Sequences::new();
+    all.clear_for(1 << 17, 4)?;
+    for index in 0..800 {
+        let quarter = index / 200;
+        let offset = OffsetValue::new((50 << (3 * quarter)) + index);
+        all.push(1 + quarter, offset, 10 + 5 * quarter + index % 2);
+    }
+    all.finish(&[0; 16400], 16400)?;
+    let whole = Part {
+        sequences: 0..all.list.len(),
+        literals: 0..all.literals().len(),
+    };
+    let tuning = Request::new(16).tuning(None, Purpose::Frame { dictionary_len: 0 });
+    for (room, expected) in [(4, [200, 400, 600, 0]), (1, [200, 0, 0, 0])] {
+        let mut splitter = Splitter {
+            writer: &mut BlockWriter::new(),
+            sequences: &all.list,
+            literals: all.literals(),
+            tuning: &tuning,
+            splits: [0; SPLITS_MAX],
+            count: SPLITS_MAX - room,
+        };
+        splitter.split(&whole, usize::MAX)?;
+        let recorded = splitter.splits.into_iter().skip(SPLITS_MAX - room);
+        assert!(recorded.eq(expected.into_iter().take(room)));
+    }
+    Ok(())
+}

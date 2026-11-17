@@ -127,3 +127,19 @@ impl Dictionary {
         input_len.is_none_or(|len| len <= limit)
     }
 }
+
+#[test]
+fn tables_are_copied_for_large_inputs() -> Result<()> {
+    let bytes = crate::vec::shared(vec![0; 8])?;
+    for (strategy, kb) in (1..).zip([8, 16, 32, 32, 32, 32, 32, 8, 8]) {
+        let mut request = Request::new(1);
+        request.set(107, strategy)?;
+        let dictionary = Dictionary::new(&bytes, &request)?;
+        let lens = [None, Some(kb << 10), Some((kb << 10) + 1)];
+        assert_eq!(
+            lens.map(|it| dictionary.is_attached_for(it)),
+            [true, true, false]
+        );
+    }
+    Ok(())
+}

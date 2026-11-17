@@ -339,3 +339,12 @@ impl LiteralTables {
         Ok(Some((header_len + written, true)))
     }
 }
+
+#[test]
+fn a_part_without_literals_is_raw() -> Result<()> {
+    let plan = LiteralsPlan::plain(Encoding::Rle);
+    let mut out = [0xFF; 2];
+    let written = LiteralTables::EMPTY.write_part(&plan, &[], false, &mut out)?;
+    assert_eq!((written, out), (Some((1, false)), [0, 0xFF]));
+    Ok(())
+}

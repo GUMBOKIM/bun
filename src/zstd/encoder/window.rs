@@ -399,6 +399,9 @@ fn indices_are_lowered_like_zstd_does() {
         assert_eq!((actual, window.next + by), (expected, next));
     }
 
+    let overflows = [0, 1].map(|len| Window::starting_at(3_670_016_000).would_overflow(len));
+    assert_eq!(overflows, [false, true]);
+
     let mut window = Window {
         next: INDEX_MAX,
         ..Window::starting_at(5)
