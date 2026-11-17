@@ -568,6 +568,16 @@ fn a_growing_output_seldom_moves() -> Result<()> {
     }
     assert_eq!((out.len(), moves), (1000 << 10, 11));
 
+    let frame = hex("28b52ffd a000000100 030008 61");
+    let (mut out, mut moves) = (vec![0; 2 << 20], 0);
+    for _ in 0..96 {
+        let capacity = out.capacity();
+        decoder.step_growing(&frame, &mut out, usize::MAX).1?;
+        moves += usize::from(out.capacity() != capacity);
+        assert!(out.capacity() <= out.len() / 4 * 5);
+    }
+    assert_eq!((out.len(), moves), (8 << 20, 7));
+
     let mut out = Vec::with_capacity((2 << 20) + 4);
     out.resize(2 << 20, 0);
     let one_match = hex("28b52ffd 0000 080000 61 3d0000 00 01 54 000200 04");
@@ -588,7 +598,7 @@ fn a_growing_output_takes_what_the_content_needs() -> Result<()> {
         .step_growing(&known, &mut out, usize::MAX)
         .1?;
     assert_eq!((out.len(), out.capacity()), (32 << 20, (32 << 20) + 32));
-    // Twice the capacity is too much, unless more follows. The last block is a literal and a match.
+    // It doubles only if more follows. The last block is a literal and a match.
     let last_block = hex("450000 0861 01 54 010200 04");
     let known = [
         hex("28b52ffd 8038 04002000"),
@@ -596,7 +606,7 @@ fn a_growing_output_takes_what_the_content_needs() -> Result<()> {
         last_block,
     ]
     .concat();
-    for (input, capacity) in [(known.clone(), (2 << 20) + 36), (known.repeat(2), 4 << 20)] {
+    for (input, capacity) in [(known.clone(), 5 << 19), (known.repeat(2), 4 << 20)] {
         let mut out = Vec::with_capacity(2 << 20);
         Decoder::new()
             .step_growing(&input, &mut out, usize::MAX)

@@ -3,8 +3,10 @@
 use crate::error::{Error, Result};
 
 /// Above this, glibc up to 2.39 copies with `rep movsb`, which crawls on Zen 3 and 4 if the target is a few bytes ahead
-/// of the source in its page: https://sourceware.org/bugzilla/show_bug.cgi?id=30994
+/// of the source modulo 4096: https://sourceware.org/bugzilla/show_bug.cgi?id=30994
 const PIECE_LEN: usize = 2048;
+/// No system has smaller ones.
+const PAGE_LEN: usize = 4096;
 
 /// A slice, or the spare capacity of a `Vec`.
 pub struct Output<'a> {
@@ -22,6 +24,26 @@ enum Target<'a> {
     Vec(&'a mut Vec<u8>),
     /// Stays as long as it got.
     Ring(&'a mut Vec<u8>),
+}
+
+/// Those that start before `end`. It takes longer to wait for new ones within `memset()` or `memcpy()`.
+#[inline]
+fn touch_pages(vec: &mut Vec<u8>, end: usize) {
+    let len = end.saturating_sub(vec.len());
+    let spare = vec.spare_capacity_mut();
+    let first = spare.as_ptr().addr().wrapping_neg() % PAGE_LEN;
+    let pages = spare.get_mut(first..len).unwrap_or_default();
+    for byte in pages.iter_mut().step_by(PAGE_LEN) {
+        byte.write(0);
+    }
+}
+
+fn clear_up_to(vec: &mut Vec<u8>, len: usize) {
+    touch_pages(vec, len);
+    // New pages are quicker to clear without `rep stosb`, too.
+    while vec.len() < len {
+        vec.resize(len.min(vec.len() + PIECE_LEN), 0);
+    }
 }
 
 impl Target<'_> {
@@ -48,7 +70,7 @@ impl Target<'_> {
             Self::Slice(slice) => slice,
             Self::Vec(vec) | Self::Ring(vec) => {
                 if vec.len() < len {
-                    vec.resize(len, 0);
+                    clear_up_to(vec, len);
                 }
                 vec
             }
@@ -60,6 +82,7 @@ impl Target<'_> {
     fn to_extend(&mut self, start: usize, len: usize) -> Option<&mut Vec<u8>> {
         match self {
             Self::Vec(vec) | Self::Ring(vec) if (start..start + len).contains(&vec.len()) => {
+                touch_pages(vec, start + len);
                 vec.truncate(start);
                 Some(vec)
             }
@@ -201,8 +224,8 @@ impl<'a> Output<'a> {
     pub(crate) fn write_ahead(&mut self, ahead: usize, bytes: &[u8]) {
         let start = self.position + ahead;
         let address = self.target.bytes().as_ptr().addr().wrapping_add(start);
-        let lead_in_page = address.wrapping_sub(bytes.as_ptr().addr()) % 4096;
-        if bytes.len() > PIECE_LEN && (1..32).contains(&lead_in_page) {
+        let lead = address.wrapping_sub(bytes.as_ptr().addr()) % 4096;
+        if bytes.len() > PIECE_LEN && (1..32).contains(&lead) {
             for (index, piece) in bytes.chunks(PIECE_LEN).enumerate() {
                 self.target.write(start + index * PIECE_LEN, piece);
             }

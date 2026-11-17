@@ -102,10 +102,12 @@ impl<'o, 'a> Destination<'o, 'a> {
         let written = self.history_len as u64;
         let credible = CREDIBLE_SIZE.max(written.saturating_mul(CREDIBLE_FACTOR));
         let size = self.frame.content_size.filter(|&size| size <= credible);
+        let len_to_move = self.out.len_to_move();
         match size.map(|size| size.saturating_sub(written) as usize + OVERSHOOT) {
             Some(left) if left < len => self.out.reserve(len),
-            Some(left) if self.is_last_frame && self.out.len_to_move() > CHEAP_TO_MOVE => {
-                self.out.reserve_exact(left)
+            // More frames may come with the next call.
+            Some(left) if self.is_last_frame && len_to_move > CHEAP_TO_MOVE => {
+                self.out.reserve_exact(left.max(len_to_move / 4))
             }
             Some(left) => self.out.reserve(left),
             None => self.out.reserve(wanted),
