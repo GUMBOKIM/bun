@@ -193,7 +193,7 @@ impl<'a> Tree<'a> {
     /// For searches at the next two positions: the root of the second, and what that of the first leads to.
     #[inline(always)]
     pub(super) fn prefetch_after(&self, history: &History<'_>, nodes: Nodes<'_>, at: u32) {
-        const CACHED_UP_TO: usize = 1 << 17;
+        const CACHED_UP_TO: usize = 1 << 16;
         if self.roots.len() <= CACHED_UP_TO {
             return;
         }

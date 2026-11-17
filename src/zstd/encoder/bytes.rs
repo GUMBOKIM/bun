@@ -35,7 +35,7 @@ impl<'a, const N: usize> AtLeast<'a, N> {
         if at > self.last {
             return None;
         }
-        self.bytes.get(at..at + N)?.as_array()
+        self.bytes.get(at..)?.first_chunk()
     }
 
     #[inline(always)]
@@ -43,7 +43,7 @@ impl<'a, const N: usize> AtLeast<'a, N> {
         if at > self.last + (N - 8) {
             return None;
         }
-        Some(u64::from_le_bytes(*self.bytes.get(at..at + 8)?.as_array()?))
+        Some(u64::from_le_bytes(*self.bytes.get(at..)?.first_chunk()?))
     }
 
     /// Whether there is a chunk at `at` for whose first word `is_match` holds. A branch on the former may be hard to

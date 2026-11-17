@@ -8,7 +8,7 @@ use crate::bytes::{
     AtLeast, chunk_at, common_suffix, compare, first_difference, likely, u32_at, u64_at,
 };
 
-/// Lower ones have a meaning of their own in tables.
+/// Lower ones have a meaning of their own in most tables.
 pub(crate) const FIRST_INDEX: u32 = 2;
 /// Leaves room for a block before `u32::MAX`.
 pub(crate) const INDEX_MAX: u32 = 3500 << 20;
@@ -299,8 +299,8 @@ impl<'a> History<'a> {
     }
 
     #[inline(always)]
-    pub(crate) fn older_match_len(&self, position: u32, at: u32) -> u32 {
-        self.match_len_in(position, self.older, at)
+    pub(crate) fn older_match_len(&self, position: u32, earlier: u32) -> u32 {
+        self.match_len_in(position, self.older, earlier)
     }
 
     /// `known` bytes need no comparing.

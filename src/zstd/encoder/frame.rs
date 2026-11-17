@@ -143,7 +143,14 @@ impl FrameWriter {
             Start::Frame(_) => 0,
             Start::Part(earlier) => earlier.len(),
         };
-        (self.state).reset(tuning, plan.uses_rows, Owner::Frame, loaded_len)?;
+        let is_only_searched = matches!(start, Start::Frame(None)) && plan.long_distance.is_none();
+        (self.state).reset(
+            tuning,
+            plan.uses_rows,
+            Owner::Frame,
+            loaded_len,
+            is_only_searched,
+        )?;
         self.blocks.is_at_start = true;
         self.long_finder = None;
         self.long_matches.clear();

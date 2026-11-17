@@ -2,7 +2,7 @@
 
 use bun_zstd_decoder::array::At;
 use bun_zstd_decoder::format::{Distribution, FSE_TABLE_LOG_MIN, fse_table_step};
-use bun_zstd_decoder::{Error, Result};
+use bun_zstd_decoder::{Error, Result, read_normalized_counts};
 
 use super::bit_writer::BitWriter;
 use crate::bytes::{chunk_at_mut, highest_bit};
@@ -37,6 +37,21 @@ impl Normalized {
             max_symbol: distribution.counts.len() - 1,
             table_log: distribution.table_log,
         }
+    }
+
+    /// Takes a description off the tables of a dictionary.
+    pub(crate) fn read(bytes: &mut &[u8], max_symbol: usize, log_max: u32) -> Result<Self> {
+        let mut counts = [0; SYMBOLS];
+        let used = counts.get_mut(..=max_symbol).ok_or(Error::Internal)?;
+        let description = (read_normalized_counts(bytes, used).ok())
+            .filter(|description| description.table_log <= log_max)
+            .ok_or(Error::DictionaryCorrupted)?;
+        *bytes = bytes.get(description.len..).ok_or(Error::Internal)?;
+        Ok(Self {
+            counts,
+            max_symbol: description.max_symbol,
+            table_log: description.table_log,
+        })
     }
 
     /// `counts` end with a symbol that occurs, have another one, and add up to `total`.

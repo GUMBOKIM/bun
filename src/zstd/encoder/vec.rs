@@ -40,10 +40,14 @@ pub(crate) fn copied<T: Copy>(from: &[T]) -> Result<Vec<T>> {
     Ok(vec)
 }
 
+pub(crate) fn make_room<T>(vec: &mut Vec<T>, capacity: usize) -> Result<()> {
+    Ok(vec.try_reserve_exact(capacity.saturating_sub(vec.len()))?)
+}
+
 /// Empties `vec`, and makes room for `capacity` elements.
 pub(crate) fn clear_for<T>(vec: &mut Vec<T>, capacity: usize) -> Result<()> {
     vec.clear();
-    Ok(vec.try_reserve_exact(capacity)?)
+    make_room(vec, capacity)
 }
 
 pub(crate) type Shared<T> = std::sync::Arc<T>;

@@ -17,16 +17,16 @@ pub(super) const LANES: usize = 8;
 const SHORT_MATCHES: usize = 128;
 const FEW_LITERALS: usize = 64;
 
+/// The exponent of a float, and the first bits of what it multiplies. Counts are too low to get rounded.
 #[inline(always)]
 fn log2<const IS_ACCURATE: bool>(count: u32) -> i32 {
-    let value = count + 1;
-    let whole = (value | 1).ilog2();
-    let fraction = if IS_ACCURATE {
-        (value << ACCURACY_LOG) >> whole
+    const FRACTION_BITS: u32 = f32::MANTISSA_DIGITS - 1;
+    let bits = ((count + 1) as i32 as f32).to_bits() as i32;
+    if IS_ACCURATE {
+        (bits - 0.5f32.to_bits() as i32) >> (FRACTION_BITS - ACCURACY_LOG)
     } else {
-        0
-    };
-    ((whole << ACCURACY_LOG) + fraction) as i32
+        (bits - 1f32.to_bits() as i32) >> FRACTION_BITS << ACCURACY_LOG
+    }
 }
 
 /// Of the first `USED` of `N` symbols.

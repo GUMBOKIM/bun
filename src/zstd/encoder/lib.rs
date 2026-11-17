@@ -9,7 +9,9 @@
     clippy::unreachable
 )]
 #![warn(unused_must_use)]
-#![feature(adt_const_params, allocator_ext, hint_prefetch, mpmc_channel)]
+// What is generic over a constant is so for its loops.
+#![cfg_attr(mordant, allow(generic_body_not_generic))]
+#![feature(adt_const_params, allocator_ext, fn_align, hint_prefetch, mpmc_channel)]
 
 mod block;
 mod bytes;

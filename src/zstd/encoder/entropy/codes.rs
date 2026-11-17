@@ -352,7 +352,12 @@ impl CodeTables {
     ) -> Result<Chosen> {
         let mut chosen = Chosen::PREDEFINED;
         let current = self.current.as_deref().unwrap_or(&PREDEFINED);
-        let histograms = CodeKind::ALL.map(|kind| histogram(kind, counts));
+        let [first, second, third] = CodeKind::ALL;
+        let mut histograms = [
+            histogram(first, counts),
+            histogram(second, counts),
+            histogram(third, counts),
+        ];
         for (kind, histogram) in CodeKind::ALL.into_iter().zip(&histograms) {
             let (alphabet, reuse) = (ALPHABETS.at(kind as usize), *self.reuse.at(kind as usize));
             let repeated_cost = |counts: &[u32]| current.cost(kind, counts);
@@ -367,7 +372,7 @@ impl CodeTables {
         let next = get_or_allocate(&mut self.next, || TableSet::EMPTY)?;
         let last = sequences.last().ok_or(Error::Internal)?;
         let kinds = CodeKind::ALL.into_iter().zip(chosen.choice.0);
-        for ((kind, encoding), mut histogram) in kinds.zip(histograms) {
+        for ((kind, encoding), histogram) in kinds.zip(&mut histograms) {
             let (alphabet, last) = (ALPHABETS.at(kind as usize), last.code(kind));
             let out = out.get_mut(chosen.len..).ok_or(Error::Internal)?;
             match encoding {
@@ -512,8 +517,9 @@ fn encode(
     };
 
     let (last, rest) = sequences.split_last()?;
+    // Or else the compiler narrows them to 16 bits, and spills one.
     let [mut literal_state, mut offset_state, mut match_state] =
-        last.symbols().map(|symbol| tables.first_state(symbol));
+        core::hint::black_box(last.symbols().map(|symbol| tables.first_state(symbol)));
     add_extra_bits(&mut writer, last)?;
 
     for sequence in rest.iter().rev() {

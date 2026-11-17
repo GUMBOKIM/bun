@@ -8,10 +8,10 @@ use bun_zstd_decoder::format::{
     MATCH_LENGTH_TABLE_LOG_MAX, MAX_LITERAL_LENGTH_CODE, MAX_MATCH_LENGTH_CODE, MAX_OFFSET_CODE,
     OFFSET_TABLE_LOG_MAX,
 };
-use bun_zstd_decoder::{Error, Result, read_huffman_weights, read_normalized_counts};
+use bun_zstd_decoder::{Error, Result, read_huffman_weights};
 
 use crate::bytes::{highest_bit, u32_at};
-use crate::entropy::fse::{Normalized, SYMBOLS};
+use crate::entropy::fse::Normalized;
 use crate::entropy::{Entropy, Reuse};
 use crate::matches::{MatchState, Owner};
 use crate::parameters::{Purpose, Request};
@@ -27,20 +27,6 @@ pub(crate) struct Dictionary {
     pub(crate) state: MatchState,
     pub(crate) entropy: Entropy,
     pub(crate) repeats: Repeats,
-}
-
-fn read_counts(bytes: &mut &[u8], max_symbol: usize, log_max: u32) -> Result<Normalized> {
-    let mut counts = [0; SYMBOLS];
-    let used = counts.get_mut(..=max_symbol).ok_or(Error::Internal)?;
-    let description = (read_normalized_counts(bytes, used).ok())
-        .filter(|description| description.table_log <= log_max)
-        .ok_or(Error::DictionaryCorrupted)?;
-    *bytes = bytes.get(description.len..).ok_or(Error::Internal)?;
-    Ok(Normalized {
-        counts,
-        max_symbol: description.max_symbol,
-        table_log: description.table_log,
-    })
 }
 
 fn reuse(has_all_symbols: bool) -> Reuse {
@@ -61,13 +47,13 @@ fn read_tables<'a>(mut bytes: &'a [u8], entropy: &mut Entropy) -> Result<(Repeat
         .literals
         .load(weights, description.table_log, reuse(has_all))?;
 
-    let offsets = read_counts(&mut bytes, MAX_OFFSET_CODE, OFFSET_TABLE_LOG_MAX)?;
-    let match_lengths = read_counts(
+    let offsets = Normalized::read(&mut bytes, MAX_OFFSET_CODE, OFFSET_TABLE_LOG_MAX)?;
+    let match_lengths = Normalized::read(
         &mut bytes,
         MAX_MATCH_LENGTH_CODE,
         MATCH_LENGTH_TABLE_LOG_MAX,
     )?;
-    let literal_lengths = read_counts(
+    let literal_lengths = Normalized::read(
         &mut bytes,
         MAX_LITERAL_LENGTH_CODE,
         LITERAL_LENGTH_TABLE_LOG_MAX,
@@ -95,7 +81,7 @@ impl Dictionary {
     pub(crate) fn new(bytes: &Shared<Vec<u8>>, request: &Request) -> Result<Self> {
         let tuning = request.tuning(None, Purpose::Dictionary { len: bytes.len() });
         let mut state = MatchState::new(tuning);
-        state.reset(tuning, tuning.prefers_rows(), Owner::Dictionary, 0)?;
+        state.reset(tuning, tuning.prefers_rows(), Owner::Dictionary, 0, false)?;
         let mut entropy = Entropy::EMPTY;
 
         let has_tables = bytes.len() >= WORD_LEN && u32_at(bytes, 0) == Some(DICTIONARY_MAGIC);

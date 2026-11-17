@@ -118,7 +118,7 @@ impl<'a> Output<'a> {
     }
 
     /// Goes on at `position` of `ring`, which is at least that long. The capacity behind `end` is slack.
-    pub(crate) fn resume_ring(ring: &'a mut Vec<u8>, position: usize, end: usize) -> Self {
+    pub fn resume_ring(ring: &'a mut Vec<u8>, position: usize, end: usize) -> Self {
         let end = end.min(ring.capacity());
         Self {
             start: 0,

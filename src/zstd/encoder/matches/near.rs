@@ -1,9 +1,21 @@
 //! What the two fast strategies share when there is only the prefix to search.
 
+use core::marker::ConstParamTy;
+
 use super::{Bounds, Progress};
 use crate::bytes::{AtLeast, likely, u32_at};
 use crate::sequences::{Repeats, Sequences};
 use crate::window::History;
+
+/// What the tables hold.
+#[derive(ConstParamTy, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Entries {
+    /// The history starts at index 0.
+    Positions,
+    /// It does not, and few are out of reach.
+    MostlyNear,
+    Any,
+}
 
 /// The end of the prefix that is within reach of the whole block. One comparison tells whether a candidate is in it.
 pub(super) struct Near<'a> {
@@ -42,6 +54,42 @@ impl<'a> Near<'a> {
         };
         search(&near, &mut progress);
         start + progress.finish(repeats, max_offset)
+    }
+
+    /// For a search of `chunks`, which are its prefix.
+    #[inline(always)]
+    pub(super) fn history_of<const ENTRIES: Entries, const N: usize>(
+        &self,
+        chunks: AtLeast<'a, N>,
+    ) -> History<'a> {
+        History {
+            prefix: chunks.bytes,
+            prefix_index: match ENTRIES {
+                Entries::Positions => 0,
+                _ => self.history.prefix_index,
+            },
+            ..self.history
+        }
+    }
+
+    /// Whether `is_match` holds for the word at `at`, which is what an entry leads to.
+    #[inline(always)]
+    pub(super) fn matches_at<const ENTRIES: Entries, const N: usize>(
+        history: &History<'_>,
+        chunks: AtLeast<'_, N>,
+        at: usize,
+        is_match: impl FnOnce(u64) -> bool,
+    ) -> bool {
+        let is_used = || {
+            // Keeps the compiler from testing this first, which is hard to predict.
+            core::hint::black_box(());
+            history.index(at as u32) != 0
+        };
+        match ENTRIES {
+            Entries::Positions => chunks.matches_at::<false>(at, is_match) && is_used(),
+            Entries::MostlyNear => chunks.matches_at::<false>(at, is_match),
+            Entries::Any => chunks.matches_at::<true>(at, is_match) && is_used(),
+        }
     }
 
     /// Whether the recent offsets lead to something near from `at` on. The second one may be missing.

@@ -256,6 +256,9 @@ pub(crate) fn count_codes(sequences: &[Sequence]) -> CodeCounts {
     counts
 }
 
+/// Where the literals start in their buffer. Copying to an address that is a few bytes further into its page is slow
+/// on some CPUs, and buffers tend to start with a page.
+const LITERALS_START: usize = 256;
 /// How far the copy of literals may go past their end.
 const OVERCOPY: usize = 16;
 
@@ -280,7 +283,7 @@ pub(crate) struct Sequences {
     /// Until they are [`finish`](Self::finish)ed, the fields hold the two lengths and the offset.
     pub(crate) list: Vec<Sequence>,
     literals: Vec<u8>,
-    literals_len: usize,
+    literals_end: usize,
     pub(crate) counts: CodeCounts,
 }
 
@@ -289,7 +292,7 @@ impl Sequences {
         Self {
             list: Vec::new(),
             literals: Vec::new(),
-            literals_len: 0,
+            literals_end: 0,
             counts: [0; _],
         }
     }
@@ -300,11 +303,11 @@ impl Sequences {
     }
 
     pub(crate) fn literals(&self) -> &[u8] {
-        self.literals.get(..self.literals_len).unwrap_or_default()
+        (self.literals.get(LITERALS_START..self.literals_end)).unwrap_or_default()
     }
 
     pub(crate) fn split_mut(&mut self) -> (&mut [Sequence], &[u8]) {
-        let literals = self.literals.get(..self.literals_len);
+        let literals = self.literals.get(LITERALS_START..self.literals_end);
         (&mut self.list, literals.unwrap_or_default())
     }
 
@@ -326,14 +329,14 @@ impl Sequences {
     /// `block` is what was searched, and `end` where the last match ends.
     pub(crate) fn finish(&mut self, block: &[u8], end: u32) -> Result<()> {
         let room = self.literal_count(block).unwrap_or(block.len());
-        grow(&mut self.literals, 0, room + OVERCOPY)?;
+        grow(&mut self.literals, 0, LITERALS_START + room + OVERCOPY)?;
         let (list, literals) = (self.list.as_mut_slice(), self.literals.as_mut_slice());
         let counts = &mut self.counts;
         *counts = [0; _];
-        let literals_len = with_bmi2(
+        let literals_end = with_bmi2(
             #[inline(always)]
             move || {
-                let (mut from, mut to) = (0u32, 0u32);
+                let (mut from, mut to) = (0u32, LITERALS_START as u32);
                 for sequence in list {
                     let (literal_len, match_base) =
                         (sequence.extra as u32, (sequence.extra >> 32) as u32);
@@ -356,7 +359,7 @@ impl Sequences {
                 Some(to as usize + last.len())
             },
         );
-        self.literals_len = literals_len.ok_or(Error::Internal)?;
+        self.literals_end = literals_end.ok_or(Error::Internal)?;
         Ok(())
     }
 }

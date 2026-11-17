@@ -6,8 +6,10 @@ use core::convert::{Infallible, identity};
 use bun_highway::with_bmi2;
 
 use super::hash::{Hasher, Tagged, insert};
-use super::near::Near;
-use super::{Attached, MatchState, Owner, Progress, Reach, SKIP_LOG, TablesMut, cells, prefetch};
+use super::near::{Entries, Near};
+use super::{
+    Attached, MatchState, Owner, Progress, Reach, SKIP_LOG, TablesMut, apart, cells, prefetch,
+};
 use crate::bytes::{AtLeast, chunk_at, likely, u32_at, u64_at, word_in};
 use crate::parameters::TAG_BITS;
 use crate::sequences::{OffsetValue, Repeats, Sequences};
@@ -70,7 +72,7 @@ pub(super) fn search<const REACH: Reach>(
         searcher.history = history.from_older(lowest);
         let mut progress = Progress::new(sequences, history.start, *repeats, u32::MAX);
         let progress_mut = &mut progress;
-        searcher.run(
+        searcher.run_on_long_input(
             #[inline(always)]
             move |searcher| searcher.search_with_older(progress_mut),
         );
@@ -126,15 +128,28 @@ impl<'a> Searcher<'a> {
         if !Near::has_repeats(progress, at) {
             at = self.start_prefix(near, progress)?;
         }
-        self.run(
+        if near.history.prefix_index == 0
+            && let Some(end) = self.run_from_start(
+                #[inline(always)]
+                |it| it.scan_prefix::<{ Entries::Positions }, true>(near, at, progress),
+            )
+        {
+            return end;
+        }
+        self.run_on_long_input(
             #[inline(always)]
-            move |searcher| searcher.scan_prefix::<true>(near, at, progress),
+            move |it| it.scan_prefix::<{ Entries::Any }, true>(near, at, progress),
         )
     }
 
     #[inline(never)]
     fn start_prefix(self, near: &Near<'a>, progress: &mut Progress<'_>) -> Option<u32> {
-        self.scan_prefix::<false>(near, near.history.start, progress)
+        self.scan_prefix::<{ Entries::Any }, false>(near, near.history.start, progress)
+    }
+
+    fn table_logs(&self) -> (u32, u32) {
+        let log = |table: &[Cell<u32>]| table.len().trailing_zeros();
+        (log(self.long_table), log(self.short_table))
     }
 
     /// With tables whose sizes the compiler knows, hashes need no checks.
@@ -143,7 +158,7 @@ impl<'a> Searcher<'a> {
         self,
         search: impl FnOnce(Self) -> Option<R>,
     ) -> Option<R> {
-        with_bmi2(
+        apart(
             #[inline(always)]
             move || {
                 search(Self {
@@ -157,13 +172,28 @@ impl<'a> Searcher<'a> {
         )
     }
 
+    /// If the sizes are those of a level.
     #[inline(always)]
-    fn run<R>(self, search: impl FnOnce(Self) -> Option<R>) -> Option<R> {
-        let log = |table: &[Cell<u32>]| table.len().trailing_zeros();
-        // Those of levels 3 and 4 for all but small inputs.
-        match (log(self.long_table), log(self.short_table)) {
+    fn run_from_start<R>(self, search: impl FnOnce(Self) -> Option<R>) -> Option<Option<R>> {
+        Some(match self.table_logs() {
+            (11, 10) => self.run_sized::<11, 10, _>(search),
+            (12, 11) => self.run_sized::<12, 11, _>(search),
+            (13, 12) => self.run_sized::<13, 12, _>(search),
+            (14, 13) => self.run_sized::<14, 13, _>(search),
+            (14, 14) => self.run_sized::<14, 14, _>(search),
+            (15, 14) => self.run_sized::<15, 14, _>(search),
             (16, 15) => self.run_sized::<16, 15, _>(search),
             (16, 16) => self.run_sized::<16, 16, _>(search),
+            (17, 16) => self.run_sized::<17, 16, _>(search),
+            (17, 17) => self.run_sized::<17, 17, _>(search),
+            (18, 18) => self.run_sized::<18, 18, _>(search),
+            _ => return None,
+        })
+    }
+
+    #[inline(always)]
+    fn run_on_long_input<R>(self, search: impl FnOnce(Self) -> Option<R>) -> Option<R> {
+        match self.table_logs() {
             (17, 16) => self.run_sized::<17, 16, _>(search),
             (18, 18) => self.run_sized::<18, 18, _>(search),
             _ => with_bmi2(
@@ -175,7 +205,7 @@ impl<'a> Searcher<'a> {
 
     /// Unless it [`HAS_REPEATS`](Near::has_repeats) from the start, it returns where it does.
     #[inline(always)]
-    fn scan_prefix<const HAS_REPEATS: bool>(
+    fn scan_prefix<const ENTRIES: Entries, const HAS_REPEATS: bool>(
         mut self,
         near: &Near<'a>,
         start: u32,
@@ -183,8 +213,7 @@ impl<'a> Searcher<'a> {
     ) -> Option<u32> {
         const STEP_GROWS_AFTER: usize = 1 << SKIP_LOG;
         let chunks = AtLeast::<WORD_LEN>::new(near.history.prefix)?;
-        self.history = near.history;
-        self.history.prefix = chunks.bytes;
+        self.history = near.history_of::<ENTRIES, _>(chunks);
         let history = &self.history;
         let index = |at: usize| history.index(at as u32);
         let position = |entry: &Cell<u32>| history.position(entry.get()) as usize;
@@ -220,12 +249,14 @@ impl<'a> Searcher<'a> {
                     }
 
                     let ahead_entry = self.long_entry(ahead_word)?;
-                    if chunks.matches_at::<true>(long, |it| it == word) {
+                    if Near::matches_at::<ENTRIES, _>(history, chunks, long, |it| it == word) {
                         break (at, long, match_len(at, long, 8), ahead_entry);
                     }
 
                     let ahead_long = position(ahead_entry);
-                    if chunks.matches_at::<true>(short, |it| it as u32 == word as u32) {
+                    if Near::matches_at::<ENTRIES, _>(history, chunks, short, |it| {
+                        it as u32 == word as u32
+                    }) {
                         let len = match_len(at, short, 4);
                         if ahead_long != 0 && chunks.word(ahead_long) == Some(ahead_word) {
                             let ahead_len = match_len(ahead, ahead_long, 8);

@@ -129,6 +129,13 @@ fn prefetch<T>(items: &[T], at: usize) {
     core::hint::prefetch_read(item, core::hint::Locality::L1);
 }
 
+/// For code that is tuned: how fast its loops are does not depend on what surrounds it.
+#[inline(never)]
+#[rustc_align(64)]
+fn apart<R>(run: impl FnOnce() -> R) -> R {
+    run()
+}
+
 /// How far back a match can start.
 #[derive(Clone, Copy)]
 struct Bounds {
@@ -287,9 +294,9 @@ impl MatchState {
         Self {
             tuning,
             uses_rows: false,
-            window: Window::starting_at(FIRST_INDEX),
+            window: Window::starting_at(0),
             dictionary_end: 0,
-            next_to_index: FIRST_INDEX,
+            next_to_index: 0,
             tables: Tables::default(),
             optimal: None,
         }
@@ -302,14 +309,21 @@ impl MatchState {
         uses_rows: bool,
         owner: Owner,
         loaded_len: usize,
+        is_only_searched: bool,
     ) -> Result<()> {
+        // These searches never index the first byte, which can therefore stand for nothing.
+        let first_index = if is_only_searched && tuning.strategy <= Strategy::DoubleFast {
+            0
+        } else {
+            FIRST_INDEX
+        };
         // Clearing the tables is faster than lowering their indices.
         if self.window.would_overflow(loaded_len + (16 << 20)) {
             self.tables.indices.0.clear();
-            self.window.next = FIRST_INDEX;
+            self.window.next = 0;
         }
         (self.tuning, self.uses_rows) = (tuning, uses_rows);
-        self.window = Window::starting_at(self.window.next);
+        self.window = Window::starting_at(self.window.next.max(first_index));
         self.dictionary_end = 0;
         self.next_to_index = self.window.next;
 

@@ -4,13 +4,13 @@ use core::convert::identity;
 use core::ops::RangeInclusive;
 
 use bun_zstd_decoder::Result;
-use bun_zstd_decoder::array::{At, allocate, grow};
+use bun_zstd_decoder::array::{At, allocate};
 
 use super::hash::Hasher;
 use super::long_distance::Cursor;
 use super::prices::{BIT, LANES, Prices};
 use super::tree::{self, Descent, Node, Tree};
-use super::{Attached, MatchState, Reach, Search, WORD};
+use super::{Attached, MatchState, Reach, Search, WORD, prefetch};
 use crate::bytes::{likely, u32_at, u64_at};
 use crate::parameters::Strategy;
 use crate::sequences::{OffsetValue, Repeats, Sequences};
@@ -49,9 +49,23 @@ struct Ways<'a> {
 }
 
 impl<'a> Ways<'a> {
-    /// The compiler sees that both have the same length.
+    /// How many entries are needed beyond the end of a match.
+    const MARGIN: usize = 3 + LANES;
+
+    /// For matches that end at up to `end`. The compiler sees that both have the same length.
     #[inline(always)]
-    fn new(prices: &'a mut [i32], ends: &'a mut [End]) -> Option<Self> {
+    fn new(prices: &'a mut Vec<i32>, ends: &'a mut Vec<End>, end: u32) -> Option<Self> {
+        #[cold]
+        #[inline(never)]
+        fn lengthen(prices: &mut Vec<i32>, ends: &mut Vec<End>, len: usize) {
+            let len = len.min(prices.capacity()).min(ends.capacity());
+            prices.resize(len, 0);
+            ends.resize(len, End::default());
+        }
+        let needed = end as usize + Self::MARGIN;
+        if prices.len() < needed {
+            lengthen(prices, ends, 2 * needed);
+        }
         let len = prices.len() as u32 as usize;
         Some(Self {
             prices: prices.get_mut(..len)?,
@@ -164,10 +178,10 @@ impl State {
     }
 
     pub(super) fn reserve(&mut self, block_len: usize) -> Result<()> {
-        let len = block_len.min(HORIZON as usize) + 3 + LANES;
+        let len = block_len.min(HORIZON as usize) + Ways::MARGIN;
         vec::clear_for(&mut self.matches, len)?;
-        grow(&mut self.way_prices, 0, len)?;
-        grow(&mut self.way_ends, End::default(), len)
+        vec::make_room(&mut self.way_prices, len)?;
+        vec::make_room(&mut self.way_ends, len)
     }
 }
 
@@ -301,12 +315,32 @@ impl Finder<'_> {
     /// The last position before `at` with about the same 3 bytes.
     #[inline(always)]
     fn find3(&mut self, history: &History<'_>, at: u32, word: u64) -> Option<u32> {
-        let current = history.index(at);
-        for index in self.next_to_index3..current {
-            let word = u64_at(history.prefix, history.position(index))?;
-            *self.tree.hash3.get_mut(self.hasher3.hash(word))? = index;
+        #[inline(never)]
+        fn fill(table: &mut [u32], hasher: Hasher, bytes: &[u8], first: u32) -> Option<()> {
+            // Without a way out, the loop gets unrolled.
+            let mask = (table.len() as u32).wrapping_sub(1) as usize;
+            let (table, last) = (table.get_mut(..mask + 1)?, bytes.len().checked_sub(4)?);
+            for at in 0..last + 1 {
+                let word = u32::from_le_bytes(*bytes.get(at..at + 4)?.as_array()?);
+                *table.get_mut(hasher.hash(word.into()) & mask)? = first + at as u32;
+            }
+            Some(())
         }
-        self.next_to_index3 = current;
+        let current = history.index(at);
+        let first = core::mem::replace(&mut self.next_to_index3, current);
+        if first + 1 == current {
+            let word = u64_at(history.prefix, at.wrapping_sub(1))?;
+            *self.tree.hash3.get_mut(self.hasher3.hash(word))? = first;
+        } else if first < current {
+            let bytes = history.position(first) as usize..at as usize + 3;
+            fill(
+                self.tree.hash3,
+                self.hasher3,
+                history.prefix.get(bytes)?,
+                first,
+            )?;
+        }
+        prefetch(self.tree.hash3, self.hasher3.hash(word >> 16));
         self.tree.hash3.get(self.hasher3.hash(word)).copied()
     }
 
@@ -468,7 +502,7 @@ impl Finder<'_> {
             return Some(anchor);
         };
         let (prefix, limit) = (history.prefix, history.end() - WORD);
-        let mut ways = Ways::new(way_prices, way_ends)?;
+        let mut ways = Ways::new(way_prices, way_ends, 0)?;
         let mut at = anchor + u32::from(anchor == 0);
         let mut is_first_match = true;
 
@@ -513,6 +547,7 @@ impl Finder<'_> {
                     }
 
                     if longest_end > end {
+                        ways = Ways::new(way_prices, way_ends, longest_end)?;
                         ways.clear(end + 1..=longest_end + 1)?;
                         end = longest_end;
                     } else {

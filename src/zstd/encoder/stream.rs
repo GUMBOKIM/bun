@@ -3,7 +3,7 @@
 use core::ops::Range;
 
 use bun_removable_features::removable_definition;
-use bun_zstd_decoder::array::{allocate, grow};
+use bun_zstd_decoder::array::allocate;
 use bun_zstd_decoder::{Error, Output, Result, Status};
 
 use crate::dictionary::Dictionary;
@@ -47,8 +47,8 @@ impl Backlog {
         room: usize,
         write: impl FnOnce(&mut Output<'_>) -> Result<()>,
     ) -> Result<()> {
-        grow(&mut self.bytes, 0, room)?;
-        let mut out = Output::slice(self.bytes.get_mut(..room).unwrap_or_default());
+        vec::make_room(&mut self.bytes, room)?;
+        let mut out = Output::resume_ring(&mut self.bytes, 0, room);
         write(&mut out)?;
         self.left = 0..out.written();
         Ok(())
