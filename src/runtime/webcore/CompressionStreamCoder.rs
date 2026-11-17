@@ -495,6 +495,10 @@ impl CompressionStreamCoder {
                 }
             }
             Backend::ZstdDecode(p) => {
+                // The decoder fails after 16 steps in a row that get nowhere.
+                if input.is_empty() && !continuing && !finish {
+                    return Ok(Progress::Done);
+                }
                 // After a frame completes, whatever follows must be another frame
                 // magic (see `zstd_head`); `step` has already re-attached a split one.
                 let mut remaining = input;
