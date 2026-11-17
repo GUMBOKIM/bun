@@ -479,7 +479,6 @@ impl MatchState {
             }
         }
         self.next_to_index = self.next_to_index.saturating_sub(by);
-        self.dictionary_end = 0;
     }
 
     /// After a long match, leaves most of it out of the tables.

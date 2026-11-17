@@ -224,10 +224,13 @@ impl Chosen {
     }
 }
 
+/// More than the three can take.
+const DESCRIPTIONS_LEN_MAX: usize = 160;
+
 /// How sequences are going to be encoded.
 pub(crate) struct CodesPlan {
     chosen: Chosen,
-    descriptions: [u8; 133],
+    descriptions: [u8; DESCRIPTIONS_LEN_MAX],
 }
 
 impl CodesPlan {

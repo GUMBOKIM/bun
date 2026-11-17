@@ -12,28 +12,27 @@ pub(super) type Node = [Cell<u32>; 2];
 
 #[derive(Clone, Copy)]
 pub(super) struct Nodes<'a> {
-    /// The compiler sees their number as `mask + 1`, and that a masked index is below it.
     nodes: &'a [Node],
-    mask: usize,
+    mask: u32,
 }
 
 impl<'a> Nodes<'a> {
+    /// The compiler sees their number as `mask + 1`, and that a masked index is below it.
     #[inline(always)]
-    pub(super) fn new(nodes: &'a [Node]) -> Option<Self> {
-        let mask = nodes.len().wrapping_sub(1) as u32 as usize;
-        let nodes = nodes.get(..mask + 1)?;
-        Some(Self { nodes, mask })
+    pub(super) fn checked(self) -> Option<Self> {
+        let nodes = self.nodes.get(..self.mask as usize + 1)?;
+        Some(Self { nodes, ..self })
     }
 
     #[inline(always)]
     pub(super) fn get(self, index: u32) -> Option<&'a Node> {
-        self.nodes.get(index as usize & self.mask)
+        self.nodes.get((index & self.mask) as usize)
     }
 
     /// The last index whose node may have been taken by another one.
     #[inline(always)]
     pub(super) fn overwritten(self, current: u32) -> u32 {
-        current.saturating_sub(self.mask as u32)
+        current.saturating_sub(self.mask)
     }
 }
 
@@ -155,7 +154,7 @@ pub(super) fn fill(state: &mut MatchState, history: &History<'_>, end: u32) {
 pub(super) struct Tree<'a> {
     pub(super) bounds: Bounds,
     pub(super) roots: &'a mut [u32],
-    pub(super) nodes: &'a [Node],
+    pub(super) nodes: Nodes<'a>,
     pub(super) hash3: &'a mut [u32],
     pub(super) hasher: Hasher,
     pub(super) attempts: u32,
@@ -169,7 +168,10 @@ impl<'a> Tree<'a> {
         Self {
             bounds,
             roots: tables.hash,
-            nodes: cells(tables.chain).as_chunks().0,
+            nodes: Nodes {
+                nodes: cells(tables.chain).as_chunks().0,
+                mask: (1 << tuning.cycle_log()) - 1,
+            },
             hash3: tables.hash3,
             hasher: Hasher::new(min_match, tuning.hash_log),
             attempts: 1 << tuning.search_log,
@@ -190,7 +192,7 @@ impl<'a> Tree<'a> {
         prefetch(self.roots, self.hasher.hash(word_in::<1, _>(words)));
         if let Some(&root) = self.roots.get(self.hasher.hash(word_in::<0, _>(words))) {
             prefetch(history.prefix, history.position(root) as usize);
-            prefetch(nodes.nodes, root as usize & nodes.mask);
+            prefetch(nodes.nodes, (root & nodes.mask) as usize);
         }
     }
 
@@ -208,7 +210,7 @@ impl<'a> Tree<'a> {
             .roots
             .get_mut(self.hasher.hash(u64_at(history.prefix, at)?))?;
         let mut index = core::mem::replace(root, current);
-        let nodes = Nodes::new(self.nodes)?;
+        let nodes = self.nodes.checked()?;
         let overwritten = nodes.overwritten(current);
         let spare = Node::default();
         let mut descent = Descent::new(nodes.get(current)?);

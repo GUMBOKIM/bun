@@ -8,7 +8,7 @@ use bun_zstd_decoder::Result;
 use super::hash::Hasher;
 use super::long_distance::Cursor;
 use super::prices::{BIT, LANES, Prices};
-use super::tree::{self, Descent, Node, Nodes, Tree};
+use super::tree::{self, Descent, Node, Tree};
 use super::{Attached, MatchState, Reach, Search, WORD};
 use crate::array::At;
 use crate::bytes::{likely, u32_at, u64_at};
@@ -321,7 +321,7 @@ impl Finder<'_> {
         matches: &mut Vec<Match>,
     ) -> Option<()> {
         let current = history.index(at);
-        let nodes = Nodes::new(self.tree.nodes)?;
+        let nodes = self.tree.nodes.checked()?;
         self.tree.prefetch_after(history, nodes, at);
         self.tree.insert_up_to::<REACH>(history, at)?;
 
@@ -383,7 +383,7 @@ impl Finder<'_> {
         matches: &mut Vec<Match>,
     ) -> Option<u32> {
         let history = self.history.with_prefix_of::<WORD_LEN>()?;
-        let nodes = Nodes::new(self.tree.nodes)?;
+        let nodes = self.tree.nodes.checked()?;
         let (current, left) = (history.index(at), history.end() - at);
         let overwritten = nodes.overwritten(current);
         let spare = Node::default();

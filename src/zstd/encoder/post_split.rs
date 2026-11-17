@@ -31,38 +31,39 @@ struct Splitter<'a> {
 }
 
 impl Splitter<'_> {
-    fn estimated_len(&mut self, part: &Part) -> Option<usize> {
-        let literals = self.literals.get(part.literals.clone())?;
-        let sequences = self.sequences.get(part.sequences.clone())?;
+    /// `None` if its tables cannot be described.
+    fn estimated_len(&mut self, part: &Part) -> Result<Option<usize>> {
+        let literals = self.literals.get(part.literals.clone());
+        let sequences = self.sequences.get(part.sequences.clone());
+        let (literals, sequences) = literals.zip(sequences).ok_or(Error::Internal)?;
         let counts = count_codes(sequences);
         let entropy = &mut self.writer.entropy;
-        let literals_plan = entropy.literals.plan(literals, self.tuning).ok()??;
-        let codes_plan = entropy
-            .codes
-            .plan(sequences, &counts, self.tuning.strategy)
-            .ok()?;
+        let Some(literals_plan) = entropy.literals.plan(literals, self.tuning)? else {
+            return Ok(None);
+        };
+        let codes_plan = (entropy.codes).plan(sequences, &counts, self.tuning.strategy)?;
         let count = part.sequences.len();
         let headers_len = BLOCK_HEADER_LEN
             + 2
             + usize::from(count >= 128)
             + usize::from(count >= LONG_SEQUENCE_COUNT);
         let overhead = LiteralsPlan::overhead(literals.len());
-        Some(
+        Ok(Some(
             headers_len
                 + literals_plan.estimated_len(literals.len(), overhead)
                 + entropy.codes.estimated_len(&codes_plan, &counts),
-        )
+        ))
     }
 
     /// `len` is the estimate for `whole`.
-    fn split(&mut self, whole: &Part, len: usize) -> Option<()> {
+    fn split(&mut self, whole: &Part, len: usize) -> Result<()> {
         if whole.sequences.len() < SEQUENCES_MIN || self.count == SPLITS_MAX {
-            return None;
+            return Ok(());
         }
         let middle = whole.sequences.start.midpoint(whole.sequences.end);
         let first = whole.sequences.start..middle;
-        let literals_middle =
-            whole.literals.start + literals_len(self.sequences.get(first.clone())?);
+        let before_middle = self.sequences.get(first.clone()).ok_or(Error::Internal)?;
+        let literals_middle = whole.literals.start + literals_len(before_middle);
         let first = Part {
             sequences: first,
             literals: whole.literals.start..literals_middle,
@@ -71,14 +72,18 @@ impl Splitter<'_> {
             sequences: middle..whole.sequences.end,
             literals: literals_middle..whole.literals.end,
         };
-        let (first_len, second_len) = (self.estimated_len(&first)?, self.estimated_len(&second)?);
-        if first_len + second_len < len {
-            self.split(&first, first_len);
-            *self.splits.get_mut(self.count)? = middle as u16;
-            self.count += 1;
-            self.split(&second, second_len);
+        if let Some(first_len) = self.estimated_len(&first)?
+            && let Some(second_len) = self.estimated_len(&second)?
+            && first_len + second_len < len
+        {
+            self.split(&first, first_len)?;
+            if let Some(split) = self.splits.get_mut(self.count) {
+                *split = middle as u16;
+                self.count += 1;
+                self.split(&second, second_len)?;
+            }
         }
-        Some(())
+        Ok(())
     }
 }
 
@@ -120,9 +125,9 @@ pub(crate) fn write(
         count: 0,
     };
     if whole.sequences.len() >= SEQUENCES_MIN
-        && let Some(len) = splitter.estimated_len(&whole)
+        && let Some(len) = splitter.estimated_len(&whole)?
     {
-        splitter.split(&whole, len);
+        splitter.split(&whole, len)?;
     }
     let Splitter { splits, count, .. } = splitter;
     if count == 0 {

@@ -2,11 +2,11 @@
 
 use super::hash::Hasher;
 use super::lazy::{Finder, Match};
-use super::tree::{self, Descent, Node, Nodes, Tree};
+use super::tree::{self, Descent, Node, Tree};
 use super::{Attached, MatchState, Reach, WORD};
-use crate::bytes::{self, highest_bit, u64_at};
+use crate::bytes::{self, highest_bit, likely, u64_at};
 use crate::sequences::OffsetValue;
-use crate::window::History;
+use crate::window::{History, WORD_LEN};
 
 /// In the second half of a node. The first half links to the last position with the same hash.
 pub(super) const UNSORTED: u32 = 1;
@@ -29,30 +29,34 @@ impl<'a> LazyTree<'a> {
         }
     }
 
-    #[inline(always)]
-    fn link_up_to(&mut self, history: &History<'_>, end: u32) -> Option<()> {
+    /// Out of line, where its loop has the registers for itself.
+    #[inline(never)]
+    fn link_up_to(&mut self, history: History<'_>, end: u32) -> Option<()> {
         let tree = &mut self.tree;
-        let nodes = Nodes::new(tree.nodes)?;
-        for index in tree.next_to_index..end {
-            let word = u64_at(history.prefix, history.position(index))?;
-            let root = tree.roots.get_mut(tree.hasher.hash(word))?;
+        let (nodes, hasher, roots) = (tree.nodes.checked()?, tree.hasher, &mut *tree.roots);
+        let bytes = likely(history.prefix.get(..end as usize + WORD_LEN))?;
+        for position in history.position(tree.next_to_index) as usize..end as usize {
+            let word = bytes.get(position..position + WORD_LEN)?.as_array()?;
+            let root = likely(roots.get_mut(hasher.hash(u64::from_le_bytes(*word))))?;
+            let index = history.index(position as u32);
             let [link, mark] = nodes.get(index)?;
             link.set(core::mem::replace(root, index));
             mark.set(UNSORTED);
         }
-        tree.next_to_index = end;
+        tree.next_to_index = history.index(end);
         Some(())
     }
 
-    #[inline(always)]
+    #[inline(never)]
     fn sort<const REACH: Reach>(
         &self,
-        history: &History<'_>,
+        history: History<'_>,
         current: u32,
         attempts: u32,
         last: u32,
     ) -> Option<()> {
-        let nodes = Nodes::new(self.tree.nodes)?;
+        let history = &history.with_prefix_of::<WORD_LEN>()?;
+        let nodes = self.tree.nodes.checked()?;
         let (run, at) = match REACH {
             Reach::Older => history.locate(current),
             _ => (history.prefix, history.position(current)),
@@ -96,7 +100,7 @@ impl<'a> LazyTree<'a> {
         mut index: u32,
         last: u32,
     ) -> Option<()> {
-        let nodes = Nodes::new(self.tree.nodes)?;
+        let nodes = self.tree.nodes.checked()?;
         let mut attempts = self.tree.attempts;
         let mut newer = 0;
         while index > last {
@@ -117,7 +121,7 @@ impl<'a> LazyTree<'a> {
         while newer != 0 {
             let [_, mark] = nodes.get(newer)?;
             let next = mark.get();
-            self.sort::<REACH>(history, newer, attempts, last)?;
+            self.sort::<REACH>(*history, newer, attempts, last)?;
             newer = next;
             attempts += 1;
         }
@@ -146,13 +150,16 @@ impl Finder for LazyTree<'_> {
         if current < self.tree.next_to_index {
             return Some(best);
         }
-        self.link_up_to(history, current)?;
+        if self.tree.next_to_index < current {
+            self.link_up_to(*history, at)?;
+        }
 
-        let word = u64_at(history.prefix, at)?;
+        let word = likely(u64_at(history.prefix, at))?;
         let lowest = self.tree.bounds.lowest(current);
-        let nodes = Nodes::new(self.tree.nodes)?;
+        let nodes = self.tree.nodes.checked()?;
+        self.tree.prefetch_after(history, nodes, at);
         let overwritten = nodes.overwritten(current);
-        let root = self.tree.roots.get_mut(self.tree.hasher.hash(word))?;
+        let root = likely(self.tree.roots.get_mut(self.tree.hasher.hash(word)))?;
         let mut index = core::mem::replace(root, current);
         self.sort_chain::<REACH>(history, index, overwritten.max(lowest))?;
 
