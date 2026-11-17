@@ -67,3 +67,10 @@ pub(super) static GEAR_TABLE: [u64; 256] = [
     0x8cd4fd6b4e85a5b2, 0xfab071054ba6409d, 0x40d6fe831fa9dfd9, 0xaf358debad7d791e,
     0xeb8d0e25a65e3e58, 0xbbcbd3df14e08580, 0x0cf751f27ecdab2b, 0x2b4da14f2613d8f4,
 ];
+
+#[test]
+fn is_that_of_zstd() {
+    let bytes = GEAR_TABLE.map(u64::to_le_bytes);
+    let hash = bun_zstd_decoder::XxHash64::hash(bytes.as_flattened());
+    assert_eq!(hash as u32, 0x1D96_EA42);
+}

@@ -412,3 +412,156 @@ impl FrameWriter {
         Ok((end.wrapping_sub(search.history.start), repeats))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use bun_zstd_decoder::decompress;
+
+    use super::*;
+    use crate::parameters::Request;
+    use crate::vec;
+    use crate::window::{FIRST_INDEX, INDEX_MAX, Window};
+
+    const PIECE_LEN: usize = 3000;
+
+    /// Words of 3 to 10 bytes.
+    fn sample() -> Vec<u8> {
+        let words = (0..3000u64).map(|it| {
+            let hash = XxHash64::hash(&it.to_le_bytes());
+            let word = XxHash64::hash(&(hash % 500).to_le_bytes()).to_le_bytes();
+            word.into_iter()
+                .chain([b' '; 2])
+                .take(3 + (hash >> 20) as usize % 8)
+        });
+        words.flatten().collect()
+    }
+
+    fn request(parameters: &[(u32, i32)]) -> Result<Request> {
+        let mut request = Request::new(1);
+        for &(key, value) in parameters {
+            request.set(key, value)?;
+        }
+        Ok(request)
+    }
+
+    fn writer(request: &Request, next_index: u32) -> FrameWriter {
+        let tuning = request.tuning(None, Purpose::Frame { dictionary_len: 0 });
+        let mut writer = FrameWriter::new(request.plan(tuning));
+        writer.state.window = Window::starting_at(next_index);
+        writer
+    }
+
+    /// In pieces, of which every other one is somewhere else than the one before.
+    fn write(
+        writer: &mut FrameWriter,
+        bytes: &[u8],
+        dictionary: Option<&Dictionary>,
+    ) -> Result<Vec<u8>> {
+        let mut frame = Vec::with_capacity(2 * bytes.len());
+        let mut out = Output::spare_capacity(&mut frame, usize::MAX);
+        let mut older = dictionary.map(Dictionary::content).unwrap_or_default();
+        for segment in bytes.chunks(2 * PIECE_LEN) {
+            let first = segment.get(..PIECE_LEN).unwrap_or(segment);
+            writer.write(&Input::alone(first, older), dictionary, false, &mut out)?;
+            let second = Input {
+                segment,
+                len: segment.len() - first.len(),
+                follows_last: true,
+                older,
+            };
+            writer.write(&second, dictionary, false, &mut out)?;
+            older = segment;
+        }
+        writer.write(&Input::alone(&[], &[]), dictionary, true, &mut out)?;
+        drop(out);
+        Ok(frame)
+    }
+
+    #[test]
+    fn lowering_indices_changes_nothing() -> Result<()> {
+        let bytes = sample();
+        for strategy in 1..=9 {
+            for (window_log, chain_log) in [(10, 6), (10, 12), (12, 9), (15, 10)] {
+                let request = request(&[
+                    (101, window_log),
+                    (102, 10),
+                    (103, chain_log),
+                    (104, 3),
+                    (105, 3 + window_log % 3),
+                    (107, strategy),
+                ])?;
+                let frame_from = |index| {
+                    let mut writer = writer(&request, FIRST_INDEX);
+                    writer.start(writer.plan, None, Start::Frame(None))?;
+                    writer.state.window = Window::starting_at(index);
+                    writer.state.next_to_index = index;
+                    let frame = write(&mut writer, &bytes, None)?;
+                    assert!(writer.state.window.next < 1 << 17);
+                    Ok::<_, Error>(frame)
+                };
+                let expected = frame_from(FIRST_INDEX)?;
+                // Among them those from which a block starts at the first indices of a cycle
+                let pieces = [1, 2, 3, 4].map(|it| it * PIECE_LEN as u32);
+                for before in pieces
+                    .into_iter()
+                    .flat_map(|it| [it - 2, it - 1, it, it + 700])
+                {
+                    let frame = frame_from(INDEX_MAX - before)?;
+                    assert!(frame == expected, "{strategy} {window_log} {before}");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn indices_start_over_when_a_frame_starts_near_the_end() -> Result<()> {
+        let request = request(&[(101, 12), (107, 4)])?;
+        let last_kept = INDEX_MAX - (16 << 20);
+        for (index, start, expected) in [
+            (last_kept, Start::Frame(None), last_kept),
+            (last_kept + 1, Start::Frame(None), FIRST_INDEX),
+            (last_kept - 8, Start::Part(&[0; 8]), last_kept),
+            (last_kept - 8, Start::Part(&[0; 9]), FIRST_INDEX + 9),
+        ] {
+            let mut writer = writer(&request, index);
+            writer.start(writer.plan, None, start)?;
+            assert_eq!(writer.state.window.next, expected);
+        }
+
+        // What the tables hold is not taken for input of the new frame.
+        let bytes = sample();
+        let mut writer = writer(&request, FIRST_INDEX);
+        writer.start(writer.plan, None, Start::Frame(None))?;
+        let expected = write(&mut writer, &bytes, None)?;
+        writer.state.window.next = INDEX_MAX;
+        writer.start(writer.plan, None, Start::Frame(None))?;
+        assert!(write(&mut writer, &bytes, None)? == expected);
+        Ok(())
+    }
+
+    #[test]
+    fn a_dictionary_is_out_of_reach_once_indices_are_lowered() -> Result<()> {
+        let bytes = sample();
+        let request = request(&[(101, 17), (107, 2)])?;
+        let dictionary = Dictionary::new(&vec::shared(bytes.clone())?, &request)?;
+        let frame_from = |index| {
+            let mut writer = writer(&request, FIRST_INDEX);
+            writer.start(writer.plan, None, Start::Frame(Some(&dictionary)))?;
+            writer.state.window = Window::starting_at(index);
+            writer.state.attach(&dictionary.state);
+            write(
+                &mut writer,
+                bytes.get(..PIECE_LEN).unwrap_or_default(),
+                Some(&dictionary),
+            )
+        };
+        assert!(frame_from(INDEX_MAX - PIECE_LEN as u32)?.len() < 30);
+
+        let frame = frame_from(INDEX_MAX - PIECE_LEN as u32 + 1)?;
+        let mut back = [0; PIECE_LEN];
+        decompress(&frame, &mut Output::slice(&mut back), None)?;
+        assert!(bytes.starts_with(&back));
+        Ok(())
+    }
+}

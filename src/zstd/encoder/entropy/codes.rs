@@ -536,3 +536,10 @@ fn encode(
     literal_shape.finish(&mut writer, literal_state)?;
     writer.finish()
 }
+
+#[test]
+fn costs_are_logarithms() {
+    for (share, cost) in INVERSE_PROBABILITY_LOG.into_iter().enumerate().skip(1) {
+        assert_eq!(cost, (-(share as f64 / 256.0).log2() * 256.0) as u16);
+    }
+}

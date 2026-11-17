@@ -472,6 +472,76 @@ fn a_new_session_keeps_the_settings() -> Result<()> {
 }
 
 #[test]
+fn a_new_session_starts_from_nothing() {
+    let mut decoder = Decoder::new();
+    let frame = hex("28b52ffd 0000 190000 616263");
+    // Two of the three bytes of a block header, and steps that got nowhere
+    assert_eq!(step(&mut decoder, &frame[..8], 9).0, 8);
+    for _ in 0..15 {
+        assert_eq!(step(&mut decoder, &[], 9), (0, 0, Ok(Status::Pending)));
+    }
+    decoder.reset_session();
+    assert_eq!(step(&mut decoder, &frame, 9), (12, 3, Ok(Status::Complete)));
+}
+
+#[test]
+fn a_refused_dictionary_replaces_the_one_before() -> Result<()> {
+    let [.., fixture] = FIXTURES;
+    let mut decoder = Decoder::new();
+    decoder.load_dictionary(fixture.dictionary)?;
+    let result = decoder.load_dictionary(&fixture.dictionary[..20]);
+    assert_eq!(result, Err(Error::DictionaryCorrupted));
+    let result = step(&mut decoder, fixture.frames, 700).2;
+    assert_eq!(result, Err(Error::DictionaryWrong));
+    Ok(())
+}
+
+#[test]
+fn a_window_that_stays_too_large_is_given_up() {
+    // Windows of 1, 2 and 8 KiB, which take 3 times as much
+    let [small, medium, large] =
+        ["00", "08", "18"].map(|window| hex(&format!("28b52ffd 00{window} 010000")));
+    let frames_until_it_allocates = |decoder: &mut Decoder, frame: &[u8]| {
+        (1..200).find(|_| {
+            let mut out = Output::slice(&mut []);
+            GRANTS.set(Some(0));
+            let (_, status) = decoder.step(frame, &mut out);
+            GRANTS.set(None);
+            status == Err(Error::MemoryAllocation)
+        })
+    };
+
+    let mut decoder = Decoder::new();
+    assert_eq!(step(&mut decoder, &medium, 0).2, Ok(Status::Complete));
+    assert_eq!(frames_until_it_allocates(&mut decoder, &small), None);
+
+    assert_eq!(step(&mut decoder, &large, 0).2, Ok(Status::Complete));
+    for _ in 0..100 {
+        assert_eq!(step(&mut decoder, &small, 0).2, Ok(Status::Complete));
+    }
+    assert_eq!(step(&mut decoder, &large, 0).2, Ok(Status::Complete));
+    assert_eq!(frames_until_it_allocates(&mut decoder, &large), None);
+    assert_eq!(frames_until_it_allocates(&mut decoder, &small), Some(128));
+}
+
+#[test]
+fn the_default_limit_is_128_mib() -> Result<()> {
+    let header = |size: u32| [&hex("28b52ffd a0")[..], &size.to_le_bytes()].concat();
+    let mut decoder = Decoder::new();
+    decoder.set_parameter(100, 10)?;
+    decoder.set_parameter(100, 0)?;
+    // It gets as far as asking for the memory.
+    let at_limit = header(1 << 27);
+    GRANTS.set(Some(0));
+    let (_, status) = decoder.step(&at_limit, &mut Output::slice(&mut []));
+    assert_eq!(status, Err(Error::MemoryAllocation));
+    decoder.reset_session();
+    let result = step(&mut decoder, &header((1 << 27) + 1), 0).2;
+    assert_eq!(result, Err(Error::WindowTooLarge));
+    Ok(())
+}
+
+#[test]
 fn earlier_frames_make_no_difference() {
     let mut decoder = Decoder::new();
     assert_eq!(

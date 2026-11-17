@@ -76,3 +76,65 @@ unsafe extern "C" fn Bun__ICUItem__decompress(
         decompress(frame, &mut Output::slice(out), dictionary.as_ref()).is_ok()
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// "abcabcabcab", which takes the dictionary below.
+    const WITH_DICTIONARY: &[u8] =
+        b"\x28\xb5\x2f\xfd\x20\x0b\x3d\x00\x00\x00\x01\x54\x00\x02\x08\x06";
+    static DICTIONARY: [u8; 8] = *b"01234abc";
+    const RAW: &[u8] = b"\x28\xb5\x2f\xfd\x20\x03\x19\x00\x00abc";
+    const SIZE_UNKNOWN: &[u8] = b"\x28\xb5\x2f\xfd\x00\x00\x19\x00\x00abc";
+    const SIZE_OF_2_GB: &[u8] = b"\x28\xb5\x2f\xfd\x80\x00\x00\x00\x00\x80\x19\x00\x00abc";
+
+    fn size(item: &[u8], length: i32) -> i32 {
+        // SAFETY: the callers pass a whole frame, or no more than its length.
+        unsafe { Bun__ICUItem__size(item.as_ptr(), length) }
+    }
+
+    fn decompressed(item: &[u8], length: i32, size: usize) -> Option<Vec<u8>> {
+        let mut out = Vec::with_capacity(size);
+        let (dictionary, len) = (DICTIONARY.as_ptr(), DICTIONARY.len());
+        // SAFETY: as above. The dictionary is static, and `size` bytes of `out` get written in any case.
+        unsafe {
+            let (item, room) = (item.as_ptr(), out.as_mut_ptr());
+            let is_done = Bun__ICUItem__decompress(item, length, dictionary, len, room, size);
+            out.set_len(size);
+            is_done.then_some(out)
+        }
+    }
+
+    #[test]
+    fn the_length_is_optional() {
+        let padded = [RAW, &[0; 5]].concat();
+        for (item, length) in [(RAW, -1), (RAW, 0), (RAW, 12), (&padded, 17)] {
+            assert_eq!(size(item, length), 3);
+            assert_eq!(decompressed(item, length, 3).as_deref(), Some(&b"abc"[..]));
+        }
+    }
+
+    #[test]
+    fn a_frame_ends_within_the_length() {
+        for length in 1..RAW.len() {
+            let expected = if length < 6 { -1 } else { 3 };
+            assert_eq!(size(&RAW[..length], length as i32), expected);
+            assert_eq!(decompressed(&RAW[..length], length as i32, 3), None);
+        }
+    }
+
+    #[test]
+    fn a_size_is_known_and_fits() {
+        assert_eq!(size(SIZE_UNKNOWN, -1), -1);
+        assert_eq!(size(SIZE_OF_2_GB, -1), -1);
+        assert_eq!(size(b"not a frame", 11), -1);
+    }
+
+    #[test]
+    fn items_refer_to_the_dictionary() {
+        let out = decompressed(WITH_DICTIONARY, -1, 11);
+        assert_eq!(out.as_deref(), Some(&b"abcabcabcab"[..]));
+        assert_eq!(decompressed(WITH_DICTIONARY, -1, 10), None);
+    }
+}

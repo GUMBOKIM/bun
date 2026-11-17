@@ -469,3 +469,76 @@ impl Finder {
         history.end() - anchor
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::window::INDEX_MAX;
+
+    #[test]
+    fn lowering_indices_changes_nothing() -> Result<()> {
+        const BLOCK_LEN: usize = 1024;
+        let parameters = LongDistance {
+            hash_log: 8,
+            bucket_log: 2,
+            min_match: 8,
+            hash_rate_log: 2,
+        };
+        let words = (0..1000u64).map(|it| XxHash64::hash(&(it * it / 7 % 200).to_le_bytes()));
+        let bytes: Vec<_> = words
+            .flat_map(|it| [it, !it])
+            .flat_map(u64::to_le_bytes)
+            .collect();
+        let found_from = |index| -> Result<_> {
+            let mut finder = Finder::new(parameters, 11)?;
+            finder.window = Window::starting_at(index);
+            finder.admit(&Input::alone(&bytes, &[]));
+            let (mut found, mut candidates) = (Vec::new(), Candidates::default());
+            for start in (0..bytes.len() - BLOCK_LEN).step_by(BLOCK_LEN + 5) {
+                candidates.clear_for(BLOCK_LEN, &parameters)?;
+                finder.find(
+                    &Input::alone(&bytes, &[]),
+                    start,
+                    BLOCK_LEN,
+                    &mut candidates,
+                );
+                finder.skip(5);
+                let list = candidates.list.iter();
+                found.extend(list.map(|it| [it.offset, it.literal_len, it.match_len]));
+            }
+            assert!(finder.window.next < 1 << 16);
+            Ok(found)
+        };
+        let expected = found_from(FIRST_INDEX)?;
+        assert!(expected.len() > 100);
+        // In the middle of a block, and of what is skipped
+        for before in [5000, 4 * (BLOCK_LEN as u32 + 5) - 2] {
+            assert_eq!(found_from(INDEX_MAX - before)?, expected);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_checksum_is_no_proof_of_a_match() -> Result<()> {
+        let parameters = LongDistance {
+            hash_log: 6,
+            bucket_log: 1,
+            min_match: 8,
+            hash_rate_log: 1,
+        };
+        let bytes = b"0123456-01234567-01234567+";
+        let mut finder = Finder::new(parameters, 10)?;
+        let history = (finder.window).history(&Input::alone(bytes, &[]), 0, bytes.len());
+        let split = Split {
+            start: 17,
+            bucket: 3,
+            checksum: 9,
+        };
+        finder.insert(3, [history.index(0), 9]);
+        assert_eq!(finder.best_match(&history, 0, 17, split), None);
+        finder.insert(3, [history.index(8), 9]);
+        let found = finder.best_match(&history, 0, 17, split);
+        assert_eq!(found, Some((history.index(8), 0, 8)));
+        Ok(())
+    }
+}

@@ -435,3 +435,34 @@ impl Drop for Workers {
         self.interest.lose();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parameters::Purpose;
+
+    /// The hash is of what `ZSTDMT_initCStream_internal()` arrives at.
+    #[test]
+    fn sections_are_those_of_zstd() -> Result<()> {
+        let mut lens = Vec::new();
+        for window_log in 10..=31 {
+            for chain_log in (6..=30).step_by(4) {
+                for index in 0..9 * 10 * 2 * 2 {
+                    let mut request = Request::new(1);
+                    request.set(101, window_log)?;
+                    request.set(103, chain_log)?;
+                    request.set(107, 1 + index / 40)?;
+                    request.set(402, index / 4 % 10)?;
+                    request.set(160, 2 - index / 2 % 2)?;
+                    request.set(401, index % 2 * 600_000)?;
+                    let tuning = request.tuning(None, Purpose::Frame { dictionary_len: 0 });
+                    let (section, overlap) =
+                        section_and_overlap_len(&request.plan(tuning), &request);
+                    lens.extend([section as u32, overlap as u32].map(u32::to_le_bytes));
+                }
+            }
+        }
+        assert_eq!(XxHash64::hash(lens.as_flattened()) as u32, 0xF440_CB58);
+        Ok(())
+    }
+}

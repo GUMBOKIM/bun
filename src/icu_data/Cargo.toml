@@ -11,3 +11,7 @@ workspace = true
 
 [dependencies]
 bun_zstd_decoder.workspace = true
+
+[[test]]
+name = "without_dictionary"
+path = "tests/without_dictionary.rs"

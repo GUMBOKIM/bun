@@ -395,3 +395,187 @@ pub(crate) struct Plan {
     pub(crate) target_block_len: usize,
     pub(crate) header: HeaderFlags,
 }
+
+#[cfg(test)]
+mod tests {
+    use bun_zstd_decoder::XxHash64;
+
+    use super::*;
+
+    fn hash(values: impl Iterator<Item = u32>) -> u32 {
+        XxHash64::hash(&values.flat_map(u32::to_le_bytes).collect::<Vec<_>>()) as u32
+    }
+
+    /// The hashes are of what `ZSTD_getCParamsFromCCtxParams()` returns.
+    #[test]
+    fn tunings_are_those_of_zstd() -> Result<()> {
+        const INPUT_LENS: [u64; 16] = [
+            0,
+            63,
+            64,
+            65,
+            1024,
+            1025,
+            16384,
+            16385,
+            131_072,
+            131_073,
+            262_144,
+            262_145,
+            1 << 30,
+            (1 << 30) + 1,
+            3_000_000_000,
+            1 << 40,
+        ];
+        const DICTIONARY_LENS: [usize; 15] = [
+            0,
+            1,
+            511,
+            512,
+            1024,
+            1025,
+            15885,
+            15886,
+            130_573,
+            130_574,
+            261_645,
+            261_646,
+            1 << 24,
+            1 << 30,
+            (1 << 30) + 1,
+        ];
+        let requests: [(&[_], _); _] = [
+            (&[], 0xE596_4A40),
+            (&[(101, 31)], 0xA529_2197),
+            (&[(101, 10)], 0x560F_2647),
+            (&[(160, 1)], 0xBB91_69F1),
+            (&[(102, 30), (103, 30), (107, 1)], 0xA40D_53E8),
+            (&[(102, 30), (103, 30), (107, 2)], 0x213D_6B66),
+            (&[(102, 30), (104, 3), (107, 3)], 0x22CC_8BAF),
+            (&[(102, 30), (104, 5), (107, 4)], 0x342E_4B09),
+            (&[(102, 30), (104, 7), (107, 5)], 0x1EC8_E829),
+            (&[(101, 31), (102, 30), (103, 30), (107, 6)], 0xA5A7_EAD3),
+            (&[(101, 27), (105, 7), (106, 9), (107, 7)], 0xF0D0_4CCA),
+            (&[(101, 26), (107, 9), (160, 2)], 0x6955_FE0D),
+            (&[(101, 30), (102, 30), (103, 30), (107, 9)], 0x4587_195A),
+            (&[(101, 10), (102, 20), (103, 20), (107, 2)], 0xF538_53F1),
+        ];
+        for (parameters, expected) in requests {
+            let mut tunings = Vec::new();
+            for level in [MIN_LEVEL - 1, -7].into_iter().chain(-1..=24) {
+                let mut request = Request::new(level);
+                for &(key, value) in parameters {
+                    request.set(key, value)?;
+                }
+                for len in DICTIONARY_LENS {
+                    tunings.push(request.tuning(
+                        None,
+                        Purpose::Frame {
+                            dictionary_len: len,
+                        },
+                    ));
+                    tunings.push(request.tuning(None, Purpose::Dictionary { len }));
+                }
+                for input_len in INPUT_LENS {
+                    tunings.extend(DICTIONARY_LENS.map(|dictionary_len| {
+                        request.tuning(Some(input_len), Purpose::Frame { dictionary_len })
+                    }));
+                }
+            }
+            let values = tunings.iter().flat_map(|it| {
+                let logs = [it.window_log, it.chain_log, it.hash_log, it.search_log];
+                logs.into_iter()
+                    .chain([it.min_match, it.target_length, it.strategy as u32])
+            });
+            assert_eq!(hash(values), expected, "{parameters:?}");
+        }
+        Ok(())
+    }
+
+    /// The hash is of what `ZSTD_ldm_adjustParameters()` leaves.
+    #[test]
+    fn long_distance_parameters_are_those_of_zstd() {
+        let mut values = Vec::new();
+        for window_log in WINDOW_LOG_MIN..=WINDOW_LOG_MAX {
+            for strategy in (1..=9).filter_map(Strategy::new) {
+                let tuning = Tuning {
+                    window_log,
+                    strategy,
+                    ..Request::new(1).tuning(None, Purpose::Frame { dictionary_len: 0 })
+                };
+                for index in 0..6 * 4 * 3 * 2 {
+                    let asked = LongDistance {
+                        hash_log: index / 24 * 6,
+                        hash_rate_log: index / 6 % 4 * 3,
+                        bucket_log: index / 2 % 3 * 4,
+                        min_match: index % 2 * 8,
+                    };
+                    let it = asked.completed(&tuning);
+                    values.extend([it.hash_log, it.bucket_log, it.min_match, it.hash_rate_log]);
+                }
+            }
+        }
+        assert_eq!(hash(values.into_iter()), 0x6925_7E0A);
+
+        let rare = LongDistance {
+            hash_log: 0,
+            hash_rate_log: 25,
+            bucket_log: 0,
+            min_match: 0,
+        };
+        let tuning = Request::new(1).tuning(Some(1), Purpose::Frame { dictionary_len: 0 });
+        assert_eq!(rare.completed(&tuning).hash_log, HASH_LOG_MIN);
+    }
+
+    #[test]
+    fn large_windows_bring_more_with_them() -> Result<()> {
+        // Rows, splitting, long distances
+        let plans = [
+            (14, 3, [false, false, false]),
+            (15, 2, [false, false, false]),
+            (15, 3, [true, false, false]),
+            (31, 5, [true, false, false]),
+            (31, 6, [false, false, false]),
+            (16, 7, [false, false, false]),
+            (17, 7, [false, true, false]),
+            (26, 9, [false, true, false]),
+            (27, 7, [false, true, true]),
+            (28, 9, [false, true, true]),
+        ];
+        for (window_log, strategy, expected) in plans {
+            let mut request = Request::new(1);
+            request.set(101, window_log)?;
+            request.set(107, strategy)?;
+            let plan = request.plan(request.tuning(None, Purpose::Frame { dictionary_len: 0 }));
+            let actual = [
+                plan.uses_rows,
+                plan.splits_blocks,
+                plan.long_distance.is_some(),
+            ];
+            assert_eq!(actual, expected, "{window_log} {strategy}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn some_values_are_clamped() -> Result<()> {
+        let mut request = Request::new(1);
+        for (value, expected) in [
+            (i32::MAX, [256, 1 << 30, 9]),
+            (1, [1, 512 << 10, 1]),
+            (0, [0, 0, 0]),
+            (i32::MIN, [0, 512 << 10, 0]),
+        ] {
+            for key in [400, 401, 402] {
+                request.set(key, value)?;
+            }
+            let actual = [
+                request.workers,
+                request.job_len,
+                request.overlap_log as usize,
+            ];
+            assert_eq!(actual, expected);
+        }
+        Ok(())
+    }
+}

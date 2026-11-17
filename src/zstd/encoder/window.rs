@@ -345,3 +345,47 @@ impl<'a> History<'a> {
         self.match_len_before_in(position, run, at, max)
     }
 }
+
+/// The results are those of `ZSTD_window_correctOverflow()`.
+#[test]
+fn indices_are_lowered_like_zstd_does() {
+    for (next, older_start, logs, expected) in [
+        (INDEX_MAX, INDEX_MAX - 4000, (10, 12), [5120, 2120, 1120]),
+        (
+            INDEX_MAX + 1,
+            INDEX_MAX - 3999,
+            (10, 12),
+            [5121, 2121, 1121],
+        ),
+        (INDEX_MAX + 2, INDEX_MAX - 3998, (10, 12), [4098, 1098, 98]),
+        (
+            3_670_000_123,
+            3_669_996_123,
+            (0, 20),
+            [1_048_578, 1_045_578, 1_044_578],
+        ),
+        (
+            3_670_000_123,
+            3_669_996_123,
+            (22, 17),
+            [8_372_731, 8_369_731, 8_368_731],
+        ),
+        (3_670_000_123, 5, (8, 31), [2_147_483_899, 2_147_480_899, 2]),
+    ] {
+        let mut window = Window {
+            next,
+            prefix_start: next - 3000,
+            older_start,
+        };
+        let by = window.lower_indices(logs.0, logs.1);
+        let actual = [window.next, window.prefix_start, window.older_start];
+        assert_eq!((actual, window.next + by), (expected, next));
+    }
+
+    let mut window = Window {
+        next: INDEX_MAX,
+        ..Window::starting_at(5)
+    };
+    window.lower_indices(10, 12);
+    assert_eq!(window.prefix_start, FIRST_INDEX);
+}

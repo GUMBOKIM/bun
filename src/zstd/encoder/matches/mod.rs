@@ -583,3 +583,58 @@ impl MatchState {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parameters::{Purpose, Request};
+
+    fn state(strategy: i32) -> Result<MatchState> {
+        let mut request = Request::new(1);
+        for (key, value) in [(101, 12), (102, 6), (103, 10), (105, 3), (107, strategy)] {
+            request.set(key, value)?;
+        }
+        let tuning = request.tuning(None, Purpose::Frame { dictionary_len: 0 });
+        let mut state = MatchState::new(tuning);
+        state.reset(tuning, false, Owner::Frame, 0, false)?;
+        Ok(state)
+    }
+
+    #[test]
+    fn tables_are_lowered_with_the_window() -> Result<()> {
+        const BY: u32 = INDEX_MAX - 4096 - 512;
+        for (strategy, mark) in [(6, lazy_tree::UNSORTED), (7, 0)] {
+            let mut state = state(strategy)?;
+            state.window = Window::starting_at(INDEX_MAX);
+            state.next_to_index = INDEX_MAX - 1;
+            let before = [lazy_tree::UNSORTED, BY + 1, BY + 2, INDEX_MAX - 1];
+            let tables = state.tables.split_mut();
+            for table in [tables.hash, tables.chain, tables.hash3] {
+                table
+                    .iter_mut()
+                    .zip(before)
+                    .for_each(|(to, from)| *to = from);
+            }
+            // Left by a frame with larger tables
+            state.tables.indices.0.push(CacheLine([0xFF; _]));
+
+            state.prepare_for(1);
+            assert_eq!(state.next_to_index, 4096 + 512);
+            let used = state.tables.indices_len();
+            assert_eq!(state.tables.indices.get::<u32>().len(), used);
+            let tables = state.tables.split_mut();
+            assert!(tables.hash.starts_with(&[0, 0, 2, 4607]));
+            assert!(tables.chain.starts_with(&[mark, 0, 2, 4607]));
+            assert_eq!(tables.hash3.starts_with(&[0, 0, 2, 4607]), strategy == 7);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn indices_with_tags_tell_16_mb_apart() -> Result<()> {
+        let content = vec![0; 1 << 24];
+        assert_eq!(state(2)?.loadable(&content).len(), (1 << 24) - 2);
+        assert_eq!(state(3)?.loadable(&content).len(), 1 << 24);
+        Ok(())
+    }
+}

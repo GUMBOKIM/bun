@@ -518,3 +518,55 @@ impl<const ALL_STATES: usize, const ALL_SYMBOLS: usize> Tables<ALL_STATES, ALL_S
         writer.finish()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The descriptions are from `FSE_normalizeCount()` and `FSE_writeNCount()`.
+    #[test]
+    fn rounding_is_made_up_for() -> Result<()> {
+        let few_and_many = |rest: &[u32]| [&[1; 29], rest].concat();
+        let cases = [
+            // All symbols are rare: without a gap, and with gaps.
+            (
+                vec![1; 43],
+                false,
+                "7109218410420821841042444444444444444492244907",
+            ),
+            (
+                [&[0][..], &[1; 43]].concat(),
+                false,
+                "11300cc318638c31c618638c31c68c8888888888489224e9",
+            ),
+            (
+                [&[1; 7][..], &[0], &[1; 12], &[0], &[1; 24]].concat(),
+                false,
+                "310cc3186304c618638c31c61823981111111111114992241d",
+            ),
+            // None is.
+            (vec![1; 21], false, "30c49091919119194dd306"),
+            // One more is, once the others have their share.
+            (
+                few_and_many(&[14, 229, 228]),
+                false,
+                "2108822008218410420821841042082184104208f901",
+            ),
+            (
+                few_and_many(&[20, 229, 228]),
+                true,
+                "01000000000000000000000000000000000000427e",
+            ),
+        ];
+        for (counts, allows_less_than_1, expected) in cases {
+            let total = counts.iter().sum::<u32>() as usize;
+            let log = table_log_for(9, total, counts.len() - 1, 2);
+            let mut out = [0; 64];
+            let len = Normalized::new(&counts, total, log, allows_less_than_1)?.write(&mut out)?;
+            let digits = out.iter().take(len).flat_map(|it| [it >> 4, it & 15]);
+            let hex: Option<String> = digits.map(|it| char::from_digit(it.into(), 16)).collect();
+            assert_eq!(hex.as_deref(), Some(expected));
+        }
+        Ok(())
+    }
+}
