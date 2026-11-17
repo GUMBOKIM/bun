@@ -1,13 +1,16 @@
 //! Looks for the cheapest way through all matches that there are.
 
-use bun_zstd_decoder::{Result, with_bmi2};
+use core::ops::RangeInclusive;
+
+use bun_zstd_decoder::Result;
 
 use super::hash::Hasher;
 use super::long_distance::Cursor;
-use super::prices::{BIT, FIXED_UP_TO, Prices};
-use super::tree::{self, Descent, Node, Tree};
+use super::prices::{BIT, LANES, Prices};
+use super::tree::{self, Descent, Node, Nodes, Tree};
 use super::{Attached, MatchState, Reach, Search, WORD};
-use crate::bytes::{u32_at, u64_at};
+use crate::array::At;
+use crate::bytes::{likely, u32_at, u64_at};
 use crate::parameters::Strategy;
 use crate::sequences::{OffsetValue, Repeats, Sequences};
 use crate::vec;
@@ -23,27 +26,143 @@ struct Match {
     len: u32,
 }
 
-/// The cheapest way to a position ends with this match and these literals.
+/// A match, and the literals after it.
 #[derive(Clone, Copy, Default)]
 struct Stretch {
-    price: i32,
     offset: OffsetValue,
     match_len: u32,
     literal_len: u32,
-    repeats: Repeats,
 }
 
-struct Stretches<'a>(&'a mut [Stretch]);
+/// For each position the cheapest way to it: what it costs, how it ends, and the recent offsets at its end.
+#[derive(Default)]
+struct Ways {
+    prices: Vec<i32>,
+    offsets: Vec<u32>,
+    match_lens: Vec<u32>,
+    literal_lens: Vec<u32>,
+    repeats: Vec<Repeats>,
+}
 
-impl Stretches<'_> {
+struct WaysMut<'a> {
+    prices: &'a mut [i32],
+    offsets: &'a mut [u32],
+    match_lens: &'a mut [u32],
+    literal_lens: &'a mut [u32],
+    repeats: &'a mut [Repeats],
+}
+
+impl Ways {
+    /// The compiler sees that all have the same length.
     #[inline(always)]
-    fn get(&self, position: u32) -> Option<&Stretch> {
-        self.0.get(position as usize)
+    fn as_mut(&mut self) -> Option<WaysMut<'_>> {
+        let len = self.prices.len() as u32 as usize;
+        Some(WaysMut {
+            prices: self.prices.get_mut(..len)?,
+            offsets: self.offsets.get_mut(..len)?,
+            match_lens: self.match_lens.get_mut(..len)?,
+            literal_lens: self.literal_lens.get_mut(..len)?,
+            repeats: self.repeats.get_mut(..len)?,
+        })
+    }
+}
+
+impl WaysMut<'_> {
+    #[inline(always)]
+    fn price(&self, position: u32) -> Option<i32> {
+        likely(self.prices.get(position as usize).copied())
     }
 
     #[inline(always)]
-    fn get_mut(&mut self, position: u32) -> Option<&mut Stretch> {
-        self.0.get_mut(position as usize)
+    fn stretch(&self, position: u32) -> Option<Stretch> {
+        Some(Stretch {
+            offset: OffsetValue(*likely(self.offsets.get(position as usize))?),
+            match_len: *self.match_lens.get(position as usize)?,
+            literal_len: *self.literal_lens.get(position as usize)?,
+        })
+    }
+
+    #[inline(always)]
+    fn repeats(&mut self, position: u32) -> Option<&mut Repeats> {
+        likely(self.repeats.get_mut(position as usize))
+    }
+
+    #[inline(always)]
+    fn set_stretch(&mut self, position: u32, stretch: Stretch) -> Option<()> {
+        *likely(self.offsets.get_mut(position as usize))? = stretch.offset.0;
+        *self.match_lens.get_mut(position as usize)? = stretch.match_len;
+        *self.literal_lens.get_mut(position as usize)? = stretch.literal_len;
+        Some(())
+    }
+
+    #[inline(always)]
+    fn set(&mut self, position: u32, price: i32, stretch: Stretch) -> Option<()> {
+        *likely(self.prices.get_mut(position as usize))? = price;
+        self.set_stretch(position, stretch)
+    }
+
+    /// The recent offsets after a match at `offset` that starts at `position`.
+    #[inline(always)]
+    fn repeats_after(&mut self, position: u32, offset: OffsetValue) -> Option<Repeats> {
+        let has_literals = *likely(self.literal_lens.get(position as usize))? != 0;
+        Some(self.repeats(position)?.after(offset, has_literals))
+    }
+
+    /// There is no way to them yet. Also affects some positions after them.
+    #[inline(always)]
+    fn clear(&mut self, positions: RangeInclusive<u32>) -> Option<()> {
+        let mut position = *positions.start() as usize;
+        while position <= *positions.end() as usize {
+            let lanes = position..position + LANES;
+            *likely(self.prices.get_mut(lanes.clone()))?.as_mut_array()? = [MAX_PRICE; LANES];
+            *self.literal_lens.get_mut(lanes)?.as_mut_array()? = [1; LANES];
+            position += LANES;
+        }
+        Some(())
+    }
+
+    /// Lets the match from `start` take over where it is cheaper, for all lengths from `shortest` on.
+    #[inline(always)]
+    fn offer(
+        &mut self,
+        prices: &Prices,
+        base_price: i32,
+        start: u32,
+        shortest: u32,
+        found: Match,
+    ) -> Option<()> {
+        let ending_after = |match_len| Stretch {
+            offset: found.offset,
+            match_len,
+            literal_len: 0,
+        };
+        let mut len = shortest;
+        while len <= found.len
+            && let Some(new) = prices.short_match_lens(len)
+        {
+            let lanes = (start + len) as usize..(start + len) as usize + LANES;
+            let old = likely(self.prices.get(lanes))?.as_array::<LANES>()?;
+            let mut cheaper = 0u8;
+            for (lane, (new, old)) in new.iter().zip(old).enumerate() {
+                cheaper |= u8::from(base_price + new < *old) << lane;
+            }
+            let mut cheaper = u32::from(cheaper) & !(u32::MAX << (found.len - len + 1).min(31));
+            while cheaper != 0 {
+                let lane = cheaper.trailing_zeros();
+                let price = base_price + new.at(lane as usize % LANES);
+                self.set(start + len + lane, price, ending_after(len + lane))?;
+                cheaper &= cheaper - 1;
+            }
+            len += LANES as u32;
+        }
+        while len <= found.len {
+            let price = base_price + prices.match_len(len);
+            if price < self.price(start + len)? {
+                self.set(start + len, price, ending_after(len))?;
+            }
+            len += 1;
+        }
+        Some(())
     }
 }
 
@@ -51,8 +170,7 @@ pub(super) struct State {
     prices: Prices,
     /// By length.
     matches: Vec<Match>,
-    /// By position.
-    stretches: Vec<Stretch>,
+    ways: Ways,
 }
 
 impl State {
@@ -60,7 +178,7 @@ impl State {
         vec::boxed(Self {
             prices: Prices::EMPTY,
             matches: Vec::new(),
-            stretches: Vec::new(),
+            ways: Ways::default(),
         })
     }
 
@@ -69,9 +187,13 @@ impl State {
     }
 
     pub(super) fn reserve(&mut self, block_len: usize) -> Result<()> {
-        let len = block_len.min(HORIZON as usize) + 3;
+        let len = block_len.min(HORIZON as usize) + 3 + LANES;
         vec::clear_for(&mut self.matches, len)?;
-        vec::grow(&mut self.stretches, Stretch::default(), len)
+        vec::grow(&mut self.ways.offsets, 0, len)?;
+        vec::grow(&mut self.ways.match_lens, 0, len)?;
+        vec::grow(&mut self.ways.literal_lens, 0, len)?;
+        vec::grow(&mut self.ways.repeats, Repeats::default(), len)?;
+        vec::grow(&mut self.ways.prices, 0, len)
     }
 }
 
@@ -105,7 +227,7 @@ pub(super) fn search<const REACH: Reach>(
         && state.tuning.strategy == Strategy::Ultra2
         && is_first
         && history.start == 0
-        && len > FIXED_UP_TO
+        && len > WORD_LEN
     {
         // Only for the prices. What it put into the tables gets out of reach.
         run(state, history, sequences, &mut { *repeats });
@@ -133,9 +255,9 @@ fn parse<const REACH: Reach, const IS_ACCURATE: bool>(
     optimal
         .prices
         .start_block::<IS_ACCURATE>(history.block(), search.entropy);
-    let hashed = tuning.min_match.min(6);
+    let (min_match, hashed) = (tuning.min_match.min(4), tuning.min_match.min(6));
     let tree = Tree::new(state, hashed);
-    let finder = Finder {
+    let mut finder = Finder {
         history: *history,
         attached: *attached,
         attached_hasher: Hasher::new(hashed, attached.tuning.hash_log),
@@ -143,18 +265,12 @@ fn parse<const REACH: Reach, const IS_ACCURATE: bool>(
         next_to_index3: tree.next_to_index,
         tree,
         long_matches: Cursor::new(search.long_matches, history.block().len()),
-        min_match: tuning.min_match.min(4),
+        min_match,
+        min_match_mask: u32::MAX >> (32 - 8 * min_match),
         sufficient_len: tuning.target_length.min(HORIZON - 1),
     };
-    let (anchor, next_to_index) = with_bmi2(
-        #[inline(always)]
-        move || {
-            let mut finder = finder;
-            let anchor = finder.parse::<REACH, IS_ACCURATE>(optimal, sequences, repeats);
-            (anchor, finder.tree.next_to_index)
-        },
-    );
-    state.next_to_index = next_to_index;
+    let anchor = finder.parse::<REACH, IS_ACCURATE>(optimal, sequences, repeats);
+    state.next_to_index = finder.tree.next_to_index;
     // Which the sequences do not add up to.
     anchor.unwrap_or(u32::MAX)
 }
@@ -169,6 +285,8 @@ struct Finder<'a> {
     long_matches: Cursor<'a>,
     /// 3 or 4
     min_match: u32,
+    /// For as many bytes.
+    min_match_mask: u32,
     /// A longer match is taken right away.
     sufficient_len: u32,
 }
@@ -181,20 +299,26 @@ fn push(matches: &mut Vec<Match>, offset: OffsetValue, len: u32) {
 
 impl Finder<'_> {
     #[inline(always)]
-    fn repeat_len<const REACH: Reach>(&self, at: u32, value: u32, offset: u32, lowest: u32) -> u32 {
-        let history = &self.history;
+    fn repeat_len<const REACH: Reach>(
+        &self,
+        history: &History<'_>,
+        at: u32,
+        value: u32,
+        offset: u32,
+        lowest: u32,
+    ) -> u32 {
         let (current, min_match) = (history.index(at), self.min_match);
-        let earlier = current.wrapping_sub(offset);
         let starts_alike = |other: Option<u32>| {
-            other.is_some_and(|other| (other ^ value) << (32 - 8 * self.min_match) == 0)
+            other.is_some_and(|other| (other ^ value) & self.min_match_mask == 0)
         };
-        if offset.wrapping_sub(1) < at {
-            let back = at - offset;
-            if earlier >= lowest && starts_alike(u32_at(history.prefix, back)) {
+        let (back, earlier) = (at.wrapping_sub(offset), current.wrapping_sub(offset));
+        let is_in_reach = offset.wrapping_sub(1) < current - lowest;
+        if back < at {
+            if is_in_reach & starts_alike(u32_at(history.prefix, back)) {
                 return min_match + history.match_len(at + min_match, back + min_match);
             }
         } else if REACH != Reach::Prefix
-            && (REACH == Reach::Attached || offset.wrapping_sub(1) < current - lowest)
+            && (REACH == Reach::Attached || is_in_reach)
             && earlier < history.prefix_index
             && starts_alike(history.u32_at_index(earlier))
         {
@@ -205,8 +329,7 @@ impl Finder<'_> {
 
     /// The last position before `at` with about the same 3 bytes.
     #[inline(always)]
-    fn find3(&mut self, at: u32, word: u64) -> Option<u32> {
-        let history = &self.history;
+    fn find3(&mut self, history: &History<'_>, at: u32, word: u64) -> Option<u32> {
         let current = history.index(at);
         for index in self.next_to_index3..current {
             let word = u64_at(history.prefix, history.position(index))?;
@@ -220,27 +343,25 @@ impl Finder<'_> {
     #[inline(always)]
     fn find_near<const REACH: Reach>(
         &mut self,
+        history: &History<'_>,
         at: u32,
         repeats: Repeats,
         has_literals: bool,
         matches: &mut Vec<Match>,
     ) -> Option<()> {
-        let history = self.history;
         let current = history.index(at);
-        if current < self.tree.next_to_index {
-            return Some(());
-        }
-        self.tree.insert_up_to::<REACH>(&history, at)?;
+        let nodes = Nodes::new(self.tree.nodes)?;
+        self.tree.prefetch_after(history, nodes, at);
+        self.tree.insert_up_to::<REACH>(history, at)?;
 
-        let word = u64_at(history.prefix, at)?;
+        let word = likely(u64_at(history.prefix, at))?;
         let left = history.end() - at;
         let lowest = self.tree.bounds.lowest(current);
         let sufficient_len = self.sufficient_len;
         let mut longest = self.min_match - 1;
 
-        for value in 1..=3 {
-            let offset = repeats.get(value - u32::from(has_literals));
-            let len = self.repeat_len::<REACH>(at, word as u32, offset, lowest);
+        for (value, offset) in (1..).zip(repeats.numbered(has_literals)) {
+            let len = self.repeat_len::<REACH>(history, at, word as u32, offset, lowest);
             if len > longest {
                 longest = len;
                 push(matches, OffsetValue(value), len);
@@ -251,7 +372,7 @@ impl Finder<'_> {
         }
 
         if self.min_match == 3 && longest < 3 {
-            let index = self.find3(at, word)?;
+            let index = self.find3(history, at, word)?;
             // From further away it would cost too much.
             if index >= lowest && current - index < 1 << 18 {
                 let len = match REACH {
@@ -269,15 +390,37 @@ impl Finder<'_> {
             }
         }
 
-        let root = self.tree.roots.get_mut(self.tree.hasher.hash(word))?;
-        let mut index = core::mem::replace(root, current);
-        let nodes = self.tree.nodes;
+        let root = likely(self.tree.roots.get_mut(self.tree.hasher.hash(word)))?;
+        let index = core::mem::replace(root, current);
+        self.tree.next_to_index = if REACH == Reach::Attached || index >= lowest {
+            self.descend::<REACH>(at, index, lowest, longest, matches)?
+        } else {
+            Descent::new(nodes.get(current)?).finish();
+            current + 1
+        };
+        Some(())
+    }
+
+    /// Adds the matches in the tree at `index` that are longer than `longest`. Returns what to index next.
+    #[inline(never)]
+    fn descend<const REACH: Reach>(
+        &self,
+        at: u32,
+        mut index: u32,
+        lowest: u32,
+        mut longest: u32,
+        matches: &mut Vec<Match>,
+    ) -> Option<u32> {
+        let history = self.history.with_prefix_of::<WORD_LEN>()?;
+        let nodes = Nodes::new(self.tree.nodes)?;
+        let (current, left) = (history.index(at), history.end() - at);
         let overwritten = nodes.overwritten(current);
         let spare = Node::default();
         let mut descent = Descent::new(nodes.get(current)?);
         let mut matched_end = current + WORD + 1;
         let mut attempts = self.tree.attempts;
-        let mut note = |index: u32, len: u32| {
+        let mut note = #[inline(always)]
+        |index: u32, len: u32| {
             if len <= longest {
                 return false;
             }
@@ -304,26 +447,26 @@ impl Finder<'_> {
         descent.finish();
 
         if REACH == Reach::Attached {
-            let hash = self.attached_hasher.hash(word);
+            let hash = self.attached_hasher.hash(u64_at(history.prefix, at)?);
             tree::descend_attached(&self.attached, &history, at, hash, attempts, note)?;
         }
-        self.tree.next_to_index = matched_end - WORD;
-        Some(())
+        Some(matched_end - WORD)
     }
 
     #[inline(always)]
     fn find<const REACH: Reach>(
         &mut self,
+        history: &History<'_>,
         at: u32,
         repeats: Repeats,
         has_literals: bool,
         matches: &mut Vec<Match>,
     ) -> Option<()> {
         matches.clear();
-        self.find_near::<REACH>(at, repeats, has_literals, matches)?;
-        let long = self
-            .long_matches
-            .at(at - self.history.start, self.history.end() - at);
+        if history.index(at) >= self.tree.next_to_index {
+            self.find_near::<REACH>(history, at, repeats, has_literals, matches)?;
+        }
+        let long = self.long_matches.at(at - history.start, history.end() - at);
         if let Some((offset, len)) = long
             && len >= self.min_match
             && matches.last().is_none_or(|last| len > last.len)
@@ -341,7 +484,7 @@ impl Finder<'_> {
         State {
             prices,
             matches,
-            stretches,
+            ways,
         }: &mut State,
         sequences: &mut Sequences,
         repeats: &mut Repeats,
@@ -350,208 +493,163 @@ impl Finder<'_> {
         let Some(history) = self.history.with_prefix_of::<WORD_LEN>() else {
             return Some(anchor);
         };
-        self.history = history;
-        let History { prefix, start, .. } = self.history;
-        let limit = self.history.end() - WORD;
-        let min_match = self.min_match;
-        let mut stretches = Stretches(stretches);
-        let mut at = start + u32::from(start == 0);
+        let (prefix, limit) = (history.prefix, history.end() - WORD);
+        let mut ways = ways.as_mut()?;
+        let mut at = anchor + u32::from(anchor == 0);
 
         'block: while at < limit {
-            let literal_len = at - anchor;
-            self.find::<REACH>(at, *repeats, literal_len != 0, matches)?;
-            let Some(&longest) = matches.last() else {
-                at += 1;
-                continue;
-            };
-            let first = stretches.get_mut(0)?;
-            *first = Stretch {
-                // What the literals themselves cost is the same for all ways.
-                price: prices.literal_len::<IS_ACCURATE>(literal_len),
-                match_len: 0,
-                literal_len,
-                repeats: *repeats,
-                ..*first
-            };
-            let ending_with = |last: Match| Stretch {
-                offset: last.offset,
-                match_len: last.len,
+            // What the literals so far cost is the same for all ways, unlike their number.
+            let mut here = Stretch {
+                literal_len: at - anchor,
                 ..Stretch::default()
             };
+            let mut here_repeats = *repeats;
+            let (mut current, mut end) = (0, 0);
 
-            // The last stretch, and where it would start if it had no literals.
-            let (last, mut before_last) = 'forward: {
-                if longest.len > self.sufficient_len {
-                    break 'forward (ending_with(longest), 0);
-                }
-
-                let no_literals = prices.literal_len::<IS_ACCURATE>(0);
-                let base_price = first.price + no_literals;
-                for len in 1..min_match {
-                    let stretch = stretches.get_mut(len)?;
-                    stretch.price = MAX_PRICE;
-                    stretch.match_len = 0;
-                    stretch.literal_len = literal_len + len;
-                }
-                let mut len = min_match;
-                for found in matches.iter() {
-                    let price = base_price + prices.offset::<IS_ACCURATE>(found.offset);
-                    while len <= found.len {
-                        let stretch = stretches.get_mut(len)?;
-                        stretch.price = price + prices.match_len::<IS_ACCURATE>(len);
-                        stretch.offset = found.offset;
-                        stretch.match_len = len;
-                        stretch.literal_len = 0;
-                        len += 1;
+            // The last stretch, and where it starts.
+            let (last, last_start) = 'forward: loop {
+                self.find::<REACH>(
+                    &history,
+                    at + current,
+                    here_repeats,
+                    here.literal_len != 0,
+                    matches,
+                )?;
+                if let Some(&longest) = matches.last() {
+                    if current == 0 {
+                        ways.set(0, prices.literal_len(here.literal_len), here)?;
+                        *ways.repeats(0)? = here_repeats;
                     }
-                }
-                stretches.get_mut(len)?.price = MAX_PRICE;
-                let mut end = len - 1;
-
-                let one_more_literal = |len: u32| {
-                    prices.literal_len::<IS_ACCURATE>(len + 1)
-                        - prices.literal_len::<IS_ACCURATE>(len)
-                };
-                let mut current = 0;
-                while current < end {
-                    let previous = *stretches.get(current)?;
-                    let literal = *prefix.get((at + current) as usize)?;
-                    current += 1;
-
-                    let price = previous.price
-                        + prices.literal::<IS_ACCURATE>(literal)
-                        + one_more_literal(previous.literal_len);
-                    if price <= stretches.get(current)?.price {
-                        let with_literal = Stretch {
-                            price,
-                            literal_len: previous.literal_len + 1,
-                            ..previous
-                        };
-                        let replaced =
-                            core::mem::replace(stretches.get_mut(current)?, with_literal);
-                        // The match may still be the better start for the literal after it.
-                        if IS_ACCURATE
-                            && replaced.literal_len == 0
-                            && one_more_literal(0) < 0
-                            && let Some(&next) = prefix.get((at + current) as usize)
-                        {
-                            let next = prices.literal::<IS_ACCURATE>(next);
-                            let after_match = replaced.price + next + one_more_literal(0);
-                            let after_literals =
-                                price + next + one_more_literal(with_literal.literal_len);
-                            if after_match < after_literals
-                                && after_match < stretches.get(current + 1)?.price
-                            {
-                                let from = stretches.get(current - replaced.match_len)?;
-                                *stretches.get_mut(current + 1)? = Stretch {
-                                    price: after_match,
-                                    literal_len: 1,
-                                    repeats: from
-                                        .repeats
-                                        .after(replaced.offset, from.literal_len != 0),
-                                    ..replaced
-                                };
-                                end = end.max(current + 1);
-                            }
-                        }
-                    }
-
-                    let mut here = *stretches.get(current)?;
-                    if here.literal_len == 0 {
-                        let from = stretches.get(current - here.match_len)?;
-                        here.repeats = from.repeats.after(here.offset, from.literal_len != 0);
-                        stretches.get_mut(current)?.repeats = here.repeats;
-                    }
-
-                    if at + current > limit {
-                        continue;
-                    }
-                    if current == end {
-                        break;
-                    }
-                    if !IS_ACCURATE && stretches.get(current + 1)?.price <= here.price + BIT / 2 {
-                        continue;
-                    }
-
-                    self.find::<REACH>(at + current, here.repeats, here.literal_len != 0, matches)?;
-                    let Some(&longest) = matches.last() else {
-                        continue;
-                    };
                     let longest_end = current + longest.len;
                     if longest.len > self.sufficient_len
-                        || longest_end >= HORIZON
-                        || at + longest_end >= self.history.end()
+                        || (current != 0
+                            && (longest_end >= HORIZON || at + longest_end >= history.end()))
                     {
-                        break 'forward (ending_with(longest), current);
+                        *repeats = ways.repeats_after(current, longest.offset)?;
+                        let last = Stretch {
+                            offset: longest.offset,
+                            match_len: longest.len,
+                            literal_len: 0,
+                        };
+                        break (last, current);
                     }
 
-                    let base_price = here.price + no_literals;
-                    let mut shortest = min_match;
-                    for found in matches.iter() {
-                        let price = base_price + prices.offset::<IS_ACCURATE>(found.offset);
-                        for len in (shortest..=found.len).rev() {
-                            let position = current + len;
-                            let price = price + prices.match_len::<IS_ACCURATE>(len);
-                            if position > end || price < stretches.get(position)?.price {
-                                while end < position {
-                                    end += 1;
-                                    let skipped = stretches.get_mut(end)?;
-                                    skipped.price = MAX_PRICE;
-                                    skipped.literal_len = 1;
+                    if longest_end > end {
+                        ways.clear(end + 1..=longest_end + 1)?;
+                        end = longest_end;
+                    } else {
+                        *ways.prices.get_mut(end as usize + 1)? = MAX_PRICE;
+                    }
+                    let base_price = ways.price(current)? + prices.literal_len(0);
+                    let mut shortest = self.min_match;
+                    for &found in matches.iter() {
+                        let base_price = base_price + prices.offset::<IS_ACCURATE>(found.offset);
+                        if IS_ACCURATE {
+                            ways.offer(prices, base_price, current, shortest, found)?;
+                        } else {
+                            let mut match_len = found.len;
+                            while match_len >= shortest {
+                                let price = base_price + prices.match_len(match_len);
+                                if price >= ways.price(current + match_len)? {
+                                    break;
                                 }
-                                let stretch = stretches.get_mut(position)?;
-                                stretch.price = price;
-                                stretch.offset = found.offset;
-                                stretch.match_len = len;
-                                stretch.literal_len = 0;
-                            } else if !IS_ACCURATE {
-                                break;
+                                let stretch = Stretch {
+                                    offset: found.offset,
+                                    match_len,
+                                    literal_len: 0,
+                                };
+                                ways.set(current + match_len, price, stretch)?;
+                                match_len -= 1;
                             }
                         }
                         shortest = found.len + 1;
                     }
-                    stretches.get_mut(end + 1)?.price = MAX_PRICE;
+                } else if current == 0 {
+                    at += 1;
+                    continue 'block;
                 }
 
-                let last = *stretches.get(end)?;
-                if last.match_len == 0 {
+                // On to the next position that is worth a search.
+                while current < end {
+                    let with_literal = ways.price(current)?
+                        + prices.literal(*likely(prefix.get((at + current) as usize))?)
+                        + prices.one_more_literal(here.literal_len);
+                    current += 1;
+
+                    let (mut price, ending_here) = (ways.price(current)?, ways.stretch(current)?);
+                    if with_literal <= price {
+                        here.literal_len += 1;
+                        ways.set(current, with_literal, here)?;
+                        // The match may still be the better start for the literal after it.
+                        if IS_ACCURATE
+                            && ending_here.literal_len == 0
+                            && prices.one_more_literal(0) < 0
+                            && let Some(&next) = prefix.get((at + current) as usize)
+                        {
+                            let next = prices.literal(next);
+                            let after_match = price + next + prices.one_more_literal(0);
+                            let after_literals =
+                                with_literal + next + prices.one_more_literal(here.literal_len);
+                            if after_match < after_literals
+                                && after_match < ways.price(current + 1)?
+                            {
+                                let start = current - ending_here.match_len;
+                                *ways.repeats(current + 1)? =
+                                    ways.repeats_after(start, ending_here.offset)?;
+                                let stretch = Stretch {
+                                    literal_len: 1,
+                                    ..ending_here
+                                };
+                                ways.set(current + 1, after_match, stretch)?;
+                                end = end.max(current + 1);
+                            }
+                        }
+                        price = with_literal;
+                    } else {
+                        here = ending_here;
+                        here_repeats = if here.literal_len == 0 {
+                            ways.repeats_after(current - here.match_len, here.offset)?
+                        } else {
+                            *ways.repeats(current)?
+                        };
+                    }
+                    *ways.repeats(current)? = here_repeats;
+
+                    if at + current <= limit
+                        && current != end
+                        && (IS_ACCURATE || ways.price(current + 1)? > price + BIT / 2)
+                    {
+                        continue 'forward;
+                    }
+                }
+
+                if here.match_len == 0 {
                     at += end;
                     continue 'block;
                 }
-                (last, end - last.match_len)
+                *repeats = here_repeats;
+                break (here, end - here.match_len - here.literal_len);
             };
 
-            if last.literal_len == 0 {
-                let from = stretches.get(before_last)?;
-                *repeats = from.repeats.after(last.offset, from.literal_len != 0);
-            } else {
-                *repeats = last.repeats;
-                before_last -= last.literal_len;
-            }
-
             // Going back, each match gets the literals in front of it. They are stored in what was passed.
-            let stored_end = before_last + 2;
-            let mut stored_start = stored_end;
-            let mut position = before_last;
-            *stretches.get_mut(stored_end)? = last;
+            let stored_end = last_start + 2;
+            let (mut stored_start, mut position, mut next) = (stored_end, last_start, last);
             loop {
-                let stretch = *stretches.get(position)?;
-                stretches.get_mut(stored_start)?.literal_len = stretch.literal_len;
+                let stretch = ways.stretch(position)?;
+                next.literal_len = stretch.literal_len;
+                ways.set_stretch(stored_start, next)?;
                 if stretch.match_len == 0 {
                     break;
                 }
-                stored_start -= 1;
-                *stretches.get_mut(stored_start)? = stretch;
+                (stored_start, next) = (stored_start - 1, stretch);
                 position -= stretch.literal_len + stretch.match_len;
             }
 
-            for stored in stretches
-                .0
-                .get(stored_start as usize..=stored_end as usize)?
-            {
+            for stored in stored_start..=stored_end {
+                let stored = ways.stretch(stored)?;
                 let start = anchor + stored.literal_len;
                 let literals = prefix.get(anchor as usize..start as usize)?;
-                prices.add(literals, stored.offset, stored.match_len);
+                prices.add::<IS_ACCURATE>(literals, stored.offset, stored.match_len);
                 sequences.push(stored.literal_len, stored.offset, stored.match_len);
                 anchor = start + stored.match_len;
             }

@@ -14,6 +14,7 @@
     allocator_ext,
     hint_prefetch,
     mpmc_channel,
+    stmt_expr_attributes,
     vec_push_within_capacity
 )]
 

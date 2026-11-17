@@ -1,5 +1,7 @@
 //! What the search for matches makes of a block.
 
+use core::hint::select_unpredictable;
+
 use bun_zstd_decoder::format::{
     INITIAL_REPEAT_OFFSETS, LITERAL_LENGTH_BITS, MATCH_LENGTH_BITS, MAX_LITERAL_LENGTH_CODE,
     MAX_MATCH_LENGTH_CODE, MIN_MATCH,
@@ -52,9 +54,17 @@ impl Repeats {
 
     /// Without literals in front of a match, the numbers of the repeats are shifted by one.
     #[inline(always)]
-    pub(crate) fn get(self, number: u32) -> u32 {
+    fn get(self, number: u32) -> u32 {
         let [first, second, third] = self.0;
         *[first, second, third, first.wrapping_sub(1)].at(number as usize)
+    }
+
+    /// The offsets that the numbers stand for.
+    #[inline(always)]
+    pub(crate) fn numbered(self, has_literals: bool) -> [u32; 3] {
+        let [first, second, third] = self.0;
+        let shifted = [second, third, first.wrapping_sub(1)];
+        select_unpredictable(has_literals, self.0, shifted)
     }
 
     #[inline(always)]

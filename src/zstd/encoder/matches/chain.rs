@@ -3,7 +3,7 @@
 use super::hash::Hasher;
 use super::lazy::{Finder, Longest, Match};
 use super::{Attached, Bounds, MatchState, Reach, WORD};
-use crate::bytes::u64_at;
+use crate::bytes::{likely, u64_at};
 use crate::window::{FIRST_INDEX, History};
 
 /// Indexes the history up to `end`.
@@ -52,9 +52,9 @@ impl<'a> Chains<'a> {
     fn insert_up_to(&mut self, history: &History<'_>, end: u32, is_skipping: bool) -> Option<()> {
         let end = history.index(end);
         for index in self.next_to_index..end {
-            let word = u64_at(history.prefix, history.position(index))?;
-            let head = self.heads.get_mut(self.hasher.hash(word))?;
-            *self.chain.get_mut(link(index, self.chain))? = *head;
+            let word = likely(u64_at(history.prefix, history.position(index)))?;
+            let head = likely(self.heads.get_mut(self.hasher.hash(word)))?;
+            *likely(self.chain.get_mut(link(index, self.chain)))? = *head;
             *head = index;
             if is_skipping {
                 break;
@@ -78,7 +78,7 @@ impl Finder for Chains<'_> {
         is_skipping: bool,
     ) -> Option<Match> {
         self.insert_up_to(history, at, is_skipping)?;
-        let word = u64_at(history.prefix, at)?;
+        let word = likely(u64_at(history.prefix, at))?;
         let current = history.index(at);
         let lowest = self.bounds.lowest(current);
         let overwritten = current.saturating_sub(self.chain.len() as u32);
@@ -90,7 +90,7 @@ impl Finder for Chains<'_> {
             if longest.consider::<REACH>(history, index).is_none() || index <= overwritten {
                 break;
             }
-            index = *self.chain.get(link(index, self.chain))?;
+            index = *likely(self.chain.get(link(index, self.chain)))?;
             attempts -= 1;
         }
 

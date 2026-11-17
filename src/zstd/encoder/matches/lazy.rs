@@ -8,7 +8,7 @@ use super::chain::Chains;
 use super::lazy_tree::LazyTree;
 use super::rows::Rows;
 use super::{Attached, Bounds, MatchState, Progress, Reach, SKIP_LOG};
-use crate::bytes::u32_at;
+use crate::bytes::{likely, u32_at};
 use crate::parameters::Strategy;
 use crate::sequences::{OffsetValue, Repeats, Sequences};
 use crate::window::{History, WORD_LEN};
@@ -52,42 +52,61 @@ impl Longest {
         }
     }
 
+    #[inline(always)]
+    fn note(&mut self, history: &History<'_>, len: u32, offset: u32) -> Option<()> {
+        if len > self.best.len {
+            let offset = OffsetValue::new(offset);
+            self.best = Match { len, offset };
+            self.tail = likely(u32_at(history.prefix, self.at + len - 3))?;
+        }
+        Some(())
+    }
+
     /// `None` if the best match reaches the end, so that none can be longer.
+    #[inline(always)]
+    pub(super) fn consider_position(&mut self, history: &History<'_>, earlier: u32) -> Option<()> {
+        let tail = likely(u32_at(
+            history.prefix,
+            earlier.wrapping_add(self.best.len - 3),
+        ));
+        if tail != Some(self.tail) {
+            return Some(());
+        }
+        let len = history.match_len(self.at, earlier);
+        self.note(history, len, self.at.wrapping_sub(earlier))
+    }
+
     #[inline(always)]
     pub(super) fn consider<const REACH: Reach>(
         &mut self,
         history: &History<'_>,
         index: u32,
     ) -> Option<()> {
-        let len = if REACH == Reach::Prefix || index >= history.prefix_index {
-            let earlier = history.position(index);
-            let tail = earlier.wrapping_add(self.best.len - 3);
-            if u32_at(history.prefix, tail) != Some(self.tail) {
-                return Some(());
-            }
-            history.match_len(self.at, earlier)
-        } else {
-            let earlier = history.older_position(index);
-            if u32_at(history.older, earlier) != u32_at(history.prefix, self.at) {
-                return Some(());
-            }
-            4 + history.older_match_len(self.at + 4, earlier + 4)
-        };
-        if len > self.best.len {
-            let offset = OffsetValue::new(history.index(self.at).wrapping_sub(index));
-            self.best = Match { len, offset };
-            self.tail = u32_at(history.prefix, self.at + len - 3)?;
+        if REACH == Reach::Prefix || index >= history.prefix_index {
+            return self.consider_position(history, history.position(index));
         }
-        Some(())
+        let earlier = history.older_position(index);
+        if u32_at(history.older, earlier) != u32_at(history.prefix, self.at) {
+            return Some(());
+        }
+        let len = 4 + history.older_match_len(self.at + 4, earlier + 4);
+        self.note(history, len, history.index(self.at).wrapping_sub(index))
     }
 }
 
 pub(super) trait Finder {
     /// How far from the end the search stops.
     const MARGIN: u32;
+    const GAINS_FROM_BMI2: bool = true;
 
     /// Arrays would keep the compiler from holding the other fields in registers.
     type Scratch: Default;
+
+    /// Where the search is compiled.
+    #[inline(always)]
+    fn prepare(&mut self) -> Option<()> {
+        Some(())
+    }
 
     /// Also indexes the positions up to `at`, unless `is_skipping`. `None` ends the search.
     fn find<const REACH: Reach>(
@@ -128,15 +147,15 @@ pub(super) fn search<const REACH: Reach>(
 
     let next_to_index = if state.tuning.strategy == Strategy::TreeLazy2 {
         let finder = LazyTree::new(state, attached);
-        parser.run::<REACH>(finder, &mut progress)
+        parser.run::<REACH, _>(finder, &mut progress)
     } else if !state.uses_rows {
         let finder = Chains::new(state, attached);
-        parser.run::<REACH>(finder, &mut progress)
+        parser.run::<REACH, _>(finder, &mut progress)
     } else {
         match state.tuning.row_log() {
-            4 => parser.run::<REACH>(Rows::<16>::new(state, attached), &mut progress),
-            5 => parser.run::<REACH>(Rows::<32>::new(state, attached), &mut progress),
-            _ => parser.run::<REACH>(Rows::<64>::new(state, attached), &mut progress),
+            4 => parser.run::<REACH, _>(Rows::<16>::new(state, attached), &mut progress),
+            5 => parser.run::<REACH, _>(Rows::<32>::new(state, attached), &mut progress),
+            _ => parser.run::<REACH, _>(Rows::<64>::new(state, attached), &mut progress),
         }
     };
     state.next_to_index = next_to_index;
@@ -154,25 +173,28 @@ struct Parser<'a> {
 impl Parser<'_> {
     /// Returns from which index on the tables are not up to date.
     #[inline(never)]
-    fn run<const REACH: Reach>(self, finder: impl Finder, progress: &mut Progress<'_>) -> u32 {
-        with_bmi2(
-            #[inline(always)]
-            move || {
-                let mut finder = finder;
-                self.parse::<REACH, _>(&mut finder, progress);
-                finder.next_to_index()
-            },
-        )
+    fn run<const REACH: Reach, F: Finder>(self, finder: F, progress: &mut Progress<'_>) -> u32 {
+        let run = #[inline(always)]
+        move || {
+            let mut finder = finder;
+            self.parse::<REACH, _>(&mut finder, progress);
+            finder.next_to_index()
+        };
+        if F::GAINS_FROM_BMI2 {
+            with_bmi2(run)
+        } else {
+            run()
+        }
     }
 
     /// The length of the match that `offset` gives at `at`, if there is one.
     #[inline(always)]
     fn repeat_len<const REACH: Reach>(&self, at: u32, offset: u32) -> Option<u32> {
         let history = &self.history;
-        let value = u32_at(history.prefix, at);
+        let value = Some(likely(u32_at(history.prefix, at))?);
         if REACH == Reach::Prefix {
             let earlier = at.wrapping_sub(offset);
-            return ((offset > 0) & (u32_at(history.prefix, earlier) == value))
+            return (earlier < at && u32_at(history.prefix, earlier) == value)
                 .then(|| 4 + history.match_len(at + 4, earlier + 4));
         }
         let current = history.index(at);
@@ -198,9 +220,10 @@ impl Parser<'_> {
         let mut at = self.start;
         let mut is_skipping = false;
         let mut scratch = F::Scratch::default();
+        finder.prepare()?;
         finder.resume(history, &mut scratch);
 
-        while at < limit {
+        'block: while at < limit {
             let mut start = at + 1;
             let repeat_len = self.repeat_len::<REACH>(start, progress.recent);
             let mut best = Match {
@@ -209,33 +232,39 @@ impl Parser<'_> {
             };
 
             if self.depth > 0 || repeat_len.is_none() {
-                let found = finder.find::<REACH>(history, &mut scratch, at, is_skipping)?;
-                if found.len > best.len {
-                    (best, start) = (found, at);
-                }
-                if best.len < MIN_LEN {
-                    let skipped = (at - progress.anchor) >> SKIP_LOG;
-                    at += skipped + 1;
-                    is_skipping = skipped + u32::from(REACH != Reach::Older) > SKIPS_INDEXING_FROM;
-                    continue;
-                }
-
-                let mut ahead = 0;
-                while ahead < self.depth && at < limit {
-                    at += 1;
-                    if let Some(len) = self.repeat_len::<REACH>(at, progress.recent) {
-                        let per_byte = 3 + ahead;
-                        let offset = OffsetValue::FIRST_REPEAT;
-                        if (len * per_byte) as i32 > best.gain(per_byte) + 1 {
-                            (best, start) = (Match { len, offset }, at);
-                        }
-                    }
+                // How many positions had nothing better, once there is a match.
+                let mut misses = None;
+                loop {
                     let found = finder.find::<REACH>(history, &mut scratch, at, is_skipping)?;
-                    if found.len >= MIN_LEN && found.gain(4) > best.gain(4) + 4 + 3 * ahead as i32 {
+                    let is_better = match misses {
+                        None => found.len > best.len,
+                        Some(misses) => {
+                            found.len >= MIN_LEN
+                                && found.gain(4) > best.gain(4) + 4 + 3 * misses as i32
+                        }
+                    };
+                    if is_better {
                         (best, start) = (found, at);
-                        ahead = 0;
-                    } else {
-                        ahead += 1;
+                    }
+                    if best.len < MIN_LEN {
+                        let skipped = (at - progress.anchor) >> SKIP_LOG;
+                        at += skipped + 1;
+                        is_skipping =
+                            skipped + u32::from(REACH != Reach::Older) > SKIPS_INDEXING_FROM;
+                        continue 'block;
+                    }
+
+                    let missed = misses.filter(|_| !is_better).map_or(0, |misses| misses + 1);
+                    if missed >= self.depth || at >= limit {
+                        break;
+                    }
+                    misses = Some(missed);
+                    at += 1;
+                    if let Some(len) = self.repeat_len::<REACH>(at, progress.recent)
+                        && (len * (3 + missed)) as i32 > best.gain(3 + missed) + 1
+                    {
+                        let offset = OffsetValue::FIRST_REPEAT;
+                        (best, start) = (Match { len, offset }, at);
                     }
                 }
 

@@ -3,83 +3,95 @@
 use core::cell::Cell;
 
 use super::hash::Hasher;
-use super::{Attached, Bounds, MatchState, Reach, WORD, cells};
-use crate::bytes::u64_at;
-use crate::window::{FIRST_INDEX, History};
+use super::{Attached, Bounds, MatchState, Reach, WORD, cells, prefetch};
+use crate::bytes::{chunk_at, u64_at, word_in};
+use crate::window::{FIRST_INDEX, History, WORD_LEN};
 
 /// The roots of the subtrees with what is smaller, and with what is larger.
 pub(super) type Node = [Cell<u32>; 2];
 
 #[derive(Clone, Copy)]
-pub(super) struct Nodes<'a>(&'a [Node]);
+pub(super) struct Nodes<'a> {
+    /// The compiler sees their number as `mask + 1`, and that a masked index is below it.
+    nodes: &'a [Node],
+    mask: usize,
+}
 
 impl<'a> Nodes<'a> {
-    pub(super) fn new(chain: &'a mut [u32]) -> Self {
-        Self(cells(chain).as_chunks().0)
-    }
-
     #[inline(always)]
-    fn mask(self) -> usize {
-        self.0.len().wrapping_sub(1)
+    pub(super) fn new(nodes: &'a [Node]) -> Option<Self> {
+        let mask = nodes.len().wrapping_sub(1) as u32 as usize;
+        let nodes = nodes.get(..mask + 1)?;
+        Some(Self { nodes, mask })
     }
 
     #[inline(always)]
     pub(super) fn get(self, index: u32) -> Option<&'a Node> {
-        self.0.get(index as usize & self.mask())
+        self.nodes.get(index as usize & self.mask)
     }
 
     /// The last index whose node may have been taken by another one.
     #[inline(always)]
     pub(super) fn overwritten(self, current: u32) -> u32 {
-        current.saturating_sub(self.mask() as u32)
+        current.saturating_sub(self.mask as u32)
+    }
+}
+
+/// The last node on the way down that was smaller than the root, or larger.
+#[derive(Clone, Copy)]
+struct Side<'a> {
+    /// Where the next such node goes.
+    slot: &'a Cell<u32>,
+    /// How many bytes it had in common with the root.
+    common: u32,
+}
+
+impl<'a> Side<'a> {
+    #[inline(always)]
+    fn extend(&mut self, index: u32, slot: &'a Cell<u32>, common: u32) -> u32 {
+        self.slot.set(index);
+        *self = Self { slot, common };
+        slot.get()
     }
 }
 
 /// Makes a node the root, while going down the tree that it takes over.
 pub(super) struct Descent<'a> {
-    /// Where the next node goes that is smaller, and larger.
-    slots: [&'a Cell<u32>; 2],
-    /// How many bytes the last node that was smaller, and larger, had in common with the root.
-    common: [u32; 2],
+    smaller: Side<'a>,
+    larger: Side<'a>,
 }
 
 impl<'a> Descent<'a> {
     #[inline(always)]
     pub(super) fn new([smaller, larger]: &'a Node) -> Self {
+        let side = |slot| Side { slot, common: 0 };
         Self {
-            slots: [smaller, larger],
-            common: [0; 2],
+            smaller: side(smaller),
+            larger: side(larger),
         }
     }
 
     /// How many bytes the next node has in common with the root, at least.
     #[inline(always)]
     pub(super) fn known(&self) -> u32 {
-        let [smaller, larger] = self.common;
-        smaller.min(larger)
+        self.smaller.common.min(self.larger.common)
     }
 
     /// Returns the next index. `node` is that of `index`, or a spare one that leads nowhere.
     #[inline(always)]
     pub(super) fn step(&mut self, index: u32, node: &'a Node, len: u32, is_smaller: bool) -> u32 {
-        let ([smaller_slot, larger_slot], [smaller, larger]) = (&mut self.slots, node);
-        let [smaller_common, larger_common] = &mut self.common;
+        let [smaller, larger] = node;
         if is_smaller {
-            smaller_slot.set(index);
-            (*smaller_slot, *smaller_common) = (larger, len);
-            larger.get()
+            self.smaller.extend(index, larger, len)
         } else {
-            larger_slot.set(index);
-            (*larger_slot, *larger_common) = (smaller, len);
-            smaller.get()
+            self.larger.extend(index, smaller, len)
         }
     }
 
     #[inline(always)]
     pub(super) fn finish(self) {
-        for slot in self.slots {
-            slot.set(0);
-        }
+        self.smaller.slot.set(0);
+        self.larger.slot.set(0);
     }
 }
 
@@ -143,7 +155,7 @@ pub(super) fn fill(state: &mut MatchState, history: &History<'_>, end: u32) {
 pub(super) struct Tree<'a> {
     pub(super) bounds: Bounds,
     pub(super) roots: &'a mut [u32],
-    pub(super) nodes: Nodes<'a>,
+    pub(super) nodes: &'a [Node],
     pub(super) hash3: &'a mut [u32],
     pub(super) hasher: Hasher,
     pub(super) attempts: u32,
@@ -157,7 +169,7 @@ impl<'a> Tree<'a> {
         Self {
             bounds,
             roots: tables.hash,
-            nodes: Nodes::new(tables.chain),
+            nodes: cells(tables.chain).as_chunks().0,
             hash3: tables.hash3,
             hasher: Hasher::new(min_match, tuning.hash_log),
             attempts: 1 << tuning.search_log,
@@ -165,22 +177,41 @@ impl<'a> Tree<'a> {
         }
     }
 
-    /// Returns how many positions that takes care of.
+    /// For searches at the next two positions: the root of the second, and what that of the first leads to.
     #[inline(always)]
+    pub(super) fn prefetch_after(&self, history: &History<'_>, nodes: Nodes<'_>, at: u32) {
+        const CACHED_UP_TO: usize = 1 << 17;
+        if self.roots.len() <= CACHED_UP_TO {
+            return;
+        }
+        let Some(words) = chunk_at::<{ WORD_LEN + 1 }>(history.prefix, at + 1) else {
+            return;
+        };
+        prefetch(self.roots, self.hasher.hash(word_in::<1, _>(words)));
+        if let Some(&root) = self.roots.get(self.hasher.hash(word_in::<0, _>(words))) {
+            prefetch(history.prefix, history.position(root) as usize);
+            prefetch(nodes.nodes, root as usize & nodes.mask);
+        }
+    }
+
+    /// Returns how many positions that takes care of.
+    #[inline(never)]
     fn insert<const REACH: Reach>(
         &mut self,
-        history: &History<'_>,
+        history: History<'_>,
         current: u32,
         lowest: u32,
     ) -> Option<u32> {
+        let history = &history.with_prefix_of::<WORD_LEN>()?;
         let at = history.position(current);
         let root = self
             .roots
             .get_mut(self.hasher.hash(u64_at(history.prefix, at)?))?;
         let mut index = core::mem::replace(root, current);
-        let overwritten = self.nodes.overwritten(current);
+        let nodes = Nodes::new(self.nodes)?;
+        let overwritten = nodes.overwritten(current);
         let spare = Node::default();
-        let mut descent = Descent::new(self.nodes.get(current)?);
+        let mut descent = Descent::new(nodes.get(current)?);
         let mut matched_end = current + WORD + 1;
         let mut longest = WORD;
 
@@ -188,7 +219,7 @@ impl<'a> Tree<'a> {
             if index < lowest {
                 break;
             }
-            let node = self.nodes.get(index)?;
+            let node = nodes.get(index)?;
             let (len, is_smaller) = compare::<REACH>(history, at, index, descent.known());
             if len > longest {
                 longest = len;
@@ -217,7 +248,7 @@ impl<'a> Tree<'a> {
         let lowest = self.bounds.lowest(end);
         let mut index = self.next_to_index;
         while index < end {
-            index += self.insert::<REACH>(history, index, lowest)?;
+            index += self.insert::<REACH>(*history, index, lowest)?;
         }
         self.next_to_index = end;
         Some(())

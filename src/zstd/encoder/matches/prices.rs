@@ -11,13 +11,15 @@ use crate::sequences::{LengthCode, OffsetValue};
 
 const ACCURACY_LOG: u32 = 8;
 pub(super) const BIT: i32 = 1 << ACCURACY_LOG;
-/// Blocks up to this length say too little about their literals.
-pub(super) const FIXED_UP_TO: usize = 8;
+/// How many prices of match lengths are looked up at once.
+pub(super) const LANES: usize = 8;
+const SHORT_MATCHES: usize = 128;
+const FEW_LITERALS: usize = 64;
 
 #[inline(always)]
 fn log2<const IS_ACCURATE: bool>(count: u32) -> i32 {
     let value = count + 1;
-    let whole = highest_bit(value);
+    let whole = (value | 1).ilog2();
     let fraction = if IS_ACCURATE {
         (value << ACCURACY_LOG) >> whole
     } else {
@@ -26,57 +28,81 @@ fn log2<const IS_ACCURATE: bool>(count: u32) -> i32 {
     ((whole << ACCURACY_LOG) + fraction) as i32
 }
 
-struct Frequencies<const N: usize> {
+/// Of the first `USED` of `N` symbols.
+struct Frequencies<const USED: usize, const N: usize> {
     counts: [u32; N],
+    logs: [i32; N],
     sum: u32,
     sum_log: i32,
 }
 
-impl<const N: usize> Frequencies<N> {
+impl<const USED: usize, const N: usize> Frequencies<USED, N> {
     const EMPTY: Self = Self {
         counts: [0; N],
+        logs: [0; N],
         sum: 0,
         sum_log: 0,
     };
 
-    fn set(&mut self, counts: [u32; N]) {
-        self.counts = counts;
-        self.sum = counts.iter().sum();
+    fn set(&mut self, count: impl Fn(usize) -> u32) {
+        for (symbol, out) in self.counts.iter_mut().enumerate().take(USED) {
+            *out = count(symbol);
+        }
+        self.sum = self.counts.iter().sum();
     }
 
     /// From how many bits each symbol takes in a dictionary.
     fn set_from_bits(&mut self, scale_log: u32, bits: impl Fn(usize) -> u32) {
-        self.set(core::array::from_fn(|symbol| match bits(symbol) {
+        self.set(|symbol| match bits(symbol) {
             0 => 1,
             bits => 1 << scale_log.saturating_sub(bits),
-        }));
+        });
     }
 
     fn scale_down(&mut self, target_log: u32) {
-        let factor = self.sum >> target_log;
+        let (counts, factor) = (self.counts, self.sum >> target_log);
         if factor > 1 {
-            self.set(self.counts.map(|count| 1 + (count >> highest_bit(factor))));
+            self.set(|symbol| 1 + (counts.at(symbol) >> highest_bit(factor)));
+        }
+    }
+
+    fn update_logs<const IS_ACCURATE: bool>(&mut self) {
+        for (log, &count) in self.logs.iter_mut().zip(&self.counts).take(USED) {
+            *log = log2::<IS_ACCURATE>(count);
         }
     }
 
     #[inline(always)]
-    fn add(&mut self, symbol: usize) {
-        *self.counts.at_mut(symbol) += 1;
-        self.sum += 1;
+    fn add<const IS_ACCURATE: bool>(&mut self, symbol: usize, times: u32) {
+        let count = self.counts.at_mut(symbol);
+        *count += times;
+        *self.logs.at_mut(symbol) = log2::<IS_ACCURATE>(*count);
+        self.sum += times;
     }
 
     #[inline(always)]
-    fn price<const IS_ACCURATE: bool>(&self, symbol: usize) -> i32 {
-        self.sum_log - log2::<IS_ACCURATE>(*self.counts.at(symbol))
+    fn price(&self, symbol: usize) -> i32 {
+        self.sum_log - self.logs.at(symbol)
     }
 }
 
+/// For all lengths with the same code as `len`.
+#[inline(always)]
+fn set_for_code(by_len: &mut [i32], len: u32, code: LengthCode, price: i32) {
+    let first = (len >> code.bits() << code.bits()) as usize;
+    let same_code = by_len.get_mut(first..first + (1 << code.bits()));
+    same_code.unwrap_or_default().fill(price);
+}
+
 pub(super) struct Prices {
-    literals: Frequencies<256>,
-    literal_lengths: Frequencies<{ MAX_LITERAL_LENGTH_CODE + 1 }>,
-    match_lengths: Frequencies<{ MAX_MATCH_LENGTH_CODE + 1 }>,
-    offsets: Frequencies<{ MAX_OFFSET_CODE + 1 }>,
-    is_fixed: bool,
+    literals: Frequencies<256, 256>,
+    literal_lengths: Frequencies<{ MAX_LITERAL_LENGTH_CODE + 1 }, 64>,
+    match_lengths: Frequencies<{ MAX_MATCH_LENGTH_CODE + 1 }, 64>,
+    offsets: Frequencies<{ MAX_OFFSET_CODE + 1 }, 64>,
+    /// By length less [`MIN_MATCH`], without what all have in common.
+    short_matches: [i32; SHORT_MATCHES],
+    /// By their number, likewise.
+    few_literals: [i32; FEW_LITERALS],
 }
 
 impl Prices {
@@ -85,7 +111,8 @@ impl Prices {
         literal_lengths: Frequencies::EMPTY,
         match_lengths: Frequencies::EMPTY,
         offsets: Frequencies::EMPTY,
-        is_fixed: false,
+        short_matches: [0; _],
+        few_literals: [0; _],
     };
 
     pub(super) fn is_empty(&self) -> bool {
@@ -96,36 +123,43 @@ impl Prices {
         self.literal_lengths.sum = 0;
     }
 
-    pub(super) fn start_block<const IS_ACCURATE: bool>(&mut self, block: &[u8], entropy: &Entropy) {
-        self.is_fixed = false;
+    fn set_counts(&mut self, block: &[u8], entropy: &Entropy) {
         if !self.is_empty() {
             self.literals.scale_down(12);
             self.literal_lengths.scale_down(11);
             self.match_lengths.scale_down(11);
             self.offsets.scale_down(11);
         } else if entropy.literals.reuse == Reuse::Always {
-            let literals = entropy.literals.current();
+            let (literals, codes) = (entropy.literals.current(), &entropy.codes);
             self.literals.set_from_bits(11, |it| literals.code_len(it));
             self.literal_lengths
-                .set_from_bits(10, |it| entropy.codes.max_bits(CodeKind::LiteralLength, it));
+                .set_from_bits(10, |it| codes.max_bits(CodeKind::LiteralLength, it));
             self.match_lengths
-                .set_from_bits(10, |it| entropy.codes.max_bits(CodeKind::MatchLength, it));
+                .set_from_bits(10, |it| codes.max_bits(CodeKind::MatchLength, it));
             self.offsets
-                .set_from_bits(10, |it| entropy.codes.max_bits(CodeKind::Offset, it));
+                .set_from_bits(10, |it| codes.max_bits(CodeKind::Offset, it));
         } else {
-            self.is_fixed = block.len() <= FIXED_UP_TO;
             let mut counts = [0; 256];
             histogram::add(&mut counts, block);
-            self.literals
-                .set(counts.map(|count| u32::from(count > 0) + (count >> 8)));
+            let counts = counts.map(|count| u32::from(count > 0) + (count >> 8));
+            self.literals.set(|literal| *counts.at(literal));
             let starting_with = |first: &[u32], code: usize| first.get(code).copied().unwrap_or(1);
             self.literal_lengths
-                .set(core::array::from_fn(|code| starting_with(&[4, 2], code)));
-            self.match_lengths.set([1; _]);
-            self.offsets.set(core::array::from_fn(|code| {
-                starting_with(&[6, 2, 1, 1, 2, 3, 4, 4, 4, 3, 2], code)
-            }));
+                .set(|code| starting_with(&[4, 2], code));
+            self.match_lengths.set(|_| 1);
+            self.offsets
+                .set(|code| starting_with(&[6, 2, 1, 1, 2, 3, 4, 4, 4, 3, 2], code));
         }
+    }
+
+    pub(super) fn start_block<const IS_ACCURATE: bool>(&mut self, block: &[u8], entropy: &Entropy) {
+        self.set_counts(block, entropy);
+        self.literals.update_logs::<IS_ACCURATE>();
+        self.literal_lengths.update_logs::<IS_ACCURATE>();
+        self.match_lengths.update_logs::<IS_ACCURATE>();
+        self.offsets.update_logs::<IS_ACCURATE>();
+        self.short_matches = core::array::from_fn(|base| self.match_base(base as u32));
+        self.few_literals = core::array::from_fn(|len| self.literal_count(len as u32));
         self.update::<IS_ACCURATE>();
     }
 
@@ -139,47 +173,62 @@ impl Prices {
     }
 
     #[inline(always)]
-    pub(super) fn add(&mut self, literals: &[u8], offset: OffsetValue, match_len: u32) {
-        // Twice, to adapt faster.
+    pub(super) fn add<const IS_ACCURATE: bool>(
+        &mut self,
+        literals: &[u8],
+        offset: OffsetValue,
+        match_len: u32,
+    ) {
         for &literal in literals {
-            *self.literals.counts.at_mut(usize::from(literal)) += 2;
+            // Twice, to adapt faster.
+            self.literals.add::<IS_ACCURATE>(usize::from(literal), 2);
         }
-        self.literals.sum += 2 * literals.len() as u32;
-        self.literal_lengths
-            .add(LengthCode::of_literals(literals.len() as u32).code());
-        self.offsets.add(offset.code() as usize);
-        self.match_lengths
-            .add(LengthCode::of_match(match_len - MIN_MATCH).code());
+        self.offsets.add::<IS_ACCURATE>(offset.code() as usize, 1);
+
+        let len = literals.len() as u32;
+        let code = LengthCode::of_literals(len);
+        self.literal_lengths.add::<IS_ACCURATE>(code.code(), 1);
+        let price = self.literal_count(len);
+        set_for_code(&mut self.few_literals, len, code, price);
+
+        let base = match_len - MIN_MATCH;
+        let code = LengthCode::of_match(base);
+        self.match_lengths.add::<IS_ACCURATE>(code.code(), 1);
+        let price = self.match_base(base);
+        set_for_code(&mut self.short_matches, base, code, price);
     }
 
     #[inline(always)]
-    pub(super) fn literal<const IS_ACCURATE: bool>(&self, literal: u8) -> i32 {
-        if self.is_fixed {
-            return 6 * BIT;
-        }
-        let price = self.literals.price::<IS_ACCURATE>(usize::from(literal));
-        price.max(BIT)
+    pub(super) fn literal(&self, literal: u8) -> i32 {
+        self.literals.price(usize::from(literal)).max(BIT)
     }
 
     #[inline(always)]
-    pub(super) fn literal_len<const IS_ACCURATE: bool>(&self, len: u32) -> i32 {
-        if self.is_fixed {
-            return log2::<IS_ACCURATE>(len);
-        }
+    fn literal_count(&self, len: u32) -> i32 {
         // There is no code for a block of nothing but literals.
         let coded = len.min(BLOCK_LEN_MAX as u32 - 1);
         let code = LengthCode::of_literals(coded);
-        let bits = (code.bits() + len - coded) as i32;
-        bits * BIT + self.literal_lengths.price::<IS_ACCURATE>(code.code())
+        (code.bits() + len - coded) as i32 * BIT - self.literal_lengths.logs.at(code.code())
     }
 
-    /// Of the offset of a match.
+    #[inline(always)]
+    pub(super) fn literal_len(&self, len: u32) -> i32 {
+        self.literal_lengths.sum_log + self.literal_count(len)
+    }
+
+    /// By how much that goes up.
+    #[inline(always)]
+    pub(super) fn one_more_literal(&self, len: u32) -> i32 {
+        match self.few_literals.get(len as usize..len as usize + 2) {
+            Some(&[before, after]) => after - before,
+            _ => self.literal_count(len + 1) - self.literal_count(len),
+        }
+    }
+
+    /// What a match costs whatever its length.
     #[inline(always)]
     pub(super) fn offset<const IS_ACCURATE: bool>(&self, offset: OffsetValue) -> i32 {
         let code = offset.code() as i32;
-        if self.is_fixed {
-            return (16 + code) * BIT;
-        }
         // Both make for faster decoding.
         let for_distance = if IS_ACCURATE {
             0
@@ -187,16 +236,30 @@ impl Prices {
             (code - 19).max(0) * 2 * BIT
         };
         let for_sequence = BIT / 5;
-        code * BIT + self.offsets.price::<IS_ACCURATE>(code as usize) + for_distance + for_sequence
+        let for_offset = code * BIT + self.offsets.price(code as usize);
+        for_offset + for_distance + for_sequence + self.match_lengths.sum_log
     }
 
     #[inline(always)]
-    pub(super) fn match_len<const IS_ACCURATE: bool>(&self, len: u32) -> i32 {
-        let base = len - MIN_MATCH;
-        if self.is_fixed {
-            return log2::<IS_ACCURATE>(base);
-        }
+    fn match_base(&self, base: u32) -> i32 {
         let code = LengthCode::of_match(base);
-        code.bits() as i32 * BIT + self.match_lengths.price::<IS_ACCURATE>(code.code())
+        code.bits() as i32 * BIT - self.match_lengths.logs.at(code.code())
+    }
+
+    /// What it costs on top of that.
+    #[inline(always)]
+    pub(super) fn match_len(&self, len: u32) -> i32 {
+        let base = len - MIN_MATCH;
+        match self.short_matches.get(base as usize) {
+            Some(&price) => price,
+            None => self.match_base(base),
+        }
+    }
+
+    /// The same from `len` on, if they are short.
+    #[inline(always)]
+    pub(super) fn short_match_lens(&self, len: u32) -> Option<&[i32; LANES]> {
+        let base = (len - MIN_MATCH) as usize;
+        self.short_matches.get(base..base + LANES)?.as_array()
     }
 }

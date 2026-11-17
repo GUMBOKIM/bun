@@ -2,7 +2,7 @@
 
 use super::hash::Hasher;
 use super::lazy::{Finder, Match};
-use super::tree::{self, Descent, Node, Tree};
+use super::tree::{self, Descent, Node, Nodes, Tree};
 use super::{Attached, MatchState, Reach, WORD};
 use crate::bytes::{self, highest_bit, u64_at};
 use crate::sequences::OffsetValue;
@@ -32,10 +32,11 @@ impl<'a> LazyTree<'a> {
     #[inline(always)]
     fn link_up_to(&mut self, history: &History<'_>, end: u32) -> Option<()> {
         let tree = &mut self.tree;
+        let nodes = Nodes::new(tree.nodes)?;
         for index in tree.next_to_index..end {
             let word = u64_at(history.prefix, history.position(index))?;
             let root = tree.roots.get_mut(tree.hasher.hash(word))?;
-            let [link, mark] = tree.nodes.get(index)?;
+            let [link, mark] = nodes.get(index)?;
             link.set(core::mem::replace(root, index));
             mark.set(UNSORTED);
         }
@@ -51,7 +52,7 @@ impl<'a> LazyTree<'a> {
         attempts: u32,
         last: u32,
     ) -> Option<()> {
-        let nodes = self.tree.nodes;
+        let nodes = Nodes::new(self.tree.nodes)?;
         let (run, at) = match REACH {
             Reach::Older => history.locate(current),
             _ => (history.prefix, history.position(current)),
@@ -95,7 +96,7 @@ impl<'a> LazyTree<'a> {
         mut index: u32,
         last: u32,
     ) -> Option<()> {
-        let nodes = self.tree.nodes;
+        let nodes = Nodes::new(self.tree.nodes)?;
         let mut attempts = self.tree.attempts;
         let mut newer = 0;
         while index > last {
@@ -126,6 +127,7 @@ impl<'a> LazyTree<'a> {
 
 impl Finder for LazyTree<'_> {
     const MARGIN: u32 = WORD;
+    const GAINS_FROM_BMI2: bool = false;
     type Scratch = ();
 
     #[inline(always)]
@@ -148,12 +150,12 @@ impl Finder for LazyTree<'_> {
 
         let word = u64_at(history.prefix, at)?;
         let lowest = self.tree.bounds.lowest(current);
-        let overwritten = self.tree.nodes.overwritten(current);
+        let nodes = Nodes::new(self.tree.nodes)?;
+        let overwritten = nodes.overwritten(current);
         let root = self.tree.roots.get_mut(self.tree.hasher.hash(word))?;
         let mut index = core::mem::replace(root, current);
         self.sort_chain::<REACH>(history, index, overwritten.max(lowest))?;
 
-        let nodes = self.tree.nodes;
         let spare = Node::default();
         let mut descent = Descent::new(nodes.get(current)?);
         let mut matched_end = current + WORD + 1;

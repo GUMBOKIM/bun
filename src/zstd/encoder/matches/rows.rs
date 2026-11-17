@@ -1,15 +1,14 @@
 //! Rows of the most recent positions with about the same hash. Tags have more bits of it.
 
-use core::hint::select_unpredictable;
 use core::ops::Range;
 
 use super::hash::Hasher;
 use super::lazy::{Finder, Longest, Match};
 use super::{Attached, Bounds, MatchState, Reach, WORD, prefetch};
 use crate::array::At;
-use crate::bytes::{equal_bytes, u64_at};
+use crate::bytes::{equal_bytes, likely, u64_at};
 use crate::parameters::TAG_BITS;
-use crate::window::{FIRST_INDEX, History};
+use crate::window::{FIRST_INDEX, History, WORD_LEN};
 
 const CACHED: usize = 8;
 
@@ -23,41 +22,54 @@ pub(super) fn fill(state: &mut MatchState, history: &History<'_>, end: u32) {
     };
 }
 
-/// One bit for each of `tags` that equals `tag`, from the most recent entry on.
+/// The head of a row, and from there on one bit for each of its `tags` that equals `tag`.
 #[inline(always)]
-fn matching<const N: usize>(tags: &[u8; N], tag: u8, head: u32) -> u64 {
+fn matching<const N: usize>(tags: &[u8; N], tag: u8) -> (u32, u64) {
     let mut all = 0;
     for (index, chunk) in tags.as_chunks().0.iter().enumerate() {
         all |= u64::from(equal_bytes(chunk, &[tag; 16])) << (16 * index);
     }
-    match N {
+    // Or else the compiler would put the first chunk together from the head and the rest.
+    core::hint::black_box(());
+    let head = u32::from(*tags.at(0));
+    let rotated = match N {
         16 => u64::from((all as u16).rotate_right(head)),
         32 => u64::from((all as u32).rotate_right(head)),
         _ => all.rotate_right(head),
-    }
+    };
+    (head, rotated)
 }
 
-/// In place of the first tag is the head: where the most recent entry is. They are added backwards.
+/// Where the row for `hash` starts.
 #[inline(always)]
-fn add<const N: usize>((indices, tags): (&mut [u32; N], &mut [u8; N]), index: u32, tag: u8) {
-    let slot = u32::from(*tags.at(0)).wrapping_sub(1) as usize % N;
-    let slot = select_unpredictable(slot == 0, N - 1, slot) % N;
-    *tags.at_mut(0) = slot as u8;
-    *tags.at_mut(slot) = tag;
-    *indices.at_mut(slot) = index;
+fn first_entry<const N: usize>(hash: u32) -> usize {
+    (hash >> TAG_BITS) as usize * N
 }
 
-/// Fills `candidates` with entries from `lowest` on, and returns those that it filled.
+#[inline(always)]
+fn prefetch_row<const N: usize>(indices: &[u32], tags: &[u8], hash: u32) {
+    let first = first_entry::<N>(hash);
+    prefetch(indices, first);
+    if N >= 32 {
+        prefetch(indices, first + 16);
+    }
+    prefetch(tags, first);
+}
+
+/// Fills `candidates` with what `note` makes of the indices from `lowest` on, and returns those that it filled.
 #[inline(always)]
 fn collect<'a, const N: usize>(
-    (indices, tags): (&[u32; N], &[u8; N]),
-    tag: u8,
+    indices: &[u32],
+    tags: &[u8],
+    hash: u32,
     lowest: u32,
     candidates: &'a mut [u32],
-    prefetch: impl Fn(u32),
-) -> &'a [u32] {
-    let head = u32::from(*tags.at(0));
-    let mut matching = matching(tags, tag, head);
+    note: impl Fn(u32) -> u32,
+) -> Option<&'a [u32]> {
+    let row = first_entry::<N>(hash)..first_entry::<N>(hash) + N;
+    let indices = likely(indices.get(row.clone()))?.as_array::<N>()?;
+    let tags = likely(tags.get(row))?.as_array::<N>()?;
+    let (head, mut matching) = matching(tags, hash as u8);
     let mut count = 0;
     while matching != 0
         && let Some(candidate) = candidates.get_mut(count)
@@ -71,21 +83,10 @@ fn collect<'a, const N: usize>(
         if index < lowest {
             break;
         }
-        prefetch(index);
-        *candidate = index;
+        *candidate = note(index);
         count += 1;
     }
-    candidates.get(..count).unwrap_or_default()
-}
-
-#[inline(always)]
-fn prefetch_row<const N: usize>(indices: &[[u32; N]], tags: &[[u8; N]], hash: u32) {
-    let first = (hash >> TAG_BITS) as usize * N;
-    prefetch(indices.as_flattened(), first);
-    if N >= 32 {
-        prefetch(indices.as_flattened(), first + 16);
-    }
-    prefetch(tags.as_flattened(), first);
+    candidates.get(..count)
 }
 
 pub(super) struct Scratch<const N: usize> {
@@ -106,18 +107,28 @@ impl<const N: usize> Default for Scratch<N> {
 
 pub(super) struct Rows<'a, const N: usize> {
     bounds: Bounds,
-    indices: &'a mut [[u32; N]],
-    tags: &'a mut [[u8; N]],
+    indices: &'a mut [u32],
+    /// In place of the first one of a row is its head: where the most recent entry is. They are added backwards.
+    tags: &'a mut [u8],
     hasher: Hasher,
-    attached_indices: &'a [[u32; N]],
-    attached_tags: &'a [[u8; N]],
+    attached: Attached<'a>,
     attached_hasher: Hasher,
-    attached_delta: u32,
     attempts: usize,
     next_to_index: u32,
 }
 
 impl<'a, const N: usize> Rows<'a, N> {
+    /// A comparison in its place becomes a branch, which is hard to predict.
+    #[expect(clippy::indexing_slicing, reason = "evaluated at compile time")]
+    const NEXT_HEADS: &'static [u8; 256] = &{
+        let (mut next, mut head) = ([0; 256], 0);
+        while head < next.len() {
+            next[head] = if head % N > 1 { head % N - 1 } else { N - 1 } as u8;
+            head += 1;
+        }
+        next
+    };
+
     pub(super) fn new(state: &'a mut MatchState, attached: &Attached<'a>) -> Self {
         let (tuning, bounds) = (state.tuning, state.bounds());
         let hasher =
@@ -125,45 +136,50 @@ impl<'a, const N: usize> Rows<'a, N> {
         let tables = state.tables.split_mut();
         Self {
             bounds,
-            indices: tables.hash.as_chunks_mut().0,
-            tags: tables.tags.as_chunks_mut().0,
+            indices: tables.hash,
+            tags: tables.tags,
             hasher: hasher(tuning.hash_log),
-            attached_indices: attached.hash.as_chunks().0,
-            attached_tags: attached.tags.as_chunks().0,
+            attached: *attached,
             attached_hasher: hasher(attached.tuning.hash_log),
-            attached_delta: attached.delta,
             attempts: 1 << tuning.search_log,
             next_to_index: state.next_to_index,
         }
     }
 
     #[inline(always)]
-    fn row(&mut self, hash: u32) -> Option<(&mut [u32; N], &mut [u8; N])> {
-        let row = (hash >> TAG_BITS) as usize;
-        Some((self.indices.get_mut(row)?, self.tags.get_mut(row)?))
+    fn add(&mut self, hash: u32, index: u32) -> Option<()> {
+        let row = first_entry::<N>(hash)..first_entry::<N>(hash) + N;
+        let tags = likely(self.tags.get_mut(row.clone()))?.as_mut_array::<N>()?;
+        let indices = likely(self.indices.get_mut(row))?.as_mut_array::<N>()?;
+        let head = *Self::NEXT_HEADS.at(usize::from(*tags.at(0)));
+        let slot = usize::from(head) % N;
+        *tags.at_mut(0) = head;
+        *tags.at_mut(slot) = hash as u8;
+        *indices.at_mut(slot) = index;
+        Some(())
     }
 
     fn fill(&mut self, history: &History<'_>, end: u32) -> Option<()> {
         for position in history.position(self.next_to_index)..end {
             let hash = self.hasher.hash(u64_at(history.prefix, position)?) as u32;
-            add(self.row(hash)?, history.index(position), hash as u8);
+            self.add(hash, history.index(position))?;
         }
         Some(())
     }
 
     /// Of the `word` at `position`. Returns what was cached in its place.
     #[inline(always)]
-    fn cache_hash(&self, hashes: &mut [u32; CACHED], position: u32, word: u64) -> u32 {
+    fn cache_hash(&self, hashes: &mut [u32; CACHED], position: usize, word: u64) -> u32 {
         let hash = self.hasher.hash(word) as u32;
-        prefetch_row(self.indices, self.tags, hash);
-        core::mem::replace(hashes.at_mut(position as usize % CACHED), hash)
+        prefetch_row::<N>(self.indices, self.tags, hash);
+        core::mem::replace(hashes.at_mut(position % CACHED), hash)
     }
 
     #[inline(always)]
     fn fill_cache(&self, history: &History<'_>, hashes: &mut [u32; CACHED], from: u32) {
         for position in from..from + CACHED as u32 {
             if let Some(word) = u64_at(history.prefix, position) {
-                self.cache_hash(hashes, position, word);
+                self.cache_hash(hashes, position as usize, word);
             }
         }
     }
@@ -175,10 +191,12 @@ impl<'a, const N: usize> Rows<'a, N> {
         hashes: &mut [u32; CACHED],
         positions: Range<u32>,
     ) -> Option<()> {
-        for position in positions {
-            let ahead = u64_at(history.prefix, position + CACHED as u32)?;
-            let hash = self.cache_hash(hashes, position, ahead);
-            add(self.row(hash)?, history.index(position), hash as u8);
+        let (start, end) = (positions.start as usize, positions.end as usize);
+        let ahead = likely(history.prefix.get(CACHED..end + CACHED + WORD_LEN))?;
+        for position in start..end {
+            let word = ahead.get(position..position + WORD_LEN)?.as_array()?;
+            let hash = self.cache_hash(hashes, position, u64::from_le_bytes(*word));
+            self.add(hash, history.index(position as u32))?;
         }
         Some(())
     }
@@ -209,6 +227,15 @@ impl<const N: usize> Finder for Rows<'_, N> {
     type Scratch = Scratch<N>;
 
     #[inline(always)]
+    fn prepare(&mut self) -> Option<()> {
+        // The compiler sees that both have the same length, and compares the start of a row with `last`.
+        let last = self.tags.len().checked_sub(N)? as u32 as usize;
+        self.tags = core::mem::take(&mut self.tags).get_mut(..last + N)?;
+        self.indices = core::mem::take(&mut self.indices).get_mut(..last + N)?;
+        Some(())
+    }
+
+    #[inline(always)]
     fn find<const REACH: Reach>(
         &mut self,
         history: &History<'_>,
@@ -217,58 +244,63 @@ impl<const N: usize> Finder for Rows<'_, N> {
         is_skipping: bool,
     ) -> Option<Match> {
         let current = history.index(at);
-        let word = u64_at(history.prefix, at)?;
-        let attached_hash = self.attached_hasher.hash(word) as u32;
+        let word = likely(u64_at(history.prefix, at))?;
+        let (attached, attached_hash) = (self.attached, self.attached_hasher.hash(word) as u32);
         if REACH == Reach::Attached {
-            prefetch_row(self.attached_indices, self.attached_tags, attached_hash);
+            prefetch_row::<N>(attached.hash, attached.tags, attached_hash);
         }
 
         let hash = if is_skipping {
             self.hasher.hash(word) as u32
         } else {
             self.insert_up_to(history, hashes, at)?;
-            self.cache_hash(hashes, at, u64_at(history.prefix, at + CACHED as u32)?)
+            let ahead = likely(u64_at(history.prefix, at + CACHED as u32))?;
+            self.cache_hash(hashes, at as usize, ahead)
         };
-        let (lowest, attempts) = (self.bounds.lowest(current), self.attempts.min(N));
-        let (indices, tags) = self.row(hash)?;
-        let found = collect(
-            (indices, tags),
-            hash as u8,
-            lowest,
+        let attempts = self.attempts.min(N);
+        let found = collect::<N>(
+            self.indices,
+            self.tags,
+            hash,
+            self.bounds.lowest(current),
             candidates.get_mut(..attempts)?,
-            |index| match REACH {
-                Reach::Older => {
-                    let (run, at) = history.locate(index);
-                    prefetch(run, at as usize);
-                }
-                _ => prefetch(history.prefix, history.position(index) as usize),
+            |index| {
+                let (run, at) = match REACH {
+                    Reach::Older => history.locate(index),
+                    _ => (history.prefix, history.position(index)),
+                };
+                prefetch(run, at as usize);
+                if REACH == Reach::Older { index } else { at }
             },
-        );
-        add((indices, tags), current, hash as u8);
+        )?;
+        self.add(hash, current)?;
         self.next_to_index = current + 1;
 
         let mut longest = Longest::new(at, word);
-        for &index in found {
-            if longest.consider::<REACH>(history, index).is_none() {
+        for &found in found {
+            let goes_on = match REACH {
+                Reach::Older => longest.consider::<REACH>(history, found),
+                _ => longest.consider_position(history, found),
+            };
+            if goes_on.is_none() {
                 break;
             }
         }
 
         if REACH == Reach::Attached {
-            let row = (attached_hash >> TAG_BITS) as usize;
             let attempts = attempts - found.len();
-            let found = collect(
-                (
-                    self.attached_indices.get(row)?,
-                    self.attached_tags.get(row)?,
-                ),
-                attached_hash as u8,
+            let found = collect::<N>(
+                attached.hash,
+                attached.tags,
+                attached_hash,
                 FIRST_INDEX,
                 candidates.get_mut(..attempts)?,
-                |index| prefetch(history.older, Attached::position(index) as usize),
-            );
+                |index| {
+                    prefetch(history.older, Attached::position(index) as usize);
+                    index.wrapping_add(attached.delta)
+                },
+            )?;
             for &index in found {
-                let index = index.wrapping_add(self.attached_delta);
                 if longest.consider::<REACH>(history, index).is_none() {
                     break;
                 }

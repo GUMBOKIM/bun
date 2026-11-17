@@ -2,7 +2,9 @@
 
 use core::hint::select_unpredictable;
 
-use crate::bytes::{AtLeast, chunk_at, common_suffix, compare, first_difference, u32_at, u64_at};
+use crate::bytes::{
+    AtLeast, chunk_at, common_suffix, compare, first_difference, likely, u32_at, u64_at,
+};
 
 /// Lower ones have a meaning of their own in tables.
 pub(crate) const FIRST_INDEX: u32 = 2;
@@ -222,20 +224,19 @@ impl<'a> History<'a> {
     /// How many bytes from `position` on equal those from `at` of `run` on, and whether the next one is lower there.
     #[inline(always)]
     fn compare_in(&self, position: u32, run: &[u8], at: u32) -> (u32, bool) {
-        let distance = at.wrapping_sub(position);
-        let mut end = position;
-        while let Some(a) = u64_at(self.prefix, end)
-            && let Some(b) = u64_at(run, end.wrapping_add(distance))
+        let mut len = 0;
+        while let Some(a) = likely(u64_at(self.prefix, position.wrapping_add(len)))
+            && let Some(b) = likely(u64_at(run, at.wrapping_add(len)))
         {
             if a != b {
-                let len = end + (a ^ b).trailing_zeros() / 8 - position;
+                let len = len + (a ^ b).trailing_zeros() / 8;
                 return (len, b.swap_bytes() < a.swap_bytes());
             }
-            end += WORD_LEN as u32;
+            len += WORD_LEN as u32;
         }
-        let at = end.wrapping_add(distance);
-        let (more, is_below) = Self::compare_bytes(self.prefix, end, run, at);
-        (end - position + more, is_below)
+        let (position, at) = (position.wrapping_add(len), at.wrapping_add(len));
+        let (more, is_below) = Self::compare_bytes(self.prefix, position, run, at);
+        (len + more, is_below)
     }
 
     #[inline(always)]
