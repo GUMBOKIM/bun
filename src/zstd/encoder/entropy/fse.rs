@@ -492,15 +492,12 @@ impl<const ALL_STATES: usize, const ALL_SYMBOLS: usize> Tables<ALL_STATES, ALL_S
         *state = self.next_state(*state >> bits, *transform);
     }
 
-    /// With two states that take turns. `None` if there is nothing to gain, or no room.
+    /// With two states that take turns. `None` if there is no room.
     #[inline(always)]
     pub(super) fn compress(&self, shape: Shape, symbols: &[u8], out: &mut [u8]) -> Option<usize> {
         let &[ref rest @ .., before_last, last] = symbols else {
             return None;
         };
-        if rest.is_empty() {
-            return None;
-        }
         let mut writer = BitWriter::new(out)?;
         let (mut due, mut other) = (self.first_state(last), self.first_state(before_last));
         let (pairs, single) = rest.as_chunks();

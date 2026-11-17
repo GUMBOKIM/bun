@@ -477,7 +477,6 @@ impl Finder<'_> {
         if let Some((offset, len)) = long
             && len >= self.min_match
             && matches.last().is_none_or(|last| len > last.len)
-            && matches.len() < HORIZON as usize
         {
             push(matches, OffsetValue::new(offset), len);
         }

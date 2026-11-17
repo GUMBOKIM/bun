@@ -257,6 +257,20 @@ impl<const N: usize> Finder for Rows<'_, N> {
     }
 
     #[inline(always)]
+    fn catch_up(
+        &mut self,
+        history: &History<'_>,
+        scratch: &mut Scratch<N>,
+        at: u32,
+        is_skipping: bool,
+    ) -> Option<()> {
+        if is_skipping {
+            return Some(());
+        }
+        self.insert_up_to(history, &mut scratch.hashes, at)
+    }
+
+    #[inline(always)]
     fn find<const REACH: Reach>(
         &mut self,
         history: &History<'_>,
@@ -274,7 +288,6 @@ impl<const N: usize> Finder for Rows<'_, N> {
         let hash = if is_skipping {
             self.hasher.hash(word) as u32
         } else {
-            self.insert_up_to(history, hashes, at)?;
             let ahead = likely(u64_at(history.prefix, at + CACHED as u32))?;
             self.cache_hash(hashes, at as usize, ahead)
         };
@@ -337,7 +350,7 @@ impl<const N: usize> Finder for Rows<'_, N> {
         self.fill_cache(history, &mut scratch.hashes, from);
     }
 
-    fn next_to_index(&self) -> u32 {
+    fn finish(self, _: &History<'_>) -> u32 {
         self.next_to_index
     }
 }

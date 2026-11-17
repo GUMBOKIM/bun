@@ -119,7 +119,16 @@ pub(super) trait Finder {
         Some(())
     }
 
-    /// Also indexes the positions up to `at`, unless `is_skipping`. `None` ends the search.
+    /// Indexes the positions up to `at`, unless `is_skipping`.
+    fn catch_up(
+        &mut self,
+        history: &History<'_>,
+        scratch: &mut Self::Scratch,
+        at: u32,
+        is_skipping: bool,
+    ) -> Option<()>;
+
+    /// Also indexes `at`. `None` ends the search.
     fn find<const REACH: Reach>(
         &mut self,
         history: &History<'_>,
@@ -131,7 +140,8 @@ pub(super) trait Finder {
     /// At the start, and after skipping.
     fn resume(&mut self, _history: &History<'_>, _scratch: &mut Self::Scratch) {}
 
-    fn next_to_index(&self) -> u32;
+    /// Returns from which index on the tables are not up to date.
+    fn finish(self, history: &History<'_>) -> u32;
 }
 
 pub(super) fn search<const REACH: Reach>(
@@ -188,9 +198,9 @@ impl Parser<'_> {
         let run = identity(
             #[inline(always)]
             move || {
-                let mut finder = finder;
+                let (mut finder, history) = (finder, self.history);
                 self.parse::<REACH, _>(&mut finder, progress);
-                finder.next_to_index()
+                finder.finish(&history)
             },
         );
         if F::GAINS_FROM_BMI2 {
@@ -249,39 +259,34 @@ impl Parser<'_> {
             let mut end = start + best.len;
 
             if self.depth > 0 || repeat_len.is_none() {
-                // How many positions had nothing better, once there is a match.
-                let mut misses = None;
-                loop {
-                    let found = finder.find::<REACH>(history, &mut scratch, at, is_skipping)?;
-                    let is_better = match misses {
-                        None => found.len > best.len,
-                        Some(misses) => {
-                            found.len >= MIN_LEN
-                                && found.gain(4) > best.gain(4) + 4 + 3 * misses as i32
-                        }
-                    };
-                    if is_better {
-                        (best, start) = (found, at);
-                    }
-                    if best.len < MIN_LEN {
-                        let skipped = (at - progress.anchor) >> SKIP_LOG;
-                        at += skipped + 1;
-                        is_skipping =
-                            skipped + u32::from(REACH != Reach::Older) > SKIPS_INDEXING_FROM;
-                        continue 'block;
-                    }
+                finder.catch_up(history, &mut scratch, at, is_skipping)?;
+                let found = finder.find::<REACH>(history, &mut scratch, at, is_skipping)?;
+                if found.len > best.len {
+                    (best, start) = (found, at);
+                }
+                if best.len < MIN_LEN {
+                    let skipped = (at - progress.anchor) >> SKIP_LOG;
+                    at += skipped + 1;
+                    is_skipping = skipped + u32::from(REACH != Reach::Older) > SKIPS_INDEXING_FROM;
+                    continue 'block;
+                }
 
-                    let missed = misses.filter(|_| !is_better).map_or(0, |misses| misses + 1);
-                    if missed >= self.depth || at >= limit {
-                        break;
-                    }
-                    misses = Some(missed);
+                // How many positions had nothing better.
+                let mut misses = 0;
+                while misses < self.depth && at < limit {
                     at += 1;
                     if let Some(len) = self.repeat_len::<REACH>(at, progress.recent)
-                        && (len * (3 + missed)) as i32 > best.gain(3 + missed) + 1
+                        && (len * (3 + misses)) as i32 > best.gain(3 + misses) + 1
                     {
                         let offset = OffsetValue::FIRST_REPEAT;
                         (best, start) = (Match { len, offset }, at);
+                    }
+                    let found = finder.find::<REACH>(history, &mut scratch, at, is_skipping)?;
+                    if found.len >= MIN_LEN && found.gain(4) > best.gain(4) + 4 + 3 * misses as i32
+                    {
+                        (best, start, misses) = (found, at, 0);
+                    } else {
+                        misses += 1;
                     }
                 }
 

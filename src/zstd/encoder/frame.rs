@@ -129,7 +129,6 @@ impl FrameWriter {
             plan.tuning.window_log = window_log;
             plan.uses_rows = state.uses_rows;
         }
-        plan.header.has_content_size &= input_len.is_some();
         let tuning = plan.tuning;
 
         (self.plan, self.input_len) = (plan, input_len);
@@ -143,7 +142,7 @@ impl FrameWriter {
             Start::Frame(_) => 0,
             Start::Part(earlier) => earlier.len(),
         };
-        let is_only_searched = matches!(start, Start::Frame(None)) && plan.long_distance.is_none();
+        let is_only_searched = matches!(start, Start::Frame(None)) && !plan.matches_long_distance;
         (self.state).reset(
             tuning,
             plan.uses_rows,
@@ -333,7 +332,6 @@ impl FrameWriter {
         let bytes = bytes.ok_or(Error::Internal)?;
         self.state.prepare_for(len);
         if len < WORTH_TRYING_FROM {
-            self.long_matches.skip(len, &self.state);
             if let Some(finder) = &mut self.long_finder {
                 finder.skip(len);
             }

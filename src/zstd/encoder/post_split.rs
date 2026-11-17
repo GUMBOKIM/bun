@@ -57,7 +57,7 @@ impl Splitter<'_> {
 
     /// `len` is the estimate for `whole`.
     fn split(&mut self, whole: &Part, len: usize) -> Result<()> {
-        if whole.sequences.len() < SEQUENCES_MIN || self.count == SPLITS_MAX {
+        if whole.sequences.len() < SEQUENCES_MIN {
             return Ok(());
         }
         let middle = whole.sequences.start.midpoint(whole.sequences.end);

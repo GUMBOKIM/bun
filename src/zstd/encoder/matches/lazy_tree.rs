@@ -135,6 +135,14 @@ impl Finder for LazyTree<'_> {
     type Scratch = ();
 
     #[inline(always)]
+    fn catch_up(&mut self, history: &History<'_>, (): &mut (), at: u32, _: bool) -> Option<()> {
+        if self.tree.next_to_index < history.index(at) {
+            self.link_up_to(*history, at)?;
+        }
+        Some(())
+    }
+
+    #[inline(always)]
     fn find<const REACH: Reach>(
         &mut self,
         history: &History<'_>,
@@ -149,9 +157,6 @@ impl Finder for LazyTree<'_> {
         };
         if current < self.tree.next_to_index {
             return Some(best);
-        }
-        if self.tree.next_to_index < current {
-            self.link_up_to(*history, at)?;
         }
 
         let word = likely(u64_at(history.prefix, at))?;
@@ -211,7 +216,7 @@ impl Finder for LazyTree<'_> {
         Some(best)
     }
 
-    fn next_to_index(&self) -> u32 {
+    fn finish(self, _: &History<'_>) -> u32 {
         self.tree.next_to_index
     }
 }

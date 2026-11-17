@@ -376,6 +376,7 @@ impl Request {
             tuning,
             uses_rows: tuning.prefers_rows(),
             splits_blocks: is_optimal && tuning.window_log >= 17,
+            matches_long_distance,
             long_distance: matches_long_distance.then_some(self.long_distance),
             target_block_len: self.target_block_len,
             header: self.header,
@@ -389,7 +390,8 @@ pub(crate) struct Plan {
     pub(crate) tuning: Tuning,
     pub(crate) uses_rows: bool,
     pub(crate) splits_blocks: bool,
-    /// Not yet [`completed`](LongDistance::completed): a dictionary has a say in the tuning.
+    pub(crate) matches_long_distance: bool,
+    /// For who finds those matches. Not yet [`completed`](LongDistance::completed): a dictionary has a say in the tuning.
     pub(crate) long_distance: Option<LongDistance>,
     /// 0 for none.
     pub(crate) target_block_len: usize,

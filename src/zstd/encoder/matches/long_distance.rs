@@ -78,50 +78,27 @@ impl Candidates {
         self.position.index >= self.list.len()
     }
 
-    /// Cuts `len` bytes off. What remains of a match has to have `min_match` bytes.
-    fn cut(&mut self, mut len: u32, min_match: u32) {
-        let index = &mut self.position.index;
-        while len > 0
-            && let Some([candidate, rest @ ..]) = self.list.get_mut(*index..)
-        {
-            if len <= candidate.literal_len {
-                candidate.literal_len -= len;
-                return;
-            }
-            len -= core::mem::take(&mut candidate.literal_len);
-            if len < candidate.match_len {
-                candidate.match_len -= len;
-                if candidate.match_len < min_match {
-                    if let Some(next) = rest.first_mut() {
-                        next.literal_len += candidate.match_len;
-                    }
-                    *index += 1;
-                }
-                return;
-            }
-            len -= candidate.match_len;
-            *index += 1;
-        }
-    }
-
-    pub(crate) fn skip(&mut self, len: usize, state: &MatchState) {
-        if state.tuning.strategy >= Strategy::Optimal {
-            self.position.advance(&self.list, len as u32);
-        } else {
-            self.cut(len as u32, state.tuning.min_match);
-        }
-    }
-
-    /// The next one, as far as it is within `left` bytes.
+    /// The next one, as far as it is within `left` bytes. The parts of a match have to have `min_match` bytes.
     fn take(&mut self, left: u32, min_match: u32) -> Option<Candidate> {
-        let mut candidate = *self.list.get(self.position.index)?;
-        if left >= candidate.len() {
+        let (next, rest) = self
+            .list
+            .get_mut(self.position.index..)?
+            .split_first_mut()?;
+        let whole = *next;
+        if left >= whole.len() {
             self.position.index += 1;
-            return Some(candidate);
+            return Some(whole);
         }
-        self.cut(left, min_match);
-        candidate.match_len = left.checked_sub(candidate.literal_len)?;
-        (candidate.match_len >= min_match).then_some(candidate)
+        next.literal_len = whole.literal_len.saturating_sub(left);
+        let match_len = left.checked_sub(whole.literal_len).filter(|&len| len > 0)?;
+        next.match_len -= match_len;
+        if next.match_len < min_match {
+            if let Some(after) = rest.first_mut() {
+                after.literal_len += next.match_len;
+            }
+            self.position.index += 1;
+        }
+        (match_len >= min_match).then_some(Candidate { match_len, ..whole })
     }
 
     /// Like [`MatchState::search`], which gets to search between the candidates.
@@ -141,7 +118,7 @@ impl Candidates {
                 ..*search
             };
             let anchor = state.search(&search, sequences, repeats);
-            self.skip(history.block().len(), state);
+            (self.position).advance(&self.list, history.block().len() as u32);
             return anchor;
         }
 

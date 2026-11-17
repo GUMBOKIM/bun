@@ -12,7 +12,7 @@ pub(super) fn fill(state: &mut MatchState, history: &History<'_>, end: u32) {
     let none = Attached::empty(state.tuning);
     let mut chains = Chains::new(state, &none);
     chains.hasher = hasher;
-    chains.insert_up_to(history, end, false);
+    chains.insert_up_to(history, end);
 }
 
 pub(super) struct Chains<'a> {
@@ -26,6 +26,7 @@ pub(super) struct Chains<'a> {
     attached_hasher: Hasher,
     attempts: u32,
     next_to_index: u32,
+    has_searched: bool,
 }
 
 impl<'a> Chains<'a> {
@@ -43,15 +44,14 @@ impl<'a> Chains<'a> {
             attached_hasher: Hasher::new(min_match, attached.tuning.hash_log),
             attempts: 1 << tuning.search_log,
             next_to_index: state.next_to_index,
+            has_searched: false,
         }
     }
 
     #[inline(always)]
-    fn insert_up_to(&mut self, history: &History<'_>, end: u32, is_skipping: bool) -> Option<()> {
-        let start = history.position(self.next_to_index);
-        let inserted_end = if is_skipping { end.min(start + 1) } else { end } as usize;
-        let bytes = likely(history.prefix.get(..inserted_end + WORD_LEN))?;
-        for position in start as usize..inserted_end {
+    fn insert_up_to(&mut self, history: &History<'_>, end: u32) -> Option<()> {
+        let bytes = likely(history.prefix.get(..end as usize + WORD_LEN))?;
+        for position in history.position(self.next_to_index) as usize..end as usize {
             let word = bytes.get(position..position + WORD_LEN)?.as_array()?;
             let hash = self.hasher.hash(u64::from_le_bytes(*word));
             let (head, index) = (
@@ -60,7 +60,6 @@ impl<'a> Chains<'a> {
             );
             *self.chain.get_mut((index & self.mask) as usize)? = core::mem::replace(head, index);
         }
-        self.next_to_index = history.index(end);
         Some(())
     }
 }
@@ -76,14 +75,27 @@ impl Finder for Chains<'_> {
     }
 
     #[inline(always)]
-    fn find<const REACH: Reach>(
+    fn catch_up(
         &mut self,
         history: &History<'_>,
         (): &mut (),
         at: u32,
         is_skipping: bool,
+    ) -> Option<()> {
+        if is_skipping {
+            return Some(());
+        }
+        self.insert_up_to(history, at)
+    }
+
+    #[inline(always)]
+    fn find<const REACH: Reach>(
+        &mut self,
+        history: &History<'_>,
+        (): &mut (),
+        at: u32,
+        _: bool,
     ) -> Option<Match> {
-        self.insert_up_to(history, at, is_skipping)?;
         let word = likely(u64_at(history.prefix, at))?;
         let current = history.index(at);
         let lowest = self.bounds.lowest(current);
@@ -91,7 +103,10 @@ impl Finder for Chains<'_> {
         let mut attempts = self.attempts;
         let mut longest = Longest::new(at, word);
 
-        let mut index = *likely(self.heads.get(self.hasher.hash(word)))?;
+        let head = likely(self.heads.get_mut(self.hasher.hash(word)))?;
+        let mut index = core::mem::replace(head, current);
+        *self.chain.get_mut((current & self.mask) as usize)? = index;
+        (self.next_to_index, self.has_searched) = (current + 1, true);
         while index >= lowest && attempts > 0 {
             if longest.consider::<REACH>(history, index).is_none() || index <= overwritten {
                 break;
@@ -120,7 +135,18 @@ impl Finder for Chains<'_> {
         Some(longest.best)
     }
 
-    fn next_to_index(&self) -> u32 {
-        self.next_to_index
+    /// Whether the last position that was searched gets indexed is up to the next block.
+    fn finish(self, history: &History<'_>) -> u32 {
+        if !self.has_searched {
+            return self.next_to_index;
+        }
+        let last = self.next_to_index - 1;
+        if let Some(word) = u64_at(history.prefix, history.position(last))
+            && let Some(head) = self.heads.get_mut(self.hasher.hash(word))
+            && let Some(&before) = self.chain.get((last & self.mask) as usize)
+        {
+            *head = before;
+        }
+        last
     }
 }
