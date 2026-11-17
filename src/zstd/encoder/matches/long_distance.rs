@@ -1,5 +1,7 @@
 //! Finds long matches at any distance, ahead of the regular search.
 
+use core::hint::{black_box, cold_path};
+
 use bun_zstd_decoder::array::At;
 use bun_zstd_decoder::{Result, XxHash64};
 
@@ -227,6 +229,7 @@ struct Split {
 }
 
 /// Picks the positions to index by their content.
+#[derive(Clone, Copy)]
 struct GearHash {
     state: u64,
     mask: u64,
@@ -245,23 +248,47 @@ impl GearHash {
         }
     }
 
-    /// Returns how many bytes it took, and after how many of them it split, until `ends` was full.
-    fn feed(&mut self, bytes: &[u8], ends: &mut [u32; BATCH_LEN]) -> (u32, usize) {
-        let (mut state, mut count) = (self.state, 0);
-        let mut fed = bytes.len();
-        for (index, &byte) in bytes.iter().enumerate() {
-            state = (state << 1).wrapping_add(*GEAR_TABLE.at(usize::from(byte)));
-            if state & self.mask == 0 {
-                core::hint::cold_path();
-                *ends.at_mut(count) = index as u32 + 1;
-                count += 1;
-                if count == BATCH_LEN {
-                    fed = index + 1;
-                    break;
+    #[inline(always)]
+    fn splits_after(&mut self, value: u64) -> bool {
+        self.state = (self.state << 1).wrapping_add(value);
+        self.state & self.mask == 0
+    }
+
+    /// After how many of `bytes` it splits first.
+    #[inline(always)]
+    fn next_split(&mut self, bytes: &[u8]) -> Option<usize> {
+        let table = black_box(&GEAR_TABLE);
+        let value = |byte: u8| *table.at(usize::from(byte));
+        let (groups, rest) = bytes.as_chunks::<4>();
+        for (index, group) in groups.iter().enumerate() {
+            let values = group.each_ref().map(|&byte| value(byte));
+            // With the values in registers, shifting and adding is one instruction.
+            black_box(());
+            for (more, value) in values.into_iter().enumerate() {
+                if self.splits_after(value) {
+                    cold_path();
+                    return Some(index * group.len() + more + 1);
                 }
             }
         }
-        self.state = state;
+        let more = rest.iter().position(|&it| self.splits_after(value(it)))?;
+        Some(bytes.len() - rest.len() + more + 1)
+    }
+
+    /// Returns how many bytes it took, and after how many of them it split, until `ends` was full.
+    #[inline(never)]
+    fn feed(&mut self, bytes: &[u8], ends: &mut [u32; BATCH_LEN]) -> (u32, usize) {
+        let (mut hash, mut fed, mut count) = (*self, 0, 0);
+        for end in ends {
+            let Some(more) = hash.next_split(bytes.get(fed..).unwrap_or_default()) else {
+                fed = bytes.len();
+                break;
+            };
+            fed += more;
+            *end = fed as u32;
+            count += 1;
+        }
+        *self = hash;
         (fed as u32, count)
     }
 }
@@ -366,7 +393,11 @@ impl Finder {
         let mut best = None;
         let mut best_len = 0;
         for &[index, checksum] in self.entries.get(bucket)? {
-            if checksum != split.checksum || index <= lowest {
+            if checksum != split.checksum {
+                continue;
+            }
+            cold_path();
+            if index <= lowest {
                 continue;
             }
             let after = history.match_len_at_index(split.start, index, 0);

@@ -1843,6 +1843,7 @@ dependencies = [
  "bun_sema_parser",
  "bun_sys",
  "bun_threading",
+ "bun_zstd",
  "libc",
 ]
 

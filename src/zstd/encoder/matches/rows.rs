@@ -2,6 +2,7 @@
 
 use core::ops::Range;
 
+use bun_highway::with_bmi2;
 use bun_zstd_decoder::array::At;
 
 use super::hash::Hasher;
@@ -17,9 +18,9 @@ const CACHED: usize = 8;
 pub(super) fn fill(state: &mut MatchState, history: &History<'_>, end: u32) {
     let none = Attached::empty(state.tuning);
     match state.tuning.row_log() {
-        4 => Rows::<16>::new(state, &none).fill(history, end),
-        5 => Rows::<32>::new(state, &none).fill(history, end),
-        _ => Rows::<64>::new(state, &none).fill(history, end),
+        4 => Rows::<16>::new(state, &none).fill(*history, end),
+        5 => Rows::<32>::new(state, &none).fill(*history, end),
+        _ => Rows::<64>::new(state, &none).fill(*history, end),
     };
 }
 
@@ -157,12 +158,24 @@ impl<'a, const N: usize> Rows<'a, N> {
         Some(())
     }
 
-    fn fill(&mut self, history: &History<'_>, end: u32) -> Option<()> {
-        for position in history.position(self.next_to_index)..end {
-            let hash = self.hasher.hash(u64_at(history.prefix, position)?) as u32;
-            self.add(hash, history.index(position))?;
-        }
-        Some(())
+    fn fill(mut self, history: History<'_>, end: u32) -> Option<()> {
+        with_bmi2(
+            #[inline(always)]
+            move || {
+                self.prepare()?;
+                let (start, mut hashes) = (history.position(self.next_to_index), [0; CACHED]);
+                let last_cached = start.max(end.saturating_sub(CACHED as u32));
+                self.fill_cache(&history, &mut hashes, start);
+                if start < last_cached {
+                    self.insert(&history, &mut hashes, start..last_cached)?;
+                }
+                for position in last_cached..end {
+                    let hash = *hashes.at(position as usize % CACHED);
+                    self.add(hash, history.index(position))?;
+                }
+                Some(())
+            },
+        )
     }
 
     /// Of the `word` at `position`. Returns what was cached in its place.
