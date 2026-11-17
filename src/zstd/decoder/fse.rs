@@ -1,6 +1,6 @@
 //! Finite State Entropy: table descriptions, and the decoding tables that follow from them.
 
-use crate::array::{wrapped, wrapped_mut};
+use crate::array::in_range;
 use crate::bits::load_from;
 use crate::error::{Error, Result};
 use crate::format::{FSE_TABLE_LOG_MIN, fse_table_step};
@@ -89,8 +89,8 @@ pub(crate) struct State {
     pub(crate) baseline: u16,
 }
 
-/// The rows of a decoding table, from the first. `PADDED` is 8 more than `STATES_MAX`.
-pub(crate) struct States<const STATES_MAX: usize, const PADDED: usize, const SYMBOLS_MAX: usize> {
+/// The rows of a decoding table, from the first. `PADDED` is 8 more than there can be.
+pub(crate) struct States<const PADDED: usize, const SYMBOLS_MAX: usize> {
     symbols: [u8; PADDED],
     /// Where in `symbols` that of the next row is, modulo the size of the table.
     index: usize,
@@ -100,9 +100,8 @@ pub(crate) struct States<const STATES_MAX: usize, const PADDED: usize, const SYM
     ranks: [u16; SYMBOLS_MAX],
 }
 
-impl<const STATES_MAX: usize, const PADDED: usize, const SYMBOLS_MAX: usize>
-    States<STATES_MAX, PADDED, SYMBOLS_MAX>
-{
+impl<const PADDED: usize, const SYMBOLS_MAX: usize> States<PADDED, SYMBOLS_MAX> {
+    const MAX: usize = PADDED - 8;
     pub(crate) const EMPTY: Self = Self {
         symbols: [0; _],
         index: 0,
@@ -111,23 +110,22 @@ impl<const STATES_MAX: usize, const PADDED: usize, const SYMBOLS_MAX: usize>
         ranks: [0; _],
     };
 
-    /// To be called on [`Self::EMPTY`]. `counts` add up to `1 << table_log`, which is at most `STATES_MAX`.
+    /// To be called on [`Self::EMPTY`]. `counts` add up to `1 << table_log`, which is at most [`Self::MAX`].
     #[inline(always)]
-    #[expect(clippy::indexing_slicing, reason = "below the length, or STATES_MAX")]
+    #[expect(clippy::indexing_slicing, reason = "below the lengths")]
     pub(crate) const fn spread(&mut self, counts: &[i16], table_log: u32) {
-        const { assert!(PADDED == STATES_MAX + 8) };
         let size = 1 << table_log;
         let step = fse_table_step(size);
         let Self { symbols, ranks, .. } = self;
         let (mut symbol, mut end, mut rare) = (0, 0, 0);
         while symbol < counts.len() {
             let count = counts[symbol];
-            *wrapped_mut(ranks, symbol) = count.unsigned_abs();
+            ranks[in_range::<SYMBOLS_MAX>(symbol)] = count.unsigned_abs();
             rare += (count < 0) as usize;
             let mut start = end;
             end += if count < 0 { 0 } else { count as usize };
             loop {
-                if let Some(eight) = symbols.split_at_mut(start % STATES_MAX).1.first_chunk_mut() {
+                if let Some(eight) = symbols.split_at_mut(start % Self::MAX).1.first_chunk_mut() {
                     *eight = [symbol as u8; 8];
                 }
                 start += 8;
@@ -146,7 +144,7 @@ impl<const STATES_MAX: usize, const PADDED: usize, const SYMBOLS_MAX: usize>
             let sorted = *symbols;
             let (mut row, mut index) = (0, 0);
             loop {
-                symbols[row % STATES_MAX] = sorted[index % STATES_MAX];
+                symbols[row % Self::MAX] = sorted[index % Self::MAX];
                 index += (row < end) as usize;
                 row = (row + step) & (size - 1);
                 if row == 0 {
@@ -157,7 +155,7 @@ impl<const STATES_MAX: usize, const PADDED: usize, const SYMBOLS_MAX: usize>
             while symbol < counts.len() {
                 if counts[symbol] < 0 {
                     row -= 1;
-                    symbols[row % STATES_MAX] = symbol as u8;
+                    symbols[row % Self::MAX] = symbol as u8;
                 }
                 symbol += 1;
             }
@@ -166,13 +164,14 @@ impl<const STATES_MAX: usize, const PADDED: usize, const SYMBOLS_MAX: usize>
     }
 
     #[inline(always)]
-    #[expect(clippy::indexing_slicing, reason = "below STATES_MAX")]
+    #[expect(clippy::indexing_slicing, reason = "below the lengths")]
     pub(crate) const fn next_state(&mut self) -> State {
         let size = 1 << self.table_log;
-        let symbol = self.symbols[(self.index & (size - 1)) % STATES_MAX];
+        let symbol = self.symbols[(self.index & (size - 1)) % Self::MAX];
         self.index = self.index.wrapping_add(self.stride);
-        let rank = *wrapped(&self.ranks, symbol as usize) as u32;
-        *wrapped_mut(&mut self.ranks, symbol as usize) = rank as u16 + 1;
+        let next_rank = &mut self.ranks[in_range::<SYMBOLS_MAX>(symbol as usize)];
+        let rank = *next_rank as u32;
+        *next_rank = rank as u16 + 1;
         let bits = (rank.leading_zeros() + self.table_log).wrapping_sub(31);
         State {
             symbol,

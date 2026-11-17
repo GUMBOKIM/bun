@@ -1,7 +1,7 @@
 //! Decompression of input that comes in pieces, into output that is taken in pieces.
 
 use crate::block::BlockDecoder;
-use crate::decompress::{check_content_size, check_dictionary, decompress_frame};
+use crate::decompress::{check_dictionary, decompress_frame};
 use crate::destination::{Destination, OVERSHOOT};
 use crate::dictionary::Dictionary;
 use crate::error::{Error, Result};
@@ -9,7 +9,7 @@ use crate::format::{
     BLOCK_HEADER_LEN, BlockType, CHECKSUM_LEN, FRAME_HEADER_LEN_MAX, WINDOW_LOG_LIMIT_DEFAULT,
     WINDOW_LOG_MAX, WINDOW_LOG_MIN,
 };
-use crate::frame::{BlockHeader, FrameHeader, FrameLen, Header, frame_len};
+use crate::frame::{BlockHeader, FrameHeader, FrameLen, Header, measure_frame};
 use crate::output::Output;
 use crate::xxhash::XxHash64;
 
@@ -139,13 +139,6 @@ impl Decoder {
         Ok(())
     }
 
-    /// Forgets the frame in progress, the dictionary, the parameters and the error.
-    pub fn reset(&mut self) {
-        self.reset_session();
-        self.dictionary = None;
-        self.window_size_max = WINDOW_SIZE_MAX_DEFAULT;
-    }
-
     /// Forgets the frame in progress and the error.
     pub fn reset_session(&mut self) {
         self.stage = Stage::Idle;
@@ -154,7 +147,7 @@ impl Decoder {
     }
 
     /// Goes as far as `input` and the room in `out` allow, up to the end of a frame. Returns how much of `input` it
-    /// consumed. An error takes back what the step wrote, and stays until [`reset`](Self::reset).
+    /// consumed. An error takes back what the step wrote, and stays until [`reset_session`](Self::reset_session).
     pub fn step(&mut self, input: &[u8], out: &mut Output<'_>) -> (usize, Result<Status>) {
         let written = out.written();
         match self.error.map_or_else(|| self.try_step(input, out), Err) {
@@ -167,6 +160,36 @@ impl Decoder {
         }
     }
 
+    /// [`step`](Self::step) to the end of `out`, which grows by up to `max` bytes.
+    pub fn step_growing(
+        &mut self,
+        input: &[u8],
+        out: &mut Vec<u8>,
+        max: usize,
+    ) -> (usize, Result<Status>) {
+        self.step(input, &mut Output::growing(out, max))
+    }
+
+    /// The length of the frame that `input` starts with, if all of it is there and can go straight to `out`.
+    fn len_in_one_pass(
+        &self,
+        header: &FrameHeader,
+        input: &[u8],
+        out: &Output<'_>,
+    ) -> Option<usize> {
+        let size = header.content_size.unwrap_or(u64::MAX);
+        let is_small = size.min(header.window_size) <= self.window_size_max;
+        let may_fit = header.content_size.is_none() || size <= out.room() as u64;
+        if size > out.reserved_room() as u64 && !(out.grows() && is_small && may_fit) {
+            return None;
+        }
+        let Ok((FrameLen::Complete(len), blocks)) = measure_frame(input) else {
+            return None;
+        };
+        let most = (blocks as u64).saturating_mul(header.block_len_max() as u64);
+        (header.content_size.unwrap_or(most) <= out.room() as u64).then_some(len)
+    }
+
     fn try_step(&mut self, input: &[u8], out: &mut Output<'_>) -> Result<(usize, Status)> {
         let written = out.written();
         let mut rest = input;
@@ -175,16 +198,18 @@ impl Decoder {
             let Some(header) = self.gather_header(&mut rest)? else {
                 return Ok((input.len(), Status::Pending));
             };
-            if let Header::Frame(FrameHeader {
-                content_size: Some(size),
-                ..
-            }) = header
+            if let Header::Frame(header) = &header
                 && had_nothing
-                && size <= out.room() as u64
-                && let Ok(FrameLen::Complete(len)) = frame_len(input)
+                && let Some(len) = self.len_in_one_pass(header, input, out)
             {
                 let frame = input.get(..len).ok_or(Error::Internal)?;
-                decompress_frame(&mut self.blocks, frame, out, self.dictionary.as_ref())?;
+                decompress_frame(
+                    &mut self.blocks,
+                    header,
+                    frame,
+                    out,
+                    self.dictionary.as_ref(),
+                )?;
                 self.stage = Stage::Idle;
                 self.idle_steps = 0;
                 return Ok((len, Status::Complete));
@@ -291,12 +316,12 @@ impl Decoder {
         let Stage::Body(frame) = &mut self.stage else {
             return Err(Error::Internal);
         };
-        while self.ring.flush(out, &frame.header) {
+        while self.ring.flush(out, &frame.header)? {
             let needed = match frame.next {
                 Part::Nothing => return Ok(()),
                 Part::BlockHeader => BLOCK_HEADER_LEN,
                 Part::Checksum => CHECKSUM_LEN,
-                Part::BlockContent { header, left } if header.block_type == BlockType::Raw => {
+                Part::BlockContent { header, left } if header.block_type() == BlockType::Raw => {
                     input.len().max(1).min(left)
                 }
                 Part::BlockContent { left, .. } => left,
@@ -341,7 +366,7 @@ impl Frame {
             Part::BlockHeader => {
                 let header = BlockHeader::new(*part.first_chunk().ok_or(Error::Internal)?)?;
                 let left = header.content_len();
-                if left > block_len_max || (left == 0 && header.block_type != BlockType::Raw) {
+                if left > block_len_max || (left == 0 && header.block_type() != BlockType::Raw) {
                     return Err(Error::CorruptionDetected);
                 }
                 if left != 0 {
@@ -351,11 +376,8 @@ impl Frame {
                 (header, 0)
             }
             Part::BlockContent { header, left } => {
-                let decoded = ring.decode(header, part, block_len_max, blocks, dictionary)?;
+                let decoded = ring.decode(&self.header, header, part, blocks, dictionary)?;
                 self.decoded_size += decoded.len() as u64;
-                if self.decoded_size > self.header.content_size.unwrap_or(u64::MAX) {
-                    return Err(Error::CorruptionDetected);
-                }
                 if let Some(hash) = &mut self.hash {
                     hash.update(decoded);
                 }
@@ -371,17 +393,15 @@ impl Frame {
             }
             Part::Nothing => return Err(Error::Internal),
         };
+        (self.header).check_content_size(self.decoded_size, left == 0 && header.is_last())?;
         self.next = if left != 0 {
             Part::BlockContent { header, left }
-        } else if !header.is_last {
+        } else if !header.is_last() {
             Part::BlockHeader
+        } else if self.header.has_checksum {
+            Part::Checksum
         } else {
-            check_content_size(&self.header, self.decoded_size)?;
-            if self.header.has_checksum {
-                Part::Checksum
-            } else {
-                Part::Nothing
-            }
+            Part::Nothing
         };
         Ok(())
     }
@@ -406,13 +426,14 @@ impl Ring {
     }
 
     /// Returns whether all is out.
-    fn flush(&mut self, out: &mut Output<'_>, header: &FrameHeader) -> bool {
+    fn flush(&mut self, out: &mut Output<'_>, header: &FrameHeader) -> Result<bool> {
         if self.start == self.end {
-            return true;
+            return Ok(true);
         }
+        out.reserve(out.room().min(self.end - self.start))?;
         self.start += out.append(self.bytes.get(self.start..self.end).unwrap_or_default());
         if self.start != self.end {
-            return false;
+            return Ok(false);
         }
         let holds_all = header
             .content_size
@@ -421,19 +442,20 @@ impl Ring {
             self.previous_end = Some(self.end);
             (self.start, self.end) = (0, 0);
         }
-        true
+        Ok(true)
     }
 
     /// Returns what `content` decoded to.
     fn decode(
         &mut self,
+        frame: &FrameHeader,
         header: BlockHeader,
         content: &[u8],
-        block_len_max: usize,
         blocks: &mut BlockDecoder,
         dictionary: Option<&Dictionary<'_>>,
     ) -> Result<&[u8]> {
-        let reach = self.end + block_len_max + OVERSHOOT;
+        let position = self.end;
+        let reach = position + frame.block_len_max() + OVERSHOOT;
         let (mut out, external) = match self.previous_end {
             Some(previous_end) if previous_end > reach => {
                 let parts = self.bytes.split_at_mut_checked(reach);
@@ -441,27 +463,20 @@ impl Ring {
                 let previous = previous
                     .get(..previous_end - reach)
                     .ok_or(Error::Internal)?;
-                (
-                    Output::resume_slice(current, self.end, self.capacity),
-                    previous,
-                )
+                (Output::resume_slice(current, position), previous)
             }
             previous_end => {
                 let dictionary = dictionary.filter(|_| previous_end.is_none());
-                let out = Output::resume_ring(&mut self.bytes, self.end, self.capacity);
+                let out = Output::resume_ring(&mut self.bytes, position, self.capacity);
                 (out, dictionary.map(Dictionary::history).unwrap_or_default())
             }
         };
-        let destination = Destination {
-            out: &mut out,
-            history_start: 0,
-            external,
-            block_len_max,
-        };
-        let len = match header.block_type {
+        let room = self.capacity - position;
+        let destination = Destination::new(&mut out, frame, position, external, room);
+        let len = match header.block_type() {
             BlockType::Compressed => blocks.decode(content, dictionary, destination),
-            BlockType::Raw => destination.append(content),
-            BlockType::Rle => destination.append_repeated(content, header.repeats()),
+            BlockType::Raw => destination.finish(0, content),
+            BlockType::Rle => destination.finish_repeated(content, header.size()),
         }?;
         drop(out);
         self.end += len;

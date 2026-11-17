@@ -15,3 +15,7 @@ workspace = true
 [[test]]
 name = "decode"
 path = "tests/decode.rs"
+
+[[test]]
+name = "built"
+path = "tests/built.rs"

@@ -1,3 +1,5 @@
+//! What can go wrong, in the encoder too.
+
 use core::ffi::CStr;
 
 macro_rules! errors {

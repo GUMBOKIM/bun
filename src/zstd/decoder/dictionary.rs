@@ -1,26 +1,24 @@
-use crate::array::only_item;
+//! Dictionaries, in the format for them or raw.
+
+use std::borrow::Cow;
+
+use crate::array::allocate;
 use crate::error::{Error, Result};
-use crate::format::{BLOCK_LEN_MAX, DICTIONARY_MAGIC};
+use crate::format::{BLOCK_LEN_MAX, CodeKind, DICTIONARY_MAGIC};
 use crate::huffman::HuffmanTable;
-use crate::sequence_tables::{Kind, SequenceTables};
+use crate::sequence_tables::SequenceTables;
 
 /// What frames can refer to besides their own content.
 pub struct Dictionary<'a> {
-    bytes: Bytes<'a>,
+    bytes: Cow<'a, [u8]>,
     id: u32,
-    /// One at most.
-    entropy: Vec<Entropy>,
-}
-
-enum Bytes<'a> {
-    Borrowed(&'a [u8]),
-    Owned(Vec<u8>),
+    entropy: Option<Entropy>,
 }
 
 /// What the first block of a frame can repeat.
 pub(crate) struct Entropy {
     pub(crate) huffman: HuffmanTable,
-    pub(crate) sequences: SequenceTables,
+    pub(crate) sequences: Box<SequenceTables>,
     pub(crate) repeat_offsets: [u32; 3],
 }
 
@@ -33,9 +31,9 @@ impl<'a> Dictionary<'a> {
     /// Nothing but content.
     pub fn raw(bytes: &'a [u8]) -> Self {
         Self {
-            bytes: Bytes::Borrowed(bytes),
+            bytes: Cow::Borrowed(bytes),
             id: 0,
-            entropy: Vec::new(),
+            entropy: None,
         }
     }
 
@@ -45,7 +43,7 @@ impl<'a> Dictionary<'a> {
         copy.try_reserve_exact(bytes.len())?;
         copy.extend_from_slice(bytes);
         let dictionary = Dictionary {
-            bytes: Bytes::Owned(copy),
+            bytes: Cow::Owned(copy),
             ..Dictionary::raw(&[])
         };
         dictionary.with_entropy()
@@ -59,18 +57,17 @@ impl<'a> Dictionary<'a> {
         if u32::from_le_bytes([m0, m1, m2, m3]) != DICTIONARY_MAGIC {
             return Ok(self);
         }
-        let mut entropy = Vec::new();
-        let empty = only_item(&mut entropy, || Entropy {
+        let mut entropy = Entropy {
             huffman: HuffmanTable::default(),
-            sequences: SequenceTables::EMPTY,
+            sequences: allocate(|| SequenceTables::EMPTY)?,
             repeat_offsets: [0; _],
-        })?;
-        empty.read(rest).map_err(|error| match error {
+        };
+        entropy.read(rest).map_err(|error| match error {
             Error::CorruptionDetected => Error::DictionaryCorrupted,
             other => other,
         })?;
         self.id = u32::from_le_bytes([i0, i1, i2, i3]);
-        self.entropy = entropy;
+        self.entropy = Some(entropy);
         Ok(self)
     }
 
@@ -79,16 +76,13 @@ impl<'a> Dictionary<'a> {
         self.id
     }
 
-    /// What is in front of a frame's content. Offsets reach into the header too, as in zstd.
+    /// What is in front of a frame's content.
     pub(crate) fn history(&self) -> &[u8] {
-        match &self.bytes {
-            Bytes::Borrowed(bytes) => bytes,
-            Bytes::Owned(bytes) => bytes,
-        }
+        &self.bytes
     }
 
     pub(crate) fn entropy(&self) -> Option<&Entropy> {
-        self.entropy.first()
+        self.entropy.as_ref()
     }
 }
 
@@ -96,7 +90,11 @@ impl Entropy {
     fn read(&mut self, src: &[u8]) -> Result<()> {
         let len = self.huffman.read(src, BLOCK_LEN_MAX)?;
         let mut src = src.get(len..).ok_or(Error::Internal)?;
-        for kind in [Kind::Offset, Kind::MatchLength, Kind::LiteralLength] {
+        for kind in [
+            CodeKind::Offset,
+            CodeKind::MatchLength,
+            CodeKind::LiteralLength,
+        ] {
             let len = self.sequences.read(kind, src)?;
             src = src.get(len..).ok_or(Error::Internal)?;
         }

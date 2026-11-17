@@ -63,6 +63,9 @@ pub(crate) struct BackwardBits<'a> {
     pub(crate) start: usize,
 }
 
+/// The first bytes of a source, behind 8 more.
+pub(crate) type PaddedStart = [u8; 40];
+
 impl<'a> BackwardBits<'a> {
     /// What [`Self::refill`] makes available, if there are as many.
     pub(crate) const IN_REFILL: u32 = 56;
@@ -92,6 +95,29 @@ impl<'a> BackwardBits<'a> {
         self.position -= bytes;
         self.available += 8 * bytes as isize;
         self.container = load_from(self.src, self.position);
+    }
+
+    /// Whether the stream is over before a refill by all the bytes that are used up goes below the start of `src`.
+    #[inline(always)]
+    pub(crate) fn is_padded(&self) -> bool {
+        self.start >= 8
+    }
+
+    pub(crate) fn padded_start(&self) -> PaddedStart {
+        let mut padded = [0; _];
+        (padded.iter_mut().skip(8).zip(self.src)).for_each(|(to, from)| *to = *from);
+        padded
+    }
+
+    /// Goes on in what [`Self::padded_start`] returned, once that has all that is left.
+    #[inline(always)]
+    pub(crate) fn move_to(&mut self, padded: &'a PaddedStart) {
+        if !self.is_padded() && self.position + 16 <= padded.len() {
+            self.src = padded;
+            self.position += 8;
+            self.start += 8;
+            self.refill();
+        }
     }
 
     /// How many bits of the stream are yet to be read. Negative once more were read than it has.

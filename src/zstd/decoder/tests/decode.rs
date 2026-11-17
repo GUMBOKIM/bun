@@ -192,6 +192,24 @@ fn refused_memory_is_an_error() {
 }
 
 #[test]
+fn refused_memory_is_an_error_for_a_growing_output() {
+    let [_, fixture, ..] = FIXTURES;
+    for step in [fixture.frames.len(), fixture.frames.len() - 1] {
+        for grants in 0.. {
+            let mut out = Vec::new();
+            GRANTS.set(Some(grants));
+            let (_, status) =
+                Decoder::new().step_growing(&fixture.frames[..step], &mut out, usize::MAX);
+            if GRANTS.take().is_some() {
+                assert_eq!((status.is_ok(), XxHash64::hash(&out)), (true, fixture.hash));
+                break;
+            }
+            assert_eq!(status, Err(Error::MemoryAllocation));
+        }
+    }
+}
+
+#[test]
 fn no_changed_byte_goes_unnoticed() -> Result<()> {
     let [.., fixture] = FIXTURES;
     let dictionary = Dictionary::new(fixture.dictionary)?;
@@ -285,6 +303,8 @@ fn invalid_frames_fail_however_they_arrive() {
             Error::CorruptionDetected,
         ),
         ("28b52ffd 0000 150000 00 01", Error::SrcSizeWrong),
+        ("28b52ffd 0000 150000 08 61", Error::SrcSizeWrong),
+        ("28b52ffd 0000 150000 10 61", Error::CorruptionDetected),
     ];
     for (frame, error) in frames {
         assert_eq!(at_once(&hex(frame), 4096), Err(error), "{frame}");
@@ -313,6 +333,19 @@ fn input_is_a_whole_number_of_frames() {
 }
 
 #[test]
+fn blocks_fit_in_the_window_and_in_the_output() {
+    let larger_than_window = hex("28b52ffd 2001 150000 0000");
+    assert_eq!(at_once(&larger_than_window, 9), Err(Error::SrcSizeWrong));
+    assert_eq!(
+        byte_by_byte(&larger_than_window),
+        Err(Error::CorruptionDetected)
+    );
+    let one_match = hex("28b52ffd 0000 080000 61 3d0000 00 01 54 000200 04");
+    assert_eq!(at_once(&one_match, 4), Ok(b"aaaa".to_vec()));
+    assert_eq!(at_once(&one_match, 1), Err(Error::DstSizeTooSmall));
+}
+
+#[test]
 fn sizes_are_read_from_headers() {
     let known = hex("28b52ffd 6400 00 030800 61 00000000");
     let unknown = hex("28b52ffd 0000 010000");
@@ -330,6 +363,8 @@ fn sizes_are_read_from_headers() {
     assert_eq!(all(&[&known, &[0]]), ContentSize::Invalid);
     assert_eq!(all(&[&known[..14]]), ContentSize::Invalid);
     assert_eq!(all(&[&huge, &huge]), ContentSize::Invalid);
+    let reserved = hex("28b52ffd e0 feffffffffffffff 010000");
+    assert_eq!(all(&[&reserved]), ContentSize::Invalid);
 
     let lens = [0, 5, 7, 10, 14].map(|len| frame_len(&known[..len]));
     assert_eq!(
@@ -396,7 +431,7 @@ fn an_error_undoes_the_step_and_stays() {
         decoder.set_parameter(100, 10),
         Err(Error::CorruptionDetected)
     );
-    decoder.reset();
+    decoder.reset_session();
     assert_eq!(step(&mut decoder, &frame, 9), (10, 1, Ok(Status::Complete)));
 }
 
@@ -447,6 +482,81 @@ fn earlier_frames_make_no_difference() {
 }
 
 #[test]
+fn a_growing_output_seldom_moves() -> Result<()> {
+    let frame = hex("28b52ffd 6000 03 032000 61");
+    let (mut decoder, mut out, mut moves) = (Decoder::new(), Vec::new(), 0);
+    for _ in 0..1000 {
+        let capacity = out.capacity();
+        decoder.step_growing(&frame, &mut out, usize::MAX).1?;
+        moves += usize::from(out.capacity() != capacity);
+    }
+    assert_eq!((out.len(), moves), (1000 << 10, 11));
+
+    let mut out = Vec::with_capacity((2 << 20) + 4);
+    out.resize(2 << 20, 0);
+    let one_match = hex("28b52ffd 0000 080000 61 3d0000 00 01 54 000200 04");
+    decoder.step_growing(&one_match, &mut out, usize::MAX).1?;
+    assert_eq!((&out[2 << 20..], out.capacity()), (&b"aaaa"[..], out.len()));
+    Ok(())
+}
+
+#[test]
+#[cfg_attr(miri, ignore = "takes tens of megabytes")]
+fn a_growing_output_takes_what_the_content_needs() -> Result<()> {
+    let block = |last| hex(&format!("0{last}0010 61"));
+    let blocks = |count: usize| [block(2).repeat(count - 1), block(3)].concat();
+    // Known to be 32 MiB, and said to be 1 TiB.
+    let known = [hex("28b52ffd 8038 00000002"), blocks(256)].concat();
+    let mut out = Vec::with_capacity(4 << 20);
+    Decoder::new()
+        .step_growing(&known, &mut out, usize::MAX)
+        .1?;
+    assert_eq!((out.len(), out.capacity()), (32 << 20, (32 << 20) + 32));
+    let claimed = [hex("28b52ffd c038 0000000000010000"), blocks(2)].concat();
+    let mut out = Vec::new();
+    let (_, status) = Decoder::new().step_growing(&claimed, &mut out, usize::MAX);
+    assert_eq!((status, out.len()), (Err(Error::CorruptionDetected), 0));
+    assert!(out.capacity() <= 1 << 20);
+
+    let large_window = hex("28b52ffd 0090 090000 61");
+    let (_, status) = Decoder::new().step_growing(&large_window, &mut out, usize::MAX);
+    assert_eq!(status, Err(Error::WindowTooLarge));
+    let small_content = hex("28b52ffd 4090 e802 431f00 61");
+    Decoder::new()
+        .step_growing(&small_content, &mut out, usize::MAX)
+        .1?;
+    assert_eq!(out, [b'a'; 1000]);
+    Ok(())
+}
+
+#[test]
+fn what_is_lent_counts_once_it_is_committed() {
+    let (mut slice, mut vec) = ([0; 4], Vec::with_capacity(9));
+    for mut out in [
+        Output::slice(&mut slice),
+        Output::spare_capacity(&mut vec, 4),
+    ] {
+        assert_eq!(out.append(b"a"), 1);
+        out.lend(2).copy_from_slice(b"abc");
+        out.commit(1);
+        assert_eq!((out.lend(9).len(), out.written(), out.room()), (4, 2, 2));
+        assert_eq!(out.append(b"xyz"), 2);
+        out.rewind(3);
+    }
+    assert_eq!((&slice, &vec[..]), (b"abxy", &b"abx"[..]));
+}
+
+#[test]
+fn errors_are_named_as_in_zstd() {
+    let error = Error::ChecksumWrong;
+    assert_eq!(
+        (error as u8, error.name()),
+        (22, c"ZSTD_error_checksum_wrong")
+    );
+    assert_eq!(error.to_string(), "Restored data doesn't match checksum");
+}
+
+#[test]
 fn magic_numbers_are_told_from_their_start() {
     for bytes in ["28", "28b52f", "28b52ffd00", "5f", "502a4d18"] {
         assert!(may_start_frame(&hex(bytes)));
@@ -488,7 +598,7 @@ fn the_window_is_limited() {
         step(&mut decoder, &larger, 0),
         (0, 0, Err(Error::WindowTooLarge))
     );
-    decoder.reset();
+    let mut decoder = Decoder::new();
     assert_eq!(step(&mut decoder, &larger, 0), complete);
     let too_large = (0, 0, Err(Error::WindowTooLarge));
     assert_eq!(
@@ -516,6 +626,12 @@ fn raw_dictionaries_are_history() -> Result<()> {
         Some(&Dictionary::raw(b"xyz")),
     )?;
     assert_eq!(&out, b"yzyzy");
+    decompress(
+        &frame,
+        &mut Output::slice(&mut out),
+        Some(&Dictionary::new(b"raw content")?),
+    )?;
+    assert_eq!(&out, b"ntntn");
     let short = Dictionary::new(b"z")?;
     let result = decompress(&frame, &mut Output::slice(&mut out), Some(&short));
     assert_eq!(result, Err(Error::CorruptionDetected));
@@ -547,11 +663,23 @@ fn descriptions_end_within_their_input() -> Result<()> {
         assert_eq!(result, Err(Error::CorruptionDetected));
     }
 
+    let mut counts = [0; 100];
+    let description = read_normalized_counts(&hex("10e3ffffffffffffff3e"), &mut counts)?;
+    assert_eq!(
+        (description.max_symbol, counts[0], counts[90]),
+        (90, 16, 16)
+    );
+
     let tree = read_huffman_weights(&hex("84 43 20 10 ff"))?;
     assert_eq!((tree.symbol_count, tree.table_log, tree.len), (6, 4, 4));
     assert_eq!(tree.weights[..6], [4, 3, 2, 0, 1, 1]);
     assert_eq!(tree.rank_counts[..6], [1, 2, 1, 1, 1, 0]);
-    for src in ["", "84 43 20", "80 00", "80 20", "81 d1", "82 13 30", "01"] {
+    // The last three: too many states, a weight too high for as many, and no end of weights that take no bits.
+    let sources = ["", "84 43 20", "80 00", "80 20", "81 d1", "82 13 30", "01"];
+    for src in sources
+        .into_iter()
+        .chain(["03 f2 0f 01", "05 11 f8 fd 01 01", "04 f0 03 00 04"])
+    {
         assert_eq!(
             read_huffman_weights(&hex(src)).err(),
             Some(Error::CorruptionDetected)

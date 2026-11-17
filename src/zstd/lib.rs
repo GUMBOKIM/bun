@@ -117,18 +117,15 @@ fn decompress_sized(
 
 /// Decompresses one or more frames.
 pub fn decompress_alloc(src: &[u8]) -> Result<Vec<u8>, ZstdError> {
-    let initial_capacity = match bun_zstd_decoder::decompressed_size(src) {
+    let mut output = match bun_zstd_decoder::decompressed_size(src) {
         ContentSize::Invalid => return Err(ZstdError::InvalidZstdData),
         ContentSize::Known(size) if size <= MAX_PREALLOCATE_SIZE as u64 => {
             return decompress_sized(src, size as usize, None);
         }
-        ContentSize::Known(_) => MAX_PREALLOCATE_SIZE,
+        ContentSize::Known(_) => with_capacity(MAX_PREALLOCATE_SIZE)?,
         // A frame's output is rarely smaller than its input.
-        ContentSize::Unknown => src
-            .len()
-            .clamp(streaming_decoder::OUTPUT_STEP, MAX_PREALLOCATE_SIZE),
+        ContentSize::Unknown => with_capacity(src.len().clamp(4096, MAX_PREALLOCATE_SIZE))?,
     };
-    let mut output = with_capacity(initial_capacity)?;
     StreamingDecoder::new().decompress(src, &mut output, usize::MAX, true)?;
     Ok(output)
 }

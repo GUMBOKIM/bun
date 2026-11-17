@@ -9,10 +9,9 @@
     clippy::unreachable
 )]
 #![warn(unused_must_use)]
-#![feature(hint_prefetch)]
-#![cfg_attr(all(target_arch = "x86_64", not(miri)), feature(fn_align))]
+#![feature(allocator_ext, fn_align, hint_prefetch)]
 
-mod array;
+pub mod array;
 mod bits;
 mod block;
 mod cpu;

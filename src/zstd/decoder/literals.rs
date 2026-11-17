@@ -127,8 +127,8 @@ impl LiteralsHeader {
     }
 
     /// How much room to offer to [`Self::decode`], if it has to be cleared first.
-    pub(crate) fn room_worth_clearing(&self) -> usize {
-        let is_large = self.has_4_streams && self.count > AMPLE_ROOM / 2;
+    pub(crate) fn room_worth_clearing(&self, table: &HuffmanTable) -> usize {
+        let is_large = self.has_4_streams && table.has_pairs() && self.count > AMPLE_ROOM / 2;
         (self.count + LITERALS_PADDING).max(if is_large { AMPLE_ROOM } else { 0 })
     }
 }

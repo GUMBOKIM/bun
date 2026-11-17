@@ -1,6 +1,6 @@
 //! Tree descriptions.
 
-use crate::array::{wrapped, wrapped_mut};
+use crate::array::At;
 use crate::bits::{BackwardBits, Width};
 use crate::error::{Error, Result};
 use crate::format::HUFFMAN_TABLE_LOG_MAX;
@@ -54,7 +54,7 @@ impl HuffmanWeights {
                 for (to, pair) in self.weights.as_chunks_mut().0.iter_mut().zip(pairs) {
                     *to = [pair >> 4, pair & 15];
                 }
-                *wrapped_mut(&mut self.weights, listed.into()) = 0;
+                *self.weights.at_mut(listed.into()) = 0;
                 (listed.into(), len)
             }
             _ => {
@@ -68,7 +68,7 @@ impl HuffmanWeights {
         let mut counts = [[0; 16]; 4];
         self.for_each_in_quarters(
             #[inline(always)]
-            |quarter, _, weight| *wrapped_mut(wrapped_mut(&mut counts, quarter), weight) += 1,
+            |quarter, _, weight| *counts.at_mut(quarter).at_mut(weight) += 1,
         );
         for quarter in &counts {
             for (sum, &count) in self.rank_counts.iter_mut().zip(quarter) {
@@ -86,14 +86,14 @@ impl HuffmanWeights {
             return Err(Error::CorruptionDetected);
         }
         let last_weight = missing.bit_width() as usize;
-        *wrapped_mut(&mut self.weights, listed) = last_weight as u8;
-        *wrapped_mut(&mut self.rank_counts, last_weight) += 1;
+        *self.weights.at_mut(listed) = last_weight as u8;
+        *self.rank_counts.at_mut(last_weight) += 1;
         self.rank_counts[0] -= (4 * self.quarter_len() - listed) as u32;
         let quarter = (1..4)
             .filter(|quarter| quarter * self.quarter_len() <= listed)
             .count();
-        wrapped_mut(&mut counts, quarter)[0] -= 1;
-        *wrapped_mut(wrapped_mut(&mut counts, quarter), last_weight) += 1;
+        counts.at_mut(quarter)[0] -= 1;
+        *counts.at_mut(quarter).at_mut(last_weight) += 1;
         self.counts_by_quarter = counts;
         if self.rank_counts[1] < 2 || !self.rank_counts[1].is_multiple_of(2) {
             return Err(Error::CorruptionDetected);
@@ -114,11 +114,7 @@ impl HuffmanWeights {
         for index in 0..len {
             for quarter in 0..4 {
                 let symbol = quarter * len + index;
-                visit(
-                    quarter,
-                    symbol as u8,
-                    (*wrapped(&self.weights, symbol)).into(),
-                );
+                visit(quarter, symbol as u8, (*self.weights.at(symbol)).into());
             }
         }
     }
@@ -138,7 +134,7 @@ fn decompress(src: &[u8], weights: &mut [u8; 256]) -> Result<usize> {
     const BATCH: usize = 8;
     const { assert!(BATCH as u32 * TABLE_LOG_MAX <= BackwardBits::IN_REFILL) };
 
-    // These limits are what fits in the workspace of zstd's `HUF_readStats()`.
+    // Limits of the reference decoder.
     let mut counts = [0; 92];
     let description = read_counts(src, &mut counts)?;
     let (log, max_symbol) = (description.table_log, description.max_symbol);
@@ -146,7 +142,7 @@ fn decompress(src: &[u8], weights: &mut [u8; 256]) -> Result<usize> {
         return Err(Error::CorruptionDetected);
     }
     let counts = counts.get(..=max_symbol).ok_or(Error::Internal)?;
-    let mut states = States::<STATES_MAX, { STATES_MAX + 8 }, 128>::EMPTY;
+    let mut states = States::<{ STATES_MAX + 8 }, 128>::EMPTY;
     states.spread(counts, log);
     let mut table = [Row {
         weight: 0,
@@ -163,17 +159,13 @@ fn decompress(src: &[u8], weights: &mut [u8; 256]) -> Result<usize> {
     }
 
     let mut bits = BackwardBits::new(src, description.len)?;
-    bits.refill();
-    let mut current = wrapped(&table, bits.read(log) as usize);
-    let mut other = wrapped(&table, bits.read(log) as usize);
+    let mut current = table.at(bits.read(log) as usize);
+    let mut other = table.at(bits.read(log) as usize);
     if bits.left() < 0 {
         return Err(Error::CorruptionDetected);
     }
     let after = |row: &Row, bits: &mut BackwardBits<'_>| {
-        wrapped(
-            &table,
-            usize::from(row.baseline) + bits.read(row.bits as u32) as usize,
-        )
+        table.at(usize::from(row.baseline) + bits.read(row.bits as u32) as usize)
     };
 
     let mut count = 0;
@@ -197,11 +189,11 @@ fn decompress(src: &[u8], weights: &mut [u8; 256]) -> Result<usize> {
     }
     // Either the bits or the weights that are left are too few to need a refill.
     while count < 254 {
-        *wrapped_mut(weights, count) = current.weight;
+        *weights.at_mut(count) = current.weight;
         (current, other) = (other, after(current, &mut bits));
         count += 1;
         if bits.left() < 0 {
-            *wrapped_mut(weights, count) = current.weight;
+            *weights.at_mut(count) = current.weight;
             return Ok(count + 1);
         }
     }

@@ -16,8 +16,8 @@ pub struct XxHash64 {
 }
 
 #[inline(always)]
-fn round(lane: u64, input: u64) -> u64 {
-    lane.wrapping_add(input.wrapping_mul(PRIME_2))
+fn round(state: u64, word: u64) -> u64 {
+    (state.wrapping_add(word.wrapping_mul(PRIME_2)))
         .rotate_left(31)
         .wrapping_mul(PRIME_1)
 }
@@ -42,8 +42,8 @@ fn finish(lanes: [u64; 4], total_len: u64, tail: &[u8]) -> u64 {
             .wrapping_add(b.rotate_left(7))
             .wrapping_add(c.rotate_left(12))
             .wrapping_add(d.rotate_left(18));
-        lanes.into_iter().fold(sum, |hash, lane| {
-            (hash ^ round(0, lane))
+        lanes.into_iter().fold(sum, |hash, word| {
+            (hash ^ round(0, word))
                 .wrapping_mul(PRIME_1)
                 .wrapping_add(PRIME_4)
         })

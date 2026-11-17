@@ -1,9 +1,6 @@
 use bun_core::compress::State;
 
-use crate::{Decoder, Output, Status, ZstdError};
-
-/// Minimum spare output capacity offered to the decoder per step.
-pub(crate) const OUTPUT_STEP: usize = 4096;
+use crate::{Decoder, Status, ZstdError};
 
 /// Decodes the chunks of a body, one or more frames, into a growing `Vec`.
 pub struct StreamingDecoder {
@@ -27,7 +24,7 @@ impl StreamingDecoder {
         matches!(self.state, State::Inflating)
     }
 
-    /// Append decompressed bytes to `out` (growing in 4096-byte steps) until `input` is
+    /// Append decompressed bytes to `out` until `input` is
     /// consumed or `out.len()` reaches `max_output`. Returns the input bytes consumed.
     /// Returns `ShortRead` when more input is required and `is_done` is false.
     pub fn decompress(
@@ -61,15 +58,9 @@ impl StreamingDecoder {
                 return Ok(total_in);
             }
 
-            if out.try_reserve(OUTPUT_STEP).is_err() {
-                self.state = State::Error;
-                return Err(ZstdError::OutOfMemory);
-            }
-            let budget = max_output - out.len();
-            let mut output = Output::spare_capacity(out, budget);
-            let (bytes_read, status) = self.decoder.step(next_in, &mut output);
-            self.output_full = output.room() == 0;
-            drop(output);
+            let (bytes_read, status) =
+                (self.decoder).step_growing(next_in, out, max_output - out.len());
+            self.output_full = out.len() >= max_output;
             let status = status.map_err(|error| {
                 self.state = State::Error;
                 ZstdError::for_decompression(error, ZstdError::ZstdDecompressionError)

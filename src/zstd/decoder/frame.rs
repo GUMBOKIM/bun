@@ -9,10 +9,9 @@ use crate::format::{
 
 const MAGIC_LEN: usize = 4;
 /// The magic number and the descriptor, which tells the length of the rest.
-pub(crate) const HEADER_PREFIX_LEN: usize = MAGIC_LEN + 1;
-const HEADER_LEN_MIN: usize = HEADER_PREFIX_LEN + 1;
+const HEADER_PREFIX_LEN: usize = MAGIC_LEN + 1;
 const SKIPPABLE_HEADER_LEN: usize = MAGIC_LEN + 4;
-/// `ZSTD_CONTENTSIZE_UNKNOWN` and `ZSTD_CONTENTSIZE_ERROR`, which zstd does not tell from what a header says.
+/// `ZSTD_CONTENTSIZE_UNKNOWN` and `ZSTD_CONTENTSIZE_ERROR`
 const UNKNOWN_SIZE: u64 = u64::MAX;
 const INVALID_SIZE: u64 = u64::MAX - 1;
 
@@ -118,20 +117,28 @@ impl Header {
             has_checksum: descriptor & 0x04 != 0,
         }))
     }
+
+    /// For input that has to be all there.
+    pub(crate) fn read_whole(src: &[u8]) -> Result<Self> {
+        let header = Self::read(src);
+        let len = src
+            .get(MAGIC_LEN)
+            .map_or(HEADER_PREFIX_LEN, |&it| header_len(it));
+        if src.len() < len + BLOCK_HEADER_LEN && !matches!(header, Ok(Self::Skippable { .. })) {
+            return Err(Error::SrcSizeWrong);
+        }
+        header
+    }
 }
 
 impl FrameHeader {
-    /// For a frame that has to be all there.
-    pub(crate) fn read_whole(src: &[u8]) -> Result<Self> {
-        let len = src
-            .get(MAGIC_LEN)
-            .map_or(HEADER_LEN_MIN, |&it| header_len(it));
-        if src.len() < len + BLOCK_HEADER_LEN {
-            return Err(Error::SrcSizeWrong);
-        }
-        match Header::read(src)? {
-            Header::Frame(header) => Ok(header),
-            _ => Err(Error::SrcSizeWrong),
+    /// `size` is that of the blocks so far.
+    pub(crate) fn check_content_size(&self, size: u64, is_complete: bool) -> Result<()> {
+        match self.content_size {
+            Some(expected) if size > expected || (is_complete && size != expected) => {
+                Err(Error::CorruptionDetected)
+            }
+            _ => Ok(()),
         }
     }
 
@@ -142,38 +149,40 @@ impl FrameHeader {
 }
 
 #[derive(Clone, Copy)]
-pub(crate) struct BlockHeader {
-    pub(crate) block_type: BlockType,
-    pub(crate) is_last: bool,
-    size: u32,
-}
+pub(crate) struct BlockHeader(u32);
 
 impl BlockHeader {
     pub(crate) fn new([b0, b1, b2]: [u8; BLOCK_HEADER_LEN]) -> Result<Self> {
-        let bits = u32::from_le_bytes([b0, b1, b2, 0]);
-        Ok(Self {
-            block_type: match bits >> 1 & 3 {
-                0 => BlockType::Raw,
-                1 => BlockType::Rle,
-                2 => BlockType::Compressed,
-                _ => return Err(Error::CorruptionDetected),
-            },
-            is_last: bits & 1 != 0,
-            size: bits >> 3,
-        })
+        let is_reserved = b0 >> 1 & 3 == 3;
+        if is_reserved {
+            return Err(Error::CorruptionDetected);
+        }
+        Ok(Self(u32::from_le_bytes([b0, b1, b2, 0])))
+    }
+
+    pub(crate) fn is_last(self) -> bool {
+        self.0 & 1 != 0
+    }
+
+    pub(crate) fn block_type(self) -> BlockType {
+        match self.0 >> 1 & 3 {
+            0 => BlockType::Raw,
+            1 => BlockType::Rle,
+            _ => BlockType::Compressed,
+        }
     }
 
     /// How many bytes follow the header.
     pub(crate) fn content_len(self) -> usize {
-        match self.block_type {
+        match self.block_type() {
             BlockType::Rle => 1,
-            _ => self.size as usize,
+            _ => self.size(),
         }
     }
 
-    /// How often the byte of an RLE block is repeated.
-    pub(crate) fn repeats(self) -> usize {
-        self.size as usize
+    /// For an RLE block, how often its byte is repeated.
+    pub(crate) fn size(self) -> usize {
+        self.0 as usize >> 3
     }
 }
 
@@ -193,6 +202,12 @@ pub(crate) fn skippable_len(content_len: u32) -> Result<usize> {
 
 /// The length of the frame that `prefix` starts with.
 pub fn frame_len(prefix: &[u8]) -> Result<FrameLen> {
+    measure_frame(prefix).map(|(len, _)| len)
+}
+
+/// Also returns how many blocks it found.
+pub(crate) fn measure_frame(prefix: &[u8]) -> Result<(FrameLen, usize)> {
+    let mut blocks = 0;
     let len = match Header::read(prefix)? {
         Header::Incomplete(len) => len,
         Header::Skippable { content_len } => skippable_len(content_len)?,
@@ -200,21 +215,22 @@ pub fn frame_len(prefix: &[u8]) -> Result<FrameLen> {
             let mut len = header.len;
             loop {
                 let Some(block) = prefix.get(len..).and_then(<[u8]>::first_chunk) else {
-                    return Ok(FrameLen::AtLeast(len + BLOCK_HEADER_LEN));
+                    return Ok((FrameLen::AtLeast(len + BLOCK_HEADER_LEN), blocks));
                 };
                 let block = BlockHeader::new(*block)?;
                 len += BLOCK_HEADER_LEN + block.content_len();
-                if block.is_last {
+                blocks += 1;
+                if block.is_last() {
                     break len + if header.has_checksum { CHECKSUM_LEN } else { 0 };
                 }
             }
         }
     };
-    Ok(if len <= prefix.len() {
-        FrameLen::Complete(len)
+    if len <= prefix.len() {
+        Ok((FrameLen::Complete(len), blocks))
     } else {
-        FrameLen::AtLeast(len)
-    })
+        Ok((FrameLen::AtLeast(len), blocks))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

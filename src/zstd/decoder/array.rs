@@ -2,45 +2,64 @@
 
 use crate::error::{Error, Result};
 
-/// `table[index % N]`, which the compiler knows to be in bounds.
-#[inline(always)]
-#[expect(clippy::indexing_slicing, reason = "the index is less than N")]
-pub(crate) const fn wrapped<T, const N: usize>(table: &[T; N], index: usize) -> &T {
-    const { assert!(N.is_power_of_two()) };
-    &table[index % N]
+pub trait At<T> {
+    /// For an `index` that the caller knows to be in range. One that is not gets some other element.
+    fn at(&self, index: usize) -> &T;
+    fn at_mut(&mut self, index: usize) -> &mut T;
 }
 
 #[inline(always)]
-#[expect(clippy::indexing_slicing, reason = "the index is less than N")]
-pub(crate) const fn wrapped_mut<T, const N: usize>(table: &mut [T; N], index: usize) -> &mut T {
-    const { assert!(N.is_power_of_two()) };
-    &mut table[index % N]
+pub(crate) const fn in_range<const N: usize>(index: usize) -> usize {
+    const { assert!(N != 0) };
+    if N.is_power_of_two() {
+        index % N
+    } else if index < N {
+        index
+    } else {
+        N - 1
+    }
 }
 
-/// Grows `vec` to `len` if it is shorter.
-#[inline(always)]
-pub(crate) fn fill_up<T: Copy>(vec: &mut Vec<T>, len: usize, value: T) -> Result<()> {
-    if let Some(missing @ 1..) = len.checked_sub(vec.len()) {
-        vec.try_reserve_exact(missing)?;
+#[expect(clippy::indexing_slicing, reason = "in_range() is below N")]
+impl<T, const N: usize> At<T> for [T; N] {
+    #[inline(always)]
+    fn at(&self, index: usize) -> &T {
+        debug_assert!(index < N);
+        &self[in_range::<N>(index)]
+    }
+
+    #[inline(always)]
+    fn at_mut(&mut self, index: usize) -> &mut T {
+        debug_assert!(index < N);
+        &mut self[in_range::<N>(index)]
+    }
+}
+
+/// Makes `vec` at least `len` long.
+#[inline]
+pub fn grow<T: Clone>(vec: &mut Vec<T>, value: T, len: usize) -> Result<()> {
+    if let Some(more @ 1..) = len.checked_sub(vec.len()) {
+        vec.try_reserve_exact(more)?;
         vec.resize(len, value);
     }
     Ok(())
 }
 
-/// The only item of `vec`, which is `empty()` at first.
-#[inline(always)]
-pub(crate) fn only_item<T>(vec: &mut Vec<T>, empty: impl FnOnce() -> T) -> Result<&mut T> {
-    /// Out of line, so that no other function has room for a `T` on its stack.
-    #[cold]
-    #[inline(never)]
-    fn allocate<T>(vec: &mut Vec<T>, empty: impl FnOnce() -> T) -> Result<()> {
-        vec.try_reserve_exact(1)?;
-        vec.push(empty());
-        Ok(())
-    }
+/// Out of line, so that no other function has room for a `T` on its stack.
+#[cold]
+#[inline(never)]
+pub(crate) fn allocate<T>(value: impl FnOnce() -> T) -> Result<Box<T>> {
+    Box::try_new(value()).map_err(|_| Error::MemoryAllocation)
+}
 
-    if vec.is_empty() {
-        allocate(vec, empty)?;
-    }
-    vec.first_mut().ok_or(Error::Internal)
+/// What is in `slot`, which is `empty()` at first.
+#[inline(always)]
+pub(crate) fn get_or_allocate<T>(
+    slot: &mut Option<Box<T>>,
+    empty: impl FnOnce() -> T,
+) -> Result<&mut T> {
+    Ok(match slot {
+        Some(item) => item,
+        None => slot.insert(allocate(empty)?),
+    })
 }

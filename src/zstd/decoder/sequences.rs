@@ -3,15 +3,17 @@
 use core::cell::Cell;
 use core::hint::{Locality, black_box, cold_path, prefetch_read, select_unpredictable};
 
-use crate::array::wrapped;
-use crate::bits::{BackwardBits, Width};
+use crate::array::At;
+use crate::bits::{BackwardBits, PaddedStart, Width};
 use crate::cpu::with_bmi2;
-use crate::destination::{Destination, OVERSHOOT};
+use crate::destination::{Destination, Loan, OVERSHOOT};
 use crate::error::{Error, Result};
+use crate::format::CodeKind;
 use crate::literals::LITERALS_PADDING;
-use crate::sequence_tables::{Kind, LengthRow, OffsetRow, SequenceTables};
+use crate::sequence_tables::{LENGTH_ROWS, LengthRow, OffsetRow, SequenceTables};
 
 const CHUNK: usize = 16;
+const _: () = assert!(2 * CHUNK <= OVERSHOOT && 2 * CHUNK <= LITERALS_PADDING);
 
 struct Sequence {
     literal_len: u32,
@@ -31,9 +33,9 @@ impl States {
     #[inline(always)]
     fn rows(self, tables: &SequenceTables) -> (&LengthRow, &OffsetRow, &LengthRow) {
         (
-            wrapped(&tables.literal_lengths, self.literal_len),
-            wrapped(&tables.offsets, self.offset),
-            wrapped(&tables.match_lengths, self.match_len),
+            tables.literal_lengths.at(self.literal_len),
+            tables.offsets.at(self.offset),
+            tables.match_lengths.at(self.match_len),
         )
     }
 
@@ -52,21 +54,21 @@ struct Reader<'a> {
     bits: BackwardBits<'a>,
     states: States,
     left: usize,
+    /// For [`BackwardBits::move_to`].
+    padded_start: &'a PaddedStart,
 }
 
 impl<'a> Reader<'a> {
     fn new(
         tables: &'a SequenceTables,
-        block: &'a [u8],
-        start: usize,
+        mut bits: BackwardBits<'a>,
+        padded_start: &'a PaddedStart,
         count: usize,
-    ) -> Result<Self> {
-        let mut bits = BackwardBits::new(block, start)?;
-        bits.refill();
+    ) -> Self {
         let [literal_len, offset, match_len] =
-            Kind::ALL.map(|kind| bits.read(tables.log(kind)) as usize);
+            CodeKind::ALL.map(|kind| bits.read(tables.log(kind)) as usize);
         bits.refill();
-        Ok(Self {
+        Self {
             tables,
             bits,
             states: States {
@@ -75,7 +77,24 @@ impl<'a> Reader<'a> {
                 match_len,
             },
             left: count,
-        })
+            padded_start,
+        }
+    }
+
+    fn is_quick(&self) -> bool {
+        self.quick_count(self.bits.position) != 0
+            && self.bits.available >= self.states.total_bits(self.tables)
+    }
+
+    /// How many sequences can be read without a look at the start of the source, as long as refills are enough for them.
+    #[inline(always)]
+    fn quick_count(&self, position: usize) -> usize {
+        let before_last = self.left.saturating_sub(1);
+        if self.bits.is_padded() {
+            before_last
+        } else {
+            before_last.min(position / 7)
+        }
     }
 
     fn next(&mut self) -> Sequence {
@@ -120,10 +139,16 @@ struct Slot {
 
 const REPEATS: usize = 3;
 const AHEAD_MAX: usize = 8;
+/// One more is read before the first turns out to take care, and one more with care.
+const PENDING_MAX: usize = AHEAD_MAX + 2;
 const BATCH: usize = 64;
+/// They do not need as many slots, which take time to clear.
+const FEW_SEQUENCES: usize = 28;
 
-struct Queue {
-    slots: [Slot; REPEATS + AHEAD_MAX + BATCH + 1],
+struct Queue<'a> {
+    slots: &'a mut [Slot],
+    /// From where it goes back to the first slot.
+    batch: usize,
     /// Where the [`REPEATS`] slots before the next to run start.
     start: usize,
     /// Read and yet to run.
@@ -163,21 +188,22 @@ fn set_chunk<const N: usize>(bytes: &mut [u8], position: usize, chunk: [u8; N]) 
     Some(())
 }
 
-/// All but the first chunk of `len` bytes.
+/// `len` bytes and some more.
 #[inline(always)]
-fn copy_rest(
-    from: &[u8],
-    from_start: usize,
-    to: &mut [u8],
-    to_start: usize,
-    len: usize,
-) -> Option<()> {
-    let from = from.get(from_start + CHUNK..)?.get(..len + CHUNK - 1)?;
-    let to = to.get_mut(to_start + CHUNK..)?.get_mut(..len + CHUNK - 1)?;
-    for (to, from) in (to.as_chunks_mut::<{ 2 * CHUNK }>().0.iter_mut()).zip(from.as_chunks().0) {
-        *to = *from;
-        // Most are short: neither unrolling nor a call of `memcpy()` pays.
-        black_box(());
+fn copy_start(from: &[u8], to: &mut [u8], len: usize) -> Option<()> {
+    let (first, mut from) = from.split_first_chunk::<CHUNK>()?;
+    let (to_first, mut to) = to.split_first_chunk_mut()?;
+    *to_first = *first;
+    if len > CHUNK {
+        cold_path();
+        from = from.get(..len + CHUNK - 1)?;
+        to = to.get_mut(..len + CHUNK - 1)?;
+        for (to, from) in (to.as_chunks_mut::<{ 2 * CHUNK }>().0.iter_mut()).zip(from.as_chunks().0)
+        {
+            *to = *from;
+            // Most are short: neither unrolling nor a call of `memcpy()` pays.
+            black_box(());
+        }
     }
     Some(())
 }
@@ -266,7 +292,7 @@ fn copy_close_match(
     len: usize,
 ) -> Option<()> {
     let bytes = u128::from_le_bytes(chunk_at(out, from)?);
-    let period = wrapped(&PERIODS, offset);
+    let period = PERIODS.at(offset);
     let repeated = |bytes: u64| (bytes & period.mask).wrapping_mul(period.multiplier);
     let low = repeated(bytes as u64);
     set_chunk(out, start, low.to_le_bytes())?;
@@ -287,62 +313,145 @@ fn copy_close_match(
     Some(())
 }
 
-/// Reads a sequence, and runs the one `AHEAD` before it, until either takes care. That way the reader goes on while the
-/// processor recovers from a wrong guess about the copies, and with more of a lead far matches arrive in time.
-#[inline(never)]
-fn run_while_quick<const AHEAD: usize>(
-    reader: &mut Reader<'_>,
-    queue: &mut Queue,
-    literals: &[u8],
-    external: &[u8],
+/// If all of it, and the overshoot, is in the last `distance` bytes of `detached`.
+#[inline(always)]
+fn copy_detached_match(
+    detached: &[u8],
+    distance: usize,
     out: &mut [u8],
-) {
-    with_bmi2(
-        #[inline(always)]
-        move || run_while_quick_inline::<AHEAD>(reader, queue, literals, external, out),
-    );
+    start: usize,
+    len: usize,
+) -> Option<()> {
+    let from = detached.get(detached.len().checked_sub(distance)?..)?;
+    let from = from.get(..len + OVERSHOOT)?;
+    copy_start(from, out.get_mut(start..)?, len)
 }
 
+/// What the copies go between.
+struct Buffers<'a> {
+    literals: &'a [u8],
+    /// Where the padding starts.
+    literals_limit: usize,
+    /// The history before `out`.
+    detached: &'a [u8],
+    out: &'a mut [u8],
+    /// Where the room for the overshoot starts.
+    out_limit: usize,
+}
+
+impl<'a> Buffers<'a> {
+    #[inline(always)]
+    fn new(literals: &'a [u8], detached: &'a [u8], out: &'a mut [u8]) -> Option<Self> {
+        Some(Self {
+            literals_limit: literals.len().checked_sub(LITERALS_PADDING)?,
+            out_limit: out.len().checked_sub(OVERSHOOT)?,
+            literals,
+            detached,
+            out,
+        })
+    }
+
+    /// Returns `None` if `current` takes care. It can be run again then.
+    #[inline(always)]
+    fn run(
+        &mut self,
+        repeats: [&mut Slot; REPEATS],
+        current: &mut Slot,
+        following: &mut Slot,
+    ) -> Option<()> {
+        let (literal_len, literal_start) = (
+            current.literal_len.into(),
+            current.literal_position as usize,
+        );
+        following.literal_position = (literal_start + literal_len) as u32;
+        if literal_start + literal_len > self.literals_limit {
+            cold_path();
+            return None;
+        }
+        let (start, match_len) = (current.position as usize, usize::from(current.match_len));
+        let match_start = start + literal_len;
+        following.position = (match_start + match_len) as u32;
+        if match_start + match_len > self.out_limit {
+            cold_path();
+            return None;
+        }
+        copy_start(
+            self.literals.get(literal_start..)?,
+            self.out.get_mut(start..)?,
+            literal_len,
+        )?;
+
+        if current.offset as i32 <= 0 {
+            current.offset = repeat_offset(current.offset as i32, literal_len, repeats)?;
+        }
+        let offset = current.offset as usize;
+        match match_start.checked_sub(offset) {
+            Some(from) if offset >= CHUNK => {
+                copy_distant_match(self.out, from, offset, match_start, match_len)
+            }
+            Some(from) => {
+                cold_path();
+                copy_close_match(self.out, from, offset, match_start, match_len)
+            }
+            None => {
+                cold_path();
+                copy_detached_match(
+                    self.detached,
+                    offset - match_start,
+                    self.out,
+                    match_start,
+                    match_len,
+                )
+            }
+        }
+    }
+
+    /// For a match that starts at `position`.
+    #[inline(always)]
+    fn prefetch(&self, position: u32, offset: u32) {
+        let detached_end = self.detached.as_ptr_range().end;
+        let base = select_unpredictable(offset > position, detached_end, self.out.as_ptr());
+        let from = base
+            .wrapping_add(position as usize)
+            .wrapping_sub(offset as usize);
+        prefetch_read(from, Locality::L1);
+        prefetch_read(from.wrapping_add(64), Locality::L1);
+    }
+}
+
+/// Reads a sequence, and runs the one `AHEAD` before it, until either takes care. That way the reader goes on while the
+/// processor recovers from a wrong guess about the copies, and with more of a lead far matches arrive in time.
 #[inline(always)]
-fn run_while_quick_inline<const AHEAD: usize>(
+fn read_and_run<const AHEAD: usize>(
     reader: &mut Reader<'_>,
-    queue: &mut Queue,
+    queue: &mut Queue<'_>,
     literals: &[u8],
-    external: &[u8],
+    detached: &[u8],
     out: &mut [u8],
-) -> Option<()> {
-    let literals_limit = literals.len().checked_sub(LITERALS_PADDING)?;
-    let out_limit = out.len().checked_sub(OVERSHOOT)?;
+) -> Result<()> {
+    const { assert!(1 <= AHEAD && AHEAD <= AHEAD_MAX) };
+    let buffers = Buffers::new(literals, detached, out);
+    let mut buffers = buffers.ok_or(Error::Internal)?;
     let (tables, src) = (reader.tables, reader.bits.src);
     let mut states = reader.states;
     let mut position = reader.bits.position as u32;
     let mut container = reader.bits.container;
     let mut spare_bits = reader.bits.available - states.total_bits(tables);
-    let mut read_position = 0u32;
-    if AHEAD > 1 {
-        let pending = queue
-            .slots
-            .get(queue.start + REPEATS..)?
-            .first_chunk::<AHEAD>()?;
-        let lens = pending
-            .iter()
-            .map(|it| u32::from(it.literal_len) + u32::from(it.match_len));
-        read_position = pending.first()?.position.wrapping_add(lens.sum());
-    }
+    let mut read_position = if AHEAD > 1 { queue.end_position()? } else { 0 };
 
     while spare_bits >= 0 && queue.pending == AHEAD {
-        if queue.start >= BATCH {
+        if queue.start >= queue.batch {
             queue.rewind()?;
         }
-        let mut count = reader.left.saturating_sub(1).min(BATCH - queue.start);
-        // With 8 bytes before it, a stream is over before a refill leaves `src`.
-        if reader.bits.start < 8 {
-            count = count.min(position as usize / 7);
-        }
+        let count = reader
+            .quick_count(position as usize)
+            .min(queue.batch - queue.start);
         if count == 0 {
             break;
         }
-        let mut slots = (queue.slots.get_mut(queue.start..)?).get_mut(..count + REPEATS + AHEAD)?;
+        let slots = queue.slots.get_mut(queue.start..);
+        let slots = slots.and_then(|slots| slots.get_mut(..count + REPEATS + AHEAD));
+        let mut slots = slots.ok_or(Error::Internal)?;
         let first_address = slots.as_ptr().addr();
 
         while let [third, second, first, current, later @ ..] = slots
@@ -360,9 +469,10 @@ fn run_while_quick_inline<const AHEAD: usize>(
                 .wrapping_add(last(offset_row.state_bits) as u8))
             .into();
             states.match_len =
-                (usize::from(match_row.next) + last(match_row.state_bits) as usize) % 512;
-            states.literal_len =
-                (usize::from(literal_row.next) + last(literal_row.state_bits) as usize) % 512;
+                (usize::from(match_row.next) + last(match_row.state_bits) as usize) % LENGTH_ROWS;
+            states.literal_len = (usize::from(literal_row.next)
+                + last(literal_row.state_bits) as usize)
+                % LENGTH_ROWS;
             let used_bytes = (spare_bits as u32 ^ 63) / 8;
             spare_bits = (spare_bits | 56) - states.total_bits(tables);
             let Some(read) = later.last_mut() else { break };
@@ -371,20 +481,17 @@ fn run_while_quick_inline<const AHEAD: usize>(
             read.offset = (offset_row.base as u32).wrapping_add(last(offset_row.extra_bits) as u32);
             if AHEAD > 1 {
                 read_position = read_position.wrapping_add(read.literal_len.into());
-                let from = out
-                    .as_ptr()
-                    .wrapping_add(read_position.wrapping_sub(read.offset) as usize);
-                prefetch_read(from, Locality::L1);
-                prefetch_read(from.wrapping_add(64), Locality::L1);
+                buffers.prefetch(read_position, read.offset);
                 read_position = read_position.wrapping_add(read.match_len.into());
             }
             position = position.wrapping_sub(used_bytes);
             let refill = src.get(position as usize..position as usize + 8);
             let Some(refill) = refill.and_then(<[u8]>::as_array) else {
                 cold_path();
-                break;
+                return Err(Error::CorruptionDetected);
             };
             container = u64::from_le_bytes(*refill);
+            // Here, or the compiler moves what leads up to it behind the copies.
             if spare_bits < 0 {
                 cold_path();
                 break;
@@ -393,58 +500,9 @@ fn run_while_quick_inline<const AHEAD: usize>(
             let Some(following) = later.first_mut() else {
                 break;
             };
-            let (literal_len, literal_start) = (
-                current.literal_len.into(),
-                current.literal_position as usize,
-            );
-            following.literal_position = (literal_start + literal_len) as u32;
-            if literal_start + literal_len > literals_limit {
-                cold_path();
-                break;
-            }
-            let (start, match_len) = (current.position as usize, usize::from(current.match_len));
-            let match_start = start + literal_len;
-            following.position = (match_start + match_len) as u32;
-            if match_start + match_len > out_limit {
-                cold_path();
-                break;
-            }
-            let Some(chunk) = chunk_at::<CHUNK>(literals, literal_start) else {
+            let Some(()) = buffers.run([third, second, first], current, following) else {
                 break;
             };
-            let Some(()) = set_chunk(out, start, chunk) else {
-                break;
-            };
-            if literal_len > CHUNK {
-                cold_path();
-                let Some(()) = copy_rest(literals, literal_start, out, start, literal_len) else {
-                    break;
-                };
-            }
-
-            if current.offset as i32 <= 0 {
-                let repeats = [third, second, first];
-                let Some(offset) = repeat_offset(current.offset as i32, literal_len, repeats)
-                else {
-                    break;
-                };
-                current.offset = offset;
-            }
-            let offset = current.offset as usize;
-            let copied = match match_start.checked_sub(offset) {
-                Some(from) if offset >= CHUNK => {
-                    copy_distant_match(out, from, offset, match_start, match_len)
-                }
-                Some(from) => {
-                    cold_path();
-                    copy_close_match(out, from, offset, match_start, match_len)
-                }
-                None => {
-                    cold_path();
-                    copy_external_match(external, offset - match_start, out, match_start, match_len)
-                }
-            };
-            let Some(()) = copied else { break };
             slots = slots.get_mut(1..).unwrap_or_default();
         }
 
@@ -459,25 +517,7 @@ fn run_while_quick_inline<const AHEAD: usize>(
     reader.bits.position = position as usize;
     reader.bits.container = container;
     reader.bits.available = spare_bits + states.total_bits(tables);
-    Some(())
-}
-
-/// If all of it, and the overshoot, is in the last `distance` bytes of `external`.
-#[inline(always)]
-fn copy_external_match(
-    external: &[u8],
-    distance: usize,
-    out: &mut [u8],
-    start: usize,
-    len: usize,
-) -> Option<()> {
-    let from = external.get(external.len().checked_sub(distance)?..)?;
-    let from = from.get(..len + OVERSHOOT)?;
-    set_chunk(out, start, chunk_at::<CHUNK>(from, 0)?)?;
-    if len > CHUNK {
-        copy_rest(from, 0, out, start, len)?;
-    }
-    Some(())
+    Ok(())
 }
 
 #[inline(always)]
@@ -487,13 +527,30 @@ fn copy(from: &[u8], to: Option<&mut [u8]>) -> Result<()> {
     Ok(())
 }
 
-impl Queue {
+impl Queue<'_> {
     #[inline(always)]
-    fn rewind(&mut self) -> Option<()> {
-        let kept: [Slot; REPEATS + AHEAD_MAX] = *self.slots.get(self.start..)?.first_chunk()?;
-        *self.slots.first_chunk_mut()? = kept;
+    fn rewind(&mut self) -> Result<()> {
+        let kept = self.slots.get(self.start..).and_then(<[Slot]>::first_chunk);
+        let kept: [Slot; REPEATS + PENDING_MAX] = *kept.ok_or(Error::Internal)?;
+        *self.slots.first_chunk_mut().ok_or(Error::Internal)? = kept;
         self.start = 0;
-        Some(())
+        Ok(())
+    }
+
+    fn next(&self) -> Result<&Slot> {
+        self.slots.get(self.start + REPEATS).ok_or(Error::Internal)
+    }
+
+    /// Where the output is once all that are pending have run.
+    #[inline(always)]
+    fn end_position(&self) -> Result<u32> {
+        let pending = self
+            .slots
+            .iter()
+            .skip(self.start + REPEATS)
+            .take(self.pending);
+        let lens = pending.map(|it| u32::from(it.literal_len) + u32::from(it.match_len));
+        Ok(self.next()?.position.wrapping_add(lens.sum()))
     }
 
     /// Returns `sequence` if it does not fit in a slot.
@@ -505,6 +562,9 @@ impl Queue {
         let ((Ok(literal_len), Ok(match_len)), -2..) = (lens, sequence.offset as i32) else {
             return Ok(Some(sequence));
         };
+        if self.start >= self.batch {
+            self.rewind()?;
+        }
         let slot = self.slots.get_mut(self.start + REPEATS + self.pending);
         let slot = slot.ok_or(Error::Internal)?;
         (slot.offset, slot.literal_len, slot.match_len) = (sequence.offset, literal_len, match_len);
@@ -512,31 +572,59 @@ impl Queue {
         Ok(None)
     }
 
-    fn run_pending(
+    /// Returns whether it got to where `kept` are left before one took care.
+    #[inline(never)]
+    fn run_pending_quickly(
+        &mut self,
+        kept: usize,
+        literals: &[u8],
+        detached: &[u8],
+        out: &mut [u8],
+    ) -> bool {
+        let Some(mut buffers) = Buffers::new(literals, detached, out) else {
+            return false;
+        };
+        let mut slots = self.slots.get_mut(self.start..).unwrap_or_default();
+        let mut pending = self.pending;
+        while pending > kept
+            && let [third, second, first, current, following, ..] = slots
+            // An earlier attempt may have left an offset of 32 bits.
+            && current.offset as i32 >= -2
+            && let Some(()) = buffers.run([third, second, first], current, following)
+        {
+            slots = slots.get_mut(1..).unwrap_or_default();
+            pending -= 1;
+        }
+        self.start += self.pending - pending;
+        self.pending = pending;
+        pending <= kept
+    }
+
+    fn run_pending_carefully(
         &mut self,
         literals: &[u8],
         destination: &mut Destination<'_, '_>,
     ) -> Result<()> {
-        let slot = self
-            .slots
-            .get(self.start + REPEATS)
-            .ok_or(Error::Internal)?;
+        let slot = self.next()?;
         let sequence = Sequence {
             literal_len: slot.literal_len.into(),
             match_len: slot.match_len.into(),
             offset: slot.offset,
         };
         self.pending -= 1;
-        self.run(&sequence, literals, destination)
+        self.run_carefully(&sequence, literals, destination)
     }
 
     /// In the place of the next slot.
-    fn run(
+    fn run_carefully(
         &mut self,
         sequence: &Sequence,
         literals: &[u8],
         destination: &mut Destination<'_, '_>,
     ) -> Result<()> {
+        if self.start >= self.batch {
+            self.rewind()?;
+        }
         let slots = self
             .slots
             .get_mut(self.start..)
@@ -557,18 +645,28 @@ impl Queue {
             _ => sequence.offset,
         };
         let offset = current.offset as usize;
-        let (external, out) = destination.lend(block_len);
+        let Loan {
+            detached: [older, newer],
+            out,
+        } = destination.lend(block_len, 0)?;
+        if offset > older.len() + newer.len() + match_start {
+            return Err(Error::CorruptionDetected);
+        }
         let literals = literals.get(literal_start..literal_start + literal_len);
         copy(literals.ok_or(Error::Internal)?, out.get_mut(start..))?;
 
         let mut to = match_start;
-        if let Some(distance @ 1..) = offset.checked_sub(match_start) {
-            let from = external.len().checked_sub(distance);
-            let from = from.and_then(|from| external.get(from..));
-            let from = from.ok_or(Error::CorruptionDetected)?;
-            let from = from.get(..match_len).unwrap_or(from);
-            copy(from, out.get_mut(to..))?;
-            to += from.len();
+        for (part, len_behind) in [(older, newer.len()), (newer, 0)] {
+            if let Some(distance @ 1..) = offset.checked_sub(to + len_behind) {
+                let from = part
+                    .len()
+                    .checked_sub(distance)
+                    .and_then(|from| part.get(from..));
+                let from = from.unwrap_or_default();
+                let from = from.get(..end - to).unwrap_or(from);
+                copy(from, out.get_mut(to..))?;
+                to += from.len();
+            }
         }
         let from = to.saturating_sub(offset);
         while to < end {
@@ -582,9 +680,6 @@ impl Queue {
         following.position = end as u32;
         following.literal_position = (literal_start + literal_len) as u32;
         self.start += 1;
-        if self.start >= BATCH {
-            self.rewind().ok_or(Error::Internal)?;
-        }
         Ok(())
     }
 
@@ -594,34 +689,48 @@ impl Queue {
         literals: &[u8],
         destination: &mut Destination<'_, '_>,
     ) -> Result<()> {
-        const LOAN_MAX: usize = 32 << 10;
+        const LOAN_MAX: usize = 16 << 10;
 
+        let block_len = reader.bits.src.len();
+        // Too large for a slot. It waits for those that are pending.
+        let mut large = None;
         loop {
-            while self.pending < AHEAD && reader.left != 0 {
-                if let Some(large) = self.push(reader.next())? {
-                    while self.pending != 0 {
-                        self.run_pending(literals, destination)?;
-                    }
-                    self.run(&large, literals, destination)?;
-                }
+            reader.bits.move_to(reader.padded_start);
+            while large.is_none()
+                && reader.left != 0
+                && (self.pending < AHEAD || (self.pending < AHEAD + 2 && !reader.is_quick()))
+            {
+                large = self.push(reader.next())?;
             }
             if self.pending == 0 {
-                return Ok(());
+                let Some(large) = large.take() else {
+                    return Ok(());
+                };
+                self.run_carefully(&large, literals, destination)?;
+                continue;
             }
-            if reader.left > 1 {
-                let next = self
-                    .slots
-                    .get(self.start + REPEATS)
-                    .ok_or(Error::Internal)?;
-                let len = next.position as usize - destination.position();
-                let (external, out) =
-                    destination.lend(len + LOAN_MAX.min(len + 4 * reader.bits.src.len()));
-                run_while_quick::<AHEAD>(reader, self, literals, external, out);
-                if reader.bits.position > reader.bits.src.len() {
-                    return Err(Error::CorruptionDetected);
+            let next = self.next()?;
+            let len = next.position as usize - destination.position();
+            let len = len + usize::from(next.literal_len) + usize::from(next.match_len);
+            let Loan {
+                detached: [_, detached],
+                out,
+            } = destination.lend(len, LOAN_MAX.min(len + 4 * block_len))?;
+
+            let goes_on = large.is_none() && reader.left != 0 && out.len() >= OVERSHOOT;
+            let kept = if goes_on { AHEAD } else { 0 };
+            if self.pending > kept && !self.run_pending_quickly(kept, literals, detached, out) {
+                self.run_pending_carefully(literals, destination)?;
+            } else if goes_on {
+                with_bmi2(
+                    #[inline(always)]
+                    || read_and_run::<AHEAD>(reader, self, literals, detached, out),
+                )?;
+                if reader.left == 1 {
+                    large = self.push(reader.next())?;
+                    self.run_pending_quickly(0, literals, detached, out);
                 }
             }
-            self.run_pending(literals, destination)?;
         }
     }
 }
@@ -636,19 +745,32 @@ pub(crate) fn run_sequences(
     repeat_offsets: &mut [u32; REPEATS],
     destination: &mut Destination<'_, '_>,
 ) -> Result<(usize, usize)> {
-    let mut reader = Reader::new(tables, block, start, count)?;
+    let bits = BackwardBits::new(block, start)?;
+    let padded_start = if bits.is_padded() {
+        &[0; _]
+    } else {
+        &bits.padded_start()
+    };
+    let mut reader = Reader::new(tables, bits, padded_start, count);
+    let (mut few_slots, mut many_slots);
+    let (slots, batch): (&mut [Slot], _) = if count <= FEW_SEQUENCES {
+        few_slots = [Slot::default(); REPEATS + FEW_SEQUENCES + 1];
+        (&mut few_slots, count + 1)
+    } else {
+        many_slots = [Slot::default(); BATCH + 2 * PENDING_MAX + REPEATS];
+        (&mut many_slots, BATCH)
+    };
+    let [third, second, first, next] = slots.first_chunk_mut().ok_or(Error::Internal)?;
+    [first.offset, second.offset, third.offset] = *repeat_offsets;
+    next.position = destination.position() as u32;
     let mut queue = Queue {
-        slots: [Slot::default(); _],
+        slots,
+        batch,
         start: 0,
         pending: 0,
     };
-    let [third, second, first, next, ..] = &mut queue.slots;
-    [first.offset, second.offset, third.offset] = *repeat_offsets;
-    next.position = destination.position() as u32;
 
-    let result = if destination.history_len() > 1 << 24
-        && count > AHEAD_MAX
-        && tables.has_many_far_offsets()
+    let result = if count > BATCH && destination.reach() > 1 << 24 && tables.has_many_far_offsets()
     {
         queue.run_all::<AHEAD_MAX>(&mut reader, literals, destination)
     } else {
