@@ -210,6 +210,17 @@ impl<'a> History<'a> {
             .or_else(|| u32_at(self.older, self.older_position(index)))
     }
 
+    /// Positions wrap around for what is in the older run.
+    #[inline(always)]
+    pub(crate) fn has_at(&self, position: u32, value: u32) -> bool {
+        match u32_at(self.prefix, position) {
+            Some(found) => found == value,
+            None => {
+                u32_at(self.older, position.wrapping_add(self.older.len() as u32)) == Some(value)
+            }
+        }
+    }
+
     /// The same for when it is hard to predict which.
     #[inline(always)]
     pub(crate) fn u32_at_any_index(&self, index: u32) -> Option<u32> {
@@ -227,15 +238,15 @@ impl<'a> History<'a> {
     #[cold]
     #[inline(never)]
     fn compare_bytes(prefix: &[u8], position: u32, run: &[u8], at: u32) -> (u32, bool) {
-        let (Some(bytes), Some(run)) = (prefix.get(position as usize..), run.get(at as usize..))
-        else {
-            return (0, false);
-        };
+        let bytes = prefix.get(position as usize..).unwrap_or_default();
+        let beyond = (at as usize).saturating_sub(run.len());
+        let run = run.get(at as usize..).unwrap_or_default();
         let (len, is_below) = compare(bytes, run);
         if len != run.len() {
             return (len as u32, is_below);
         }
-        let (more, is_below) = compare(bytes.get(len..).unwrap_or_default(), prefix);
+        let from = |start: usize| prefix.get(start..).unwrap_or_default();
+        let (more, is_below) = compare(from(position as usize + len), from(beyond));
         ((len + more) as u32, is_below)
     }
 
@@ -269,6 +280,11 @@ impl<'a> History<'a> {
     #[inline(always)]
     pub(crate) fn compare(&self, position: u32, distance: u32) -> (u32, bool) {
         self.compare_in(position, self.prefix, distance)
+    }
+
+    #[inline(always)]
+    pub(crate) fn compare_older(&self, position: u32, distance: u32) -> (u32, bool) {
+        self.compare_in(position, self.older, distance)
     }
 
     #[inline(always)]

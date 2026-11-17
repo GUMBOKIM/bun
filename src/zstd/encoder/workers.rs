@@ -5,7 +5,7 @@ use std::sync::mpmc;
 use std::sync::mpsc::{self, TryRecvError};
 use std::thread::JoinHandle;
 
-use bun_zstd_decoder::array::{allocate, grow};
+use bun_zstd_decoder::array::allocate;
 use bun_zstd_decoder::format::{BLOCK_LEN_MAX, CHECKSUM_LEN, FRAME_HEADER_LEN_MAX};
 use bun_zstd_decoder::{Error, Output, Result, Status, XxHash64};
 
@@ -121,7 +121,7 @@ impl Worker {
         let [for_chunk, for_block] =
             [CHUNK_LEN, BLOCK_LEN_MAX].map(|len| worst_case_len(len.min(section.len())));
         let room = FRAME_HEADER_LEN_MAX + for_chunk + 2 * for_block + CHECKSUM_LEN;
-        grow(&mut self.out, 0, room)?;
+        vec::make_room(&mut self.out, room)?;
 
         let mut start = job.start;
         loop {
@@ -132,7 +132,7 @@ impl Worker {
                 follows_last: start != 0,
                 older: dictionary.map(Dictionary::content).unwrap_or_default(),
             };
-            let mut out = Output::slice(&mut self.out);
+            let mut out = Output::resume_ring(&mut self.out, 0, room);
             let is_last = job.is_last && end == job.input.len();
             writer.write(&input, dictionary, is_last, &mut out)?;
             let written = out.written();
@@ -193,8 +193,8 @@ pub(crate) struct Pool {
 }
 
 impl Pool {
-    /// One thread is enough to go on.
-    fn post(&mut self, job: Job, useful_threads: usize) -> Result<()> {
+    /// Starts another thread if there are fewer. One is enough to go on.
+    fn prepare(&mut self, useful_threads: usize) -> Result<&mpmc::Sender<Job>> {
         let (sender, receiver) = self.jobs.get_or_insert_with(mpmc::channel);
         if self.threads.len() < useful_threads {
             self.threads.try_reserve(1)?;
@@ -208,7 +208,7 @@ impl Pool {
         if self.threads.is_empty() {
             return Err(Error::MemoryAllocation);
         }
-        sender.send(job).map_err(|_| Error::Internal)
+        Ok(sender)
     }
 }
 
@@ -254,7 +254,9 @@ impl Workers {
         request: &Request,
         input_len: Option<u64>,
         dictionary: Option<&Shared<Dictionary>>,
+        pool: &mut Pool,
     ) -> Result<Self> {
+        pool.prepare(1)?;
         let (section_len, overlap_len) = section_and_overlap_len(&plan, request);
         let window_log = plan.tuning.window_log;
         let long_matcher = match plan.long_distance.take() {
@@ -354,8 +356,12 @@ impl Workers {
             reports,
             interest: self.interest.clone(),
         };
-        pool.post(job, self.threads_max.min(self.reports.len() + 1))?;
+        pool.prepare(1)?.send(job).map_err(|_| Error::Internal)?;
         self.reports.push_back(receiver);
+        if !is_last {
+            // It gets ready while the section fills up.
+            pool.prepare(self.threads_max.min(self.reports.len() + 1))?;
+        }
         Ok(())
     }
 

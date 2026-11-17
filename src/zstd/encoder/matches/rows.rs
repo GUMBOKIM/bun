@@ -1,5 +1,6 @@
 //! Rows of the most recent positions with about the same hash. Tags have more bits of it.
 
+use core::convert::identity;
 use core::hint::{black_box, cold_path};
 use core::ops::Range;
 
@@ -28,10 +29,13 @@ pub(super) fn fill(state: &mut MatchState, history: &History<'_>, end: u32) {
 /// The head of a row, and from there on one bit for each entry that has `tag`.
 #[inline(always)]
 fn matching<const N: usize>(tags: &[u8; N], tag: u8) -> (u32, u64) {
-    let of_chunk = |index: usize| {
-        let chunk = tags.as_chunks().0.get(index);
-        chunk.map_or(0, |chunk| u32::from(equal_bytes(chunk, &[tag; 16])))
-    };
+    let of_chunk = identity(
+        #[inline(always)]
+        |index: usize| match tags.as_chunks().0.get(index) {
+            Some(chunk) => u32::from(equal_bytes(chunk, &[tag; 16])),
+            None => 0,
+        },
+    );
     let (low, mut high) = (
         of_chunk(0) | of_chunk(1) << 16,
         of_chunk(2) | of_chunk(3) << 16,
@@ -173,15 +177,11 @@ impl<'a, const N: usize> Rows<'a, N> {
             #[inline(always)]
             move || {
                 self.prepare()?;
-                let (start, mut hashes) = (history.position(self.next_to_index), [0; CACHED]);
-                let last_cached = start.max(end.saturating_sub(CACHED as u32));
-                self.fill_cache(&history, &mut hashes, start);
-                if start < last_cached {
-                    self.insert(&history, &mut hashes, start..last_cached)?;
-                }
-                for position in last_cached..end {
-                    let hash = *hashes.at(position as usize % CACHED);
-                    self.add(hash, history.index(position))?;
+                let bytes = likely(history.prefix.get(..end as usize + WORD_LEN))?;
+                for position in history.position(self.next_to_index) as usize..end as usize {
+                    let word = bytes.get(position..position + WORD_LEN)?.as_array()?;
+                    let hash = self.hasher.hash(u64::from_le_bytes(*word)) as u32;
+                    self.add(hash, history.index(position as u32))?;
                 }
                 Some(())
             },

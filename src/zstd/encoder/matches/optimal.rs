@@ -1,6 +1,7 @@
 //! Looks for the cheapest way through all matches that there are.
 
 use core::convert::identity;
+use core::hint::black_box;
 use core::ops::RangeInclusive;
 
 use bun_zstd_decoder::Result;
@@ -506,35 +507,31 @@ impl Finder<'_> {
         let mut is_first_match = true;
 
         'block: while at < limit {
+            self.find::<REACH>(&history, at, *repeats, at != anchor, matches)?;
+            if matches.is_empty() {
+                at += 1;
+                continue;
+            }
+            if core::mem::take(&mut is_first_match) {
+                prices.derive::<IS_ACCURATE>();
+            }
             // What the literals so far cost is the same for all ways, unlike their number.
             let mut here = Stretch {
                 literal_len: at - anchor,
                 ..Stretch::default()
             };
             let mut here_repeats = *repeats;
+            ways.set(0, prices.literal_len(here.literal_len), here)?;
+            ways.end(0)?.repeats = here_repeats;
             let (mut current, mut end) = (0, 0);
 
             // The last stretch, and where it starts.
             let (last, last_start) = 'forward: loop {
-                self.find::<REACH>(
-                    &history,
-                    at + current,
-                    here_repeats,
-                    here.literal_len != 0,
-                    matches,
-                )?;
                 if let Some(&longest) = matches.last() {
-                    if current == 0 {
-                        if core::mem::take(&mut is_first_match) {
-                            prices.derive::<IS_ACCURATE>();
-                        }
-                        ways.set(0, prices.literal_len(here.literal_len), here)?;
-                        ways.end(0)?.repeats = here_repeats;
-                    }
                     let longest_end = current + longest.len;
                     if longest.len > self.sufficient_len
-                        || (current != 0
-                            && (longest_end >= HORIZON || at + longest_end >= history.end()))
+                        || ((longest_end >= HORIZON || at + longest_end >= history.end())
+                            && current != 0)
                     {
                         *repeats = ways.repeats_after(current, longest.offset)?;
                         let last = Stretch {
@@ -542,7 +539,7 @@ impl Finder<'_> {
                             match_len: longest.len,
                             literal_len: 0,
                         };
-                        break (last, current);
+                        break 'forward (last, current);
                     }
 
                     if longest_end > end {
@@ -576,13 +573,18 @@ impl Finder<'_> {
                         }
                         shortest = found.len + 1;
                     }
-                } else if current == 0 {
-                    at += 1;
-                    continue 'block;
                 }
 
                 // On to the next position that is worth a search.
-                while current < end {
+                loop {
+                    if current >= end {
+                        if here.match_len == 0 {
+                            at += end;
+                            continue 'block;
+                        }
+                        *repeats = here_repeats;
+                        break 'forward (here, end - here.match_len - here.literal_len);
+                    }
                     let with_literal = ways.price(current)?
                         + prices.literal(*likely(prefix.get((at + current) as usize))?)
                         + prices.one_more_literal(here.literal_len);
@@ -633,16 +635,12 @@ impl Finder<'_> {
                         && current != end
                         && (IS_ACCURATE || ways.price(current + 1)? > price + BIT / 2)
                     {
-                        continue 'forward;
+                        break;
                     }
                 }
-
-                if here.match_len == 0 {
-                    at += end;
-                    continue 'block;
-                }
-                *repeats = here_repeats;
-                break (here, end - here.match_len - here.literal_len);
+                // Or else the loop above keeps track of all that the search derives from it.
+                let (position, has_literals) = (black_box(at + current), here.literal_len != 0);
+                self.find::<REACH>(&history, position, here_repeats, has_literals, matches)?;
             };
 
             // Going back, each match gets the literals in front of it. They are stored in what was passed.

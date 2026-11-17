@@ -11,7 +11,7 @@ use super::{
     Attached, MatchState, Owner, Progress, Reach, SKIP_LOG, TablesMut, apart, cells, prefetch,
 };
 use crate::bytes::{AtLeast, chunk_at, likely, u32_at, u64_at, word_in};
-use crate::parameters::TAG_BITS;
+use crate::parameters::{TAG_BITS, Tuning};
 use crate::sequences::{OffsetValue, Repeats, Sequences};
 use crate::window::{History, WORD_LEN};
 
@@ -76,10 +76,18 @@ pub(super) fn search<const REACH: Reach>(
     if REACH == Reach::Attached {
         let mut progress = Progress::new(sequences, history.start, *repeats, u32::MAX);
         let progress_mut = &mut progress;
-        with_bmi2(
-            #[inline(always)]
-            move || searcher.search_with_attached(attached, progress_mut),
-        );
+        let logs = |tuning: Tuning| (tuning.hash_log, tuning.chain_log);
+        if logs(tuning) == logs(attached.tuning) {
+            with_bmi2(
+                #[inline(always)]
+                move || searcher.search_with_attached::<true>(attached, progress_mut),
+            );
+        } else {
+            with_bmi2(
+                #[inline(always)]
+                move || searcher.search_with_attached::<false>(attached, progress_mut),
+            );
+        }
         return progress.finish(repeats, u32::MAX);
     }
 
@@ -210,6 +218,7 @@ impl<'a> Searcher<'a> {
     #[inline(always)]
     fn run_on_long_input<R>(self, search: impl FnOnce(Self) -> Option<R>) -> Option<R> {
         match self.table_logs() {
+            (16, 15) => self.run_sized::<16, 15, _>(search),
             (17, 16) => self.run_sized::<17, 16, _>(search),
             (18, 18) => self.run_sized::<18, 18, _>(search),
             _ => with_bmi2(
@@ -373,41 +382,52 @@ impl<'a> Searcher<'a> {
             let (short_entry, long_entry) = (self.short_entry(word)?, self.long_entry(word)?);
             let current = history.index(at);
             let (short, long) = (short_entry.replace(current), long_entry.replace(current));
-            let back = (current + 1).wrapping_sub(progress.recent);
+            let back = (at + 1).wrapping_sub(progress.recent);
 
-            let found =
-                if history.u32_at_index(back) == Some(next_word as u32) && progress.recent != 0 {
-                    Match::repeat(at + 1, back)
-                } else if history.u64_at_any_index(long) == Some(word) && long != lowest {
-                    Match::new(at, long, 8)
-                } else if history.u32_at_any_index(short) == Some(word as u32) && short != lowest {
-                    let long = self.long_entry(next_word)?.replace(current + 1);
-                    if history.u64_at_any_index(long) == Some(next_word) && long != lowest {
-                        Match::new(at + 1, long, 8)
-                    } else {
-                        Match::new(at, short, 4)
-                    }
+            let found = if history.has_at(back, (word >> 8) as u32) && progress.recent != 0 {
+                Match::repeat(at + 1, history.index(back))
+            } else if history.u64_at_any_index(long) == Some(word) && long != lowest {
+                Match::new(at, long, 8)
+            } else if history.u32_at_any_index(short) == Some(word as u32) && short != lowest {
+                let long = self.long_entry(next_word)?.replace(current + 1);
+                if history.u64_at_any_index(long) == Some(next_word) && long != lowest {
+                    Match::new(at + 1, long, 8)
                 } else {
-                    at += ((at - progress.anchor) >> SKIP_LOG) + 1;
-                    continue;
-                };
+                    Match::new(at, short, 4)
+                }
+            } else {
+                at += ((at - progress.anchor) >> SKIP_LOG) + 1;
+                continue;
+            };
             at = self.take_match(at, found, progress)?;
         }
     }
 
+    /// If those tables have the `SAME_SIZES` as its own, they share the hashes and their checks.
     #[inline(always)]
-    fn search_with_attached(
+    fn search_with_attached<const SAME_SIZES: bool>(
         mut self,
         attached: &Attached<'_>,
         progress: &mut Progress<'_>,
     ) -> Option<Infallible> {
         let words = AtLeast::<WORD_LEN>::new(self.history.prefix)?;
         self.history.prefix = words.bytes;
-        let (history, attached) = (&self.history, *attached);
+        let (history, mut attached) = (&self.history, *attached);
+        if SAME_SIZES {
+            attached.hash = attached.hash.get(..self.long_table.len())?;
+            attached.chain = attached.chain.get(..self.short_table.len())?;
+        }
         let tuning = attached.tuning;
-        let long_hasher = Hasher::new(8, tuning.hash_log + TAG_BITS);
-        let short_hasher = Hasher::new(tuning.min_match, tuning.chain_log + TAG_BITS);
+        let long_hasher = self.long_hasher.with_bits(tuning.hash_log + TAG_BITS);
+        let short_hasher = self.short_hasher.with_bits(tuning.chain_log + TAG_BITS);
         let look_up_long = |word| Tagged::look_up(attached.hash, long_hasher.hash(word));
+        let entry = |table: &'a [Cell<u32>], own: Hasher, with_tag: Hasher, word| {
+            likely(table.get(if SAME_SIZES {
+                with_tag.hash(word) >> TAG_BITS
+            } else {
+                own.hash(word)
+            }))
+        };
         let find_long = identity(
             #[inline(always)]
             |candidate: u32, tagged: Tagged, word: u64| {
@@ -439,17 +459,16 @@ impl<'a> Searcher<'a> {
         let mut at = history.start;
         loop {
             let [word, next_word] = adjacent_words(history.prefix, at)?;
-            let (short_entry, long_entry) = (self.short_entry(word)?, self.long_entry(word)?);
+            let short_entry = entry(self.short_table, self.short_hasher, short_hasher, word)?;
+            let long_entry = entry(self.long_table, self.long_hasher, long_hasher, word)?;
             let attached_long = look_up_long(word)?;
             let attached_short = Tagged::look_up(attached.chain, short_hasher.hash(word))?;
             let current = history.index(at);
             let (short, long) = (short_entry.replace(current), long_entry.replace(current));
-            let back = (current + 1).wrapping_sub(progress.recent);
+            let back = (at + 1).wrapping_sub(progress.recent);
 
-            let found = if history.u32_at_any_index(back) == Some(next_word as u32)
-                && progress.recent != 0
-            {
-                Match::repeat(at + 1, back)
+            let found = if history.has_at(back, next_word as u32) && progress.recent != 0 {
+                Match::repeat(at + 1, history.index(back))
             } else if let Some(long) = find_long(long, attached_long, word) {
                 Match::new(at, long, 8)
             } else if let Some(short) = find_short(short, attached_short, word) {

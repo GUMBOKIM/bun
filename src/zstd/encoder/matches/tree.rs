@@ -119,25 +119,25 @@ pub(super) fn descend_attached(
     mut visit: impl FnMut(u32, u32) -> bool,
 ) -> Option<()> {
     let (nodes, _) = attached.chain.as_chunks::<2>();
-    let mask = nodes.len().wrapping_sub(1);
-    let overwritten = attached.end.saturating_sub(mask as u32).max(FIRST_INDEX);
-    let (mut smaller_common, mut larger_common) = (at, at);
+    let mask = (nodes.len() as u32).wrapping_sub(1);
+    let nodes = nodes.get(..mask as usize + 1)?;
+    let overwritten = attached.end.saturating_sub(mask).max(FIRST_INDEX);
+    let (mut smaller_common, mut larger_common, mut known) = (at, at, at);
     let mut index = *attached.hash.get(hash)?;
     for _ in 0..attempts {
         if index <= FIRST_INDEX {
             break;
         }
-        let in_history = index.wrapping_add(attached.delta);
-        let known = smaller_common.min(larger_common);
-        let (end, is_smaller) = compare::<{ Reach::Older }>(history, at, in_history, known);
-        if visit(in_history, end - at) || index <= overwritten {
+        let distance = Attached::position(index).wrapping_sub(at);
+        let (end, is_smaller) = history.compare_older(known, distance);
+        if visit(index.wrapping_add(attached.delta), end - at) || index <= overwritten {
             break;
         }
-        let &[smaller, larger] = nodes.get(index as usize & mask)?;
+        let &[smaller, larger] = nodes.get((index & mask) as usize)?;
         if is_smaller {
-            (smaller_common, index) = (end, larger);
+            (smaller_common, known, index) = (end, end.min(larger_common), larger);
         } else {
-            (larger_common, index) = (end, smaller);
+            (larger_common, known, index) = (end, end.min(smaller_common), smaller);
         }
     }
     Some(())

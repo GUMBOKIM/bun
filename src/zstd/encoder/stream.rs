@@ -311,7 +311,8 @@ impl Encoder {
         let plan = self.request.plan(tuning);
 
         if self.request.workers > 0 && input_len.is_none_or(|len| len > JOB_LEN_MIN as u64) {
-            let workers = Workers::new(plan, &self.request, input_len, self.dictionary.as_ref())?;
+            let (dictionary, pool) = (self.dictionary.as_ref(), &mut self.pool);
+            let workers = Workers::new(plan, &self.request, input_len, dictionary, pool)?;
             return Ok(Frame::Parallel(allocate(|| workers)?));
         }
         Buffered::new(plan, input_len, dictionary, self.finished.take()).map(Frame::Buffered)

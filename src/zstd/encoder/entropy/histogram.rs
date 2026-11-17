@@ -29,10 +29,16 @@ impl Histogram<256> {
 impl<const N: usize> Histogram<N> {
     #[inline]
     pub(crate) fn new(counts: [u32; N]) -> Self {
+        let (mut max_symbol, mut largest_count) = (0u32, 0);
+        // Without branches, it compiles to vector instructions.
+        for (symbol, &count) in (0..).zip(&counts) {
+            max_symbol = max_symbol.max(if count != 0 { symbol } else { 0 });
+            largest_count = largest_count.max(count);
+        }
         Self {
-            max_symbol: counts.iter().rposition(|&count| count != 0).unwrap_or(0),
-            largest_count: counts.iter().fold(0, |max, &count| count.max(max)) as usize,
             counts,
+            max_symbol: max_symbol as usize,
+            largest_count: largest_count as usize,
         }
     }
 

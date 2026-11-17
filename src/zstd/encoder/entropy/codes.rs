@@ -58,7 +58,7 @@ pub(crate) const fn first_symbol(kind: CodeKind) -> usize {
 
 fn histogram(kind: CodeKind, counts: &CodeCounts) -> Histogram {
     let by_kind = counts.as_chunks().0.get(kind as usize);
-    Histogram::new(by_kind.copied().unwrap_or([0; _]))
+    Histogram::new(*by_kind.unwrap_or(&[0; _]))
 }
 
 type Tables = fse::Tables<2048, 256>;
@@ -184,6 +184,7 @@ pub(crate) struct CodesChoice([Encoding; 3]);
 
 impl CodesChoice {
     pub(crate) const PREDEFINED: Self = Self([Encoding::Basic; 3]);
+    const REPEATED: Self = Self([Encoding::Repeat; 3]);
 
     pub(super) fn modes(self) -> u8 {
         let [literal_lengths, offsets, match_lengths] = self.0.map(|encoding| encoding as u8);
@@ -324,15 +325,18 @@ impl CodeTables {
     }
 
     fn chosen(&self, choice: CodesChoice) -> &TableSet {
-        let built = self
-            .next
-            .as_deref()
-            .filter(|_| choice != CodesChoice::PREDEFINED);
+        let built = match choice {
+            CodesChoice::PREDEFINED => None,
+            CodesChoice::REPEATED => self.current.as_deref(),
+            _ => self.next.as_deref(),
+        };
         built.unwrap_or(&PREDEFINED)
     }
 
     pub(super) fn accept(&mut self, choice: CodesChoice) {
-        core::mem::swap(&mut self.current, &mut self.next);
+        if choice != CodesChoice::REPEATED {
+            core::mem::swap(&mut self.current, &mut self.next);
+        }
         for (reuse, encoding) in self.reuse.iter_mut().zip(choice.0) {
             match encoding {
                 Encoding::Basic | Encoding::Rle => *reuse = Reuse::Never,
@@ -365,7 +369,7 @@ impl CodeTables {
             *chosen.choice.0.at_mut(kind as usize) =
                 select(alphabet, reuse, repeated_cost, histogram, total, strategy)?;
         }
-        if chosen.choice == CodesChoice::PREDEFINED {
+        if let CodesChoice::PREDEFINED | CodesChoice::REPEATED = chosen.choice {
             return Ok(chosen);
         }
 

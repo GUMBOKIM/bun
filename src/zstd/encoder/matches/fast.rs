@@ -418,11 +418,11 @@ impl<'a> Searcher<'a> {
         let words = AtLeast::<WORD_LEN>::new(self.history.prefix)?;
         self.history.prefix = words.bytes;
         let (history, bytes) = (&self.history, words.bytes);
-        let tuning = &attached.tuning;
-        let attached_hasher = Hasher::new(tuning.min_match, tuning.hash_log + TAG_BITS);
+        let attached_hasher = self.hasher.with_bits(attached.tuning.hash_log + TAG_BITS);
         let mut at = history.start;
 
         loop {
+            let recent = progress.recent;
             let mut step = self.step;
             let mut next_step = at + STEP_GROWS_AFTER;
             let mut ahead = at + step;
@@ -435,13 +435,13 @@ impl<'a> Searcher<'a> {
 
             let (found, earlier, repeats) = loop {
                 let current = history.index(at);
-                let back = (current + 1).wrapping_sub(progress.recent);
+                let back = (at + 1).wrapping_sub(recent);
                 let ahead_entry = self.entry(ahead_word)?;
                 let ahead_hash = attached_hasher.hash(ahead_word);
                 entry.set(current);
 
-                if history.u32_at_any_index(back) == Some((word >> 8) as u32) {
-                    break (at + 1, back, true);
+                if history.has_at(back, (word >> 8) as u32) {
+                    break (at + 1, history.index(back), true);
                 }
                 if let Some(index) = attached_candidate.index()
                     && u32_at(history.older, Attached::position(index)) == Some(word as u32)
