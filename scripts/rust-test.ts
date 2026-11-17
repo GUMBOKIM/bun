@@ -66,6 +66,8 @@ const crates = [
   "bun_trim",
   "bun_webp",
   "bun_wyhash",
+  "bun_zstd_decoder",
+  "bun_zstd_encoder",
 ];
 
 // Not `spawnSync`: what runs beside it writes into pipes that this process empties.
@@ -125,8 +127,8 @@ const extraArgs = process.argv.slice(2);
 const programs: Promise<TestProgram>[] = [];
 const running = new Set<ChildProcess>();
 
-// The crates `include!()` generated sources, cargo cannot resolve the workspace until the vendored path dependencies
-// exist, and the build script of bun_sema_standalone compiles zstd's decoder. Of WebKit the code generators are enough.
+// The crates `include!()` generated sources, and cargo cannot resolve the workspace until the vendored path
+// dependencies exist. Of WebKit the code generators are enough.
 await run("bun", ["install", "--frozen-lockfile"]);
 // They need nothing of what follows, which leaves most of the processors idle until cargo starts.
 if (bunUnderTest && !extraArgs.length) {
@@ -140,7 +142,7 @@ await run(
   isBuildkite ? "node" : "bun",
   [
     "scripts/build.ts",
-    ...["codegen", "clone-zstd", "clone-lolhtml", "clone-rust-argon2"].map(name => `--target=${name}`),
+    ...["codegen", "clone-lolhtml", "clone-rust-argon2"].map(name => `--target=${name}`),
   ],
   { BUN_WEBKIT_GENERATORS_ONLY: "1", ...process.env },
 );

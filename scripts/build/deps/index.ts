@@ -27,7 +27,6 @@ import { sqlite } from "./sqlite.ts";
 import { tinycc } from "./tinycc.ts";
 import { webkit } from "./webkit.ts";
 import { zlib } from "./zlib.ts";
-import { zstd } from "./zstd.ts";
 
 /**
  * All deps in dependency-resolution + link order.
@@ -41,7 +40,6 @@ export const allDeps: readonly Dependency[] = [
   nodejsHeaders,
 
   zlib,
-  zstd,
   brotli,
   libdeflate,
   cares,
@@ -81,5 +79,4 @@ export {
   tinycc,
   webkit,
   zlib,
-  zstd,
 };

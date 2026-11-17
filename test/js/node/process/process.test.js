@@ -775,7 +775,6 @@ it("process.versions", async () => {
     lolhtml: "lolhtml",
     ares: "cares",
     libdeflate: "libdeflate",
-    zstd: "zstd",
   };
 
   const expectedVersions = {};

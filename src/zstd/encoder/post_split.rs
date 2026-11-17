@@ -1,0 +1,171 @@
+//! Splits a block where tables of their own make both parts smaller.
+
+use core::ops::Range;
+
+use bun_zstd_decoder::format::{BLOCK_HEADER_LEN, LONG_SEQUENCE_COUNT, MIN_MATCH};
+use bun_zstd_decoder::{Error, Result};
+
+use crate::block::{BlockWriter, Content};
+use crate::entropy::LiteralsPlan;
+use crate::parameters::Tuning;
+use crate::sequences::{OffsetValue, Repeats, Sequence, Sequences, count_codes};
+
+const SPLITS_MAX: usize = 196;
+const SEQUENCES_MIN: usize = 300;
+
+pub(crate) fn literals_len(sequences: &[Sequence]) -> usize {
+    sequences.iter().map(|it| it.literal_len() as usize).sum()
+}
+
+pub(crate) fn matches_len(sequences: &[Sequence]) -> usize {
+    let lens = sequences.iter().map(|it| it.match_base() + MIN_MATCH);
+    lens.sum::<u32>() as usize
+}
+
+#[derive(Clone)]
+struct Part {
+    sequences: Range<usize>,
+    literals: Range<usize>,
+}
+
+struct Splitter<'a> {
+    writer: &'a mut BlockWriter,
+    all: &'a Sequences,
+    tuning: &'a Tuning,
+    /// The sequences that start a part, but for the first one.
+    splits: [u16; SPLITS_MAX],
+    count: usize,
+}
+
+impl Splitter<'_> {
+    fn estimated_len(&mut self, part: &Part) -> Option<usize> {
+        let literals = self.all.literals().get(part.literals.clone())?;
+        let sequences = self.all.list.get(part.sequences.clone())?;
+        let counts = count_codes(sequences);
+        let entropy = &mut self.writer.entropy;
+        let literals_plan = entropy.literals.plan(literals, self.tuning)?;
+        let codes_plan = entropy
+            .codes
+            .plan(sequences, &counts, self.tuning.strategy)
+            .ok()?;
+        let count = part.sequences.len();
+        let headers_len = BLOCK_HEADER_LEN
+            + 2
+            + usize::from(count >= 128)
+            + usize::from(count >= LONG_SEQUENCE_COUNT);
+        let overhead = LiteralsPlan::overhead(literals.len());
+        Some(
+            headers_len
+                + literals_plan.estimated_len(literals.len(), overhead)
+                + entropy.codes.estimated_len(&codes_plan, &counts),
+        )
+    }
+
+    /// `len` is the estimate for `whole`.
+    fn split(&mut self, whole: &Part, len: usize) -> Option<()> {
+        if whole.sequences.len() < SEQUENCES_MIN || self.count == SPLITS_MAX {
+            return None;
+        }
+        let middle = whole.sequences.start.midpoint(whole.sequences.end);
+        let first = whole.sequences.start..middle;
+        let literals_middle =
+            whole.literals.start + literals_len(self.all.list.get(first.clone())?);
+        let first = Part {
+            sequences: first,
+            literals: whole.literals.start..literals_middle,
+        };
+        let second = Part {
+            sequences: middle..whole.sequences.end,
+            literals: literals_middle..whole.literals.end,
+        };
+        let (first_len, second_len) = (self.estimated_len(&first)?, self.estimated_len(&second)?);
+        if first_len + second_len < len {
+            self.split(&first, first_len);
+            *self.splits.get_mut(self.count)? = middle as u16;
+            self.count += 1;
+            self.split(&second, second_len);
+        }
+        Some(())
+    }
+}
+
+/// A part that ends up uncompressed leaves the recent offsets of a decoder as they are, unlike those that the search
+/// counted on.
+fn replace_lost_repeats(sequences: &mut [Sequence], decoder: &mut Repeats, search: &mut Repeats) {
+    for sequence in sequences {
+        let (found, has_literals) = (sequence.offset(), sequence.literal_len() != 0);
+        let offset = search.resolve(found, has_literals);
+        if decoder.resolve(found, has_literals) != offset {
+            sequence.set_offset(OffsetValue::new(offset));
+        }
+        *decoder = decoder.after(sequence.offset(), has_literals);
+        *search = search.after(found, has_literals);
+    }
+}
+
+/// `repeats` are the recent offsets after `all`.
+pub(crate) fn write(
+    writer: &mut BlockWriter,
+    mut bytes: &[u8],
+    all: &mut Sequences,
+    repeats: Repeats,
+    tuning: &Tuning,
+    is_last: bool,
+    out: &mut [u8],
+) -> Result<usize> {
+    let whole = Part {
+        sequences: 0..all.list.len(),
+        literals: 0..all.literals().len(),
+    };
+    let mut splitter = Splitter {
+        writer,
+        all,
+        tuning,
+        splits: [0; SPLITS_MAX],
+        count: 0,
+    };
+    if whole.sequences.len() >= SEQUENCES_MIN
+        && let Some(len) = splitter.estimated_len(&whole)
+    {
+        splitter.split(&whole, len);
+    }
+    let Splitter { splits, count, .. } = splitter;
+    if count == 0 {
+        let content = Content {
+            bytes,
+            sequences: &all.list,
+            literals: all.literals(),
+            counts: &all.counts,
+            repeats,
+        };
+        return writer.write(&content, tuning, is_last, out);
+    }
+
+    let mut search_repeats = writer.repeats;
+    let (list, mut literals) = all.split_mut();
+    let (mut start, mut written) = (0, 0);
+    let ends = splits.into_iter().take(count).map(usize::from);
+    for end in ends.chain([whole.sequences.end]) {
+        let is_last_part = end == whole.sequences.end;
+        let sequences = list.get_mut(start..end).ok_or(Error::Internal)?;
+        let (literals_len, len) = if is_last_part {
+            (literals.len(), bytes.len())
+        } else {
+            let literals_len = literals_len(sequences);
+            (literals_len, literals_len + matches_len(sequences))
+        };
+        let mut repeats = writer.repeats;
+        replace_lost_repeats(sequences, &mut repeats, &mut search_repeats);
+        let content = Content {
+            bytes: bytes.split_off(..len).ok_or(Error::Internal)?,
+            sequences,
+            literals: literals.split_off(..literals_len).ok_or(Error::Internal)?,
+            counts: &count_codes(sequences),
+            repeats,
+        };
+        let out = out.get_mut(written..).ok_or(Error::Internal)?;
+        written += writer.write(&content, tuning, is_last && is_last_part, out)?;
+        start = end;
+    }
+    Ok(written)
+}
