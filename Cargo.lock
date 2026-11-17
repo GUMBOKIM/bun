@@ -2267,6 +2267,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "bun_zstd_decoder"
+version = "0.0.0"
+
+[[package]]
 name = "byteorder"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

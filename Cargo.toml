@@ -128,6 +128,7 @@ members = [
   "src/uws_sys",
   "src/lsquic_sys",
   "src/zstd",
+  "src/zstd/decoder",
   "src/options_types",
   "src/output",
   "src/runtime",
@@ -507,6 +508,7 @@ bun_tcc_sys = { path = "src/tcc_sys" }
 bun_uws_sys = { path = "src/uws_sys" }
 bun_lsquic_sys = { path = "src/lsquic_sys" }
 bun_zstd = { path = "src/zstd" }
+bun_zstd_decoder = { path = "src/zstd/decoder" }
 bun_options_types = { path = "src/options_types" }
 bun_bunfig = { path = "src/bunfig" }
 bun_output = { path = "src/output" }
@@ -522,6 +524,11 @@ opt-level = 3
 opt-level = 3
 
 [profile.dev.package.bun_webp]
+opt-level = 3
+
+[profile.dev.package.bun_zstd]
+opt-level = 3
+[profile.dev.package.bun_zstd_decoder]
 opt-level = 3
 
 # Runs for every line of a response head and every chunk of a body.

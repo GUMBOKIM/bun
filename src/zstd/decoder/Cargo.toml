@@ -1,0 +1,13 @@
+[package]
+name = "bun_zstd_decoder"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+path = "lib.rs"
+
+[lints]
+workspace = true
+
+# None: JavaScriptCore's test programs link this crate without the rest of Bun.
+[dependencies]
