@@ -146,10 +146,7 @@ if (bunUnderTest && !extraArgs.length) {
 await run(
   // A CI machine runs the build with the node of its image, and the build checks the version of what runs it.
   isBuildkite ? "node" : "bun",
-  [
-    "scripts/build.ts",
-    ...["codegen", "clone-lolhtml", "clone-rust-argon2"].map(name => `--target=${name}`),
-  ],
+  ["scripts/build.ts", ...["codegen", "clone-lolhtml", "clone-rust-argon2"].map(name => `--target=${name}`)],
   { BUN_WEBKIT_GENERATORS_ONLY: "1", ...process.env },
 );
 
