@@ -14,7 +14,7 @@ impl Histogram<256> {
     pub(crate) fn of(symbols: &[u8]) -> Self {
         Self::new(match symbols.len() {
             ..1500 => {
-                let mut counts = [0; 256];
+                let mut counts = [0; _];
                 add(&mut counts, symbols);
                 counts
             }
@@ -50,22 +50,29 @@ pub(crate) fn add(counts: &mut [u32; 256], symbols: &[u8]) {
 /// With several tables, a symbol that repeats does not wait for its last count to be stored.
 #[inline(never)]
 fn count_interleaved<const SETS: usize>(symbols: &[u8]) -> [u32; 256] {
-    let mut sets = [[[0u32; 256]; 4]; SETS];
+    // Padded, as processors mistake addresses that are 4 KB apart for the same.
+    let mut sets = [[[0u32; 256 + 16]; 4]; SETS];
     let (stripes, rest) = symbols.as_chunks::<16>();
+    let mut loaded = 0;
     for stripe in stripes {
         for (index, word) in stripe.as_chunks().0.iter().enumerate() {
-            let word = u32::from_le_bytes(*word);
+            let word = core::mem::replace(&mut loaded, u32::from_le_bytes(*word));
+            // Keeps the load ahead of the stores.
+            core::hint::black_box(());
             for (byte, table) in sets.at_mut(index % SETS).iter_mut().enumerate() {
                 *table.at_mut(usize::from((word >> (8 * byte)) as u8)) += 1;
             }
         }
     }
-    let mut counts = [0; 256];
+    let mut counts = [0; _];
+    add(&mut counts, &loaded.to_le_bytes());
     add(&mut counts, rest);
     for table in sets.as_flattened() {
         for (count, more) in counts.iter_mut().zip(table) {
             *count += more;
         }
     }
+    // What `loaded` started with.
+    *counts.at_mut(0) -= 4;
     counts
 }

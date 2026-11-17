@@ -6,7 +6,7 @@ use bun_zstd_decoder::format::{
 
 use crate::array::At;
 use crate::bytes::highest_bit;
-use crate::entropy::{CodeKind, Entropy, Reuse, histogram};
+use crate::entropy::{CodeKind, Entropy, histogram};
 use crate::sequences::{LengthCode, OffsetValue};
 
 const ACCURACY_LOG: u32 = 8;
@@ -123,14 +123,15 @@ impl Prices {
         self.literal_lengths.sum = 0;
     }
 
-    fn set_counts(&mut self, block: &[u8], entropy: &Entropy) {
+    /// There are no prices until they are [`derive`](Self::derive)d.
+    pub(super) fn start_block(&mut self, block: &[u8], entropy: &Entropy) {
         if !self.is_empty() {
             self.literals.scale_down(12);
             self.literal_lengths.scale_down(11);
             self.match_lengths.scale_down(11);
             self.offsets.scale_down(11);
-        } else if entropy.literals.reuse == Reuse::Always {
-            let (literals, codes) = (entropy.literals.current(), &entropy.codes);
+        } else if let Some(literals) = entropy.literals.complete() {
+            let codes = &entropy.codes;
             self.literals.set_from_bits(11, |it| literals.code_len(it));
             self.literal_lengths
                 .set_from_bits(10, |it| codes.max_bits(CodeKind::LiteralLength, it));
@@ -152,8 +153,8 @@ impl Prices {
         }
     }
 
-    pub(super) fn start_block<const IS_ACCURATE: bool>(&mut self, block: &[u8], entropy: &Entropy) {
-        self.set_counts(block, entropy);
+    #[inline(never)]
+    pub(super) fn derive<const IS_ACCURATE: bool>(&mut self) {
         self.literals.update_logs::<IS_ACCURATE>();
         self.literal_lengths.update_logs::<IS_ACCURATE>();
         self.match_lengths.update_logs::<IS_ACCURATE>();

@@ -48,9 +48,9 @@ impl Entropy {
         self.codes.accept(CodesChoice::PREDEFINED);
     }
 
-    pub(crate) fn copy_from(&mut self, other: &Self) {
-        self.literals.copy_from(&other.literals);
-        self.codes.copy_from(&other.codes);
+    pub(crate) fn copy_from(&mut self, other: &Self) -> Result<()> {
+        self.literals.copy_from(&other.literals)?;
+        self.codes.copy_from(&other.codes)
     }
 
     pub(crate) fn accept(&mut self, changes: Changes) {
@@ -69,13 +69,10 @@ impl Entropy {
         tuning: &Tuning,
         out: &mut [u8],
     ) -> Result<Option<(usize, Changes)>> {
-        let len = content.bytes.len();
+        let worth_it_below = tuning.strategy.worth_it_below(content.bytes.len());
         match self.write_sections(content, tuning, out) {
             Err(Error::DstSizeTooSmall) => Ok(None),
-            result => {
-                let worth_it_below = len.wrapping_sub(tuning.strategy.min_gain(len));
-                Ok(result?.filter(|&(written, _)| written < worth_it_below))
-            }
+            result => Ok(result?.filter(|&(written, _)| written < worth_it_below)),
         }
     }
 
@@ -91,7 +88,8 @@ impl Entropy {
         out: &mut [u8],
     ) -> Result<Option<(usize, Changes)>> {
         let literals_per_sequence = literals.len().checked_div(sequences.len());
-        let has_few_matches = literals_per_sequence.is_none_or(|ratio| ratio >= 20);
+        // Blocks without any only get here if they do not look random.
+        let has_few_matches = literals_per_sequence.is_some_and(|ratio| ratio >= 20);
         let (mut written, encoding) =
             self.literals
                 .compress(literals, tuning, has_few_matches, out)?;
@@ -112,7 +110,7 @@ impl Entropy {
         let chosen = self.codes.choose(sequences, counts, tuning.strategy, out)?;
         *modes = chosen.choice.modes();
         let out = out.get_mut(chosen.len..).ok_or(Error::Internal)?;
-        let stream_len = self.codes.encode(sequences, out)?;
+        let stream_len = self.codes.encode(chosen.choice, sequences, out)?;
         if chosen.trips_old_decoders(stream_len) {
             return Ok(None);
         }

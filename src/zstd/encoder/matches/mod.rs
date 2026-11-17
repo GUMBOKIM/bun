@@ -8,6 +8,7 @@ mod hash;
 mod lazy;
 mod lazy_tree;
 pub(crate) mod long_distance;
+mod near;
 mod optimal;
 mod prices;
 mod rows;
@@ -29,6 +30,8 @@ use long_distance::Candidates;
 
 /// The more bytes in a row do not match, the more are skipped.
 const SKIP_LOG: u32 = 8;
+/// Of so many positions, the fast strategies index at least one in what they did not search.
+const FILL_STEP: usize = 3;
 const WORD: u32 = WORD_LEN as u32;
 
 /// What there is to search besides the prefix.
@@ -55,13 +58,13 @@ impl Memory {
         (len * size_of::<T>()).div_ceil(size_of::<CacheLine>())
     }
 
-    /// What is added is 0.
-    fn grow<T>(&mut self, len: usize, may_stay_unused: bool) -> Result<()> {
-        let lines = Self::lines_for::<T>(len);
-        if may_stay_unused && self.0.len() < lines {
-            self.0 = vec::zeroed(lines)?;
+    /// Starts from 0 if it is too small.
+    fn make_room<T>(&mut self, len: usize) -> Result<()> {
+        if self.0.len() < Self::lines_for::<T>(len) {
+            self.0 = Vec::new();
+            self.0 = vec::zeroed(Self::lines_for::<T>(len))?;
         }
-        vec::grow(&mut self.0, CacheLine([0; _]), lines)
+        Ok(())
     }
 
     fn get<T: Pod>(&self) -> &[T] {
@@ -262,18 +265,20 @@ pub(crate) struct Search<'a> {
     pub(crate) long_matches: Option<&'a Candidates>,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(ConstParamTy, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Owner {
     Frame,
     Dictionary,
 }
 
-pub(crate) struct Usage {
-    pub(crate) owner: Owner,
-    /// Of what is going to be loaded.
-    pub(crate) preceding_len: usize,
-    /// Whether the input may leave most of the tables unused.
-    pub(crate) may_be_short: bool,
+impl Owner {
+    /// In the tables of the fast strategies.
+    fn tag_bits(self) -> u32 {
+        match self {
+            Self::Frame => 0,
+            Self::Dictionary => TAG_BITS,
+        }
+    }
 }
 
 pub(crate) struct MatchState {
@@ -302,10 +307,16 @@ impl MatchState {
         }
     }
 
-    /// What the tables hold stays, out of reach.
-    pub(crate) fn reset(&mut self, tuning: Tuning, uses_rows: bool, usage: &Usage) -> Result<()> {
+    /// What the tables hold stays, out of reach. `loaded_len` bytes are going to be [`load`](Self::load)ed.
+    pub(crate) fn reset(
+        &mut self,
+        tuning: Tuning,
+        uses_rows: bool,
+        owner: Owner,
+        loaded_len: usize,
+    ) -> Result<()> {
         // Clearing the tables is faster than lowering their indices.
-        if self.window.would_overflow(usage.preceding_len + (16 << 20)) {
+        if self.window.would_overflow(loaded_len + (16 << 20)) {
             self.tables.indices.0.clear();
             self.window.next = FIRST_INDEX;
         }
@@ -314,7 +325,7 @@ impl MatchState {
         self.dictionary_end = 0;
         self.next_to_index = self.window.next;
 
-        let is_optimal = usage.owner == Owner::Frame && tuning.strategy >= Strategy::Optimal;
+        let is_optimal = owner == Owner::Frame && tuning.strategy >= Strategy::Optimal;
         let has_chain = tuning.strategy != Strategy::Fast && !uses_rows;
         let has_hash3 = is_optimal && tuning.min_match == 3;
         let tables = &mut self.tables;
@@ -322,13 +333,8 @@ impl MatchState {
         tables.chain_len = usize::from(has_chain) << tuning.chain_log;
         tables.hash3_len = usize::from(has_hash3) << tuning.window_log.min(17);
         tables.tags_len = usize::from(uses_rows) << tuning.hash_log;
-        let indices_len = tables.indices_len();
-        tables
-            .indices
-            .grow::<u32>(indices_len, usage.may_be_short)?;
-        tables
-            .tags
-            .grow::<u8>(tables.tags_len, usage.may_be_short)?;
+        tables.indices.make_room::<u32>(tables.indices_len())?;
+        tables.tags.make_room::<u8>(tables.tags_len)?;
 
         match &mut self.optimal {
             Some(optimal) => optimal.forget(),
@@ -373,10 +379,9 @@ impl MatchState {
         self.dictionary_end = self.window.next;
     }
 
-    /// The end of `content` that the tables of `owner` can tell apart.
-    pub(crate) fn loadable<'a>(&self, content: &'a [u8], owner: Owner) -> &'a [u8] {
-        let has_tags = owner == Owner::Dictionary && self.tuning.strategy <= Strategy::DoubleFast;
-        let end_max = if has_tags {
+    /// The end of `content` that the tables of a dictionary can tell apart.
+    pub(crate) fn loadable<'a>(&self, content: &'a [u8]) -> &'a [u8] {
+        let end_max = if self.tuning.strategy <= Strategy::DoubleFast {
             1 << (32 - TAG_BITS)
         } else {
             INDEX_MAX
@@ -387,8 +392,8 @@ impl MatchState {
         content.get(excess..).unwrap_or_default()
     }
 
-    /// Indexes [`loadable`](Self::loadable) content, which nothing precedes.
-    pub(crate) fn load(&mut self, content: &[u8], owner: Owner) {
+    /// Indexes `content`, which nothing precedes.
+    pub(crate) fn load<const OWNER: Owner>(&mut self, content: &[u8]) {
         let tuning = self.tuning;
         let worth_log = (tuning.hash_log + 3).max(tuning.chain_log + 1).min(31);
         let start = content.len().saturating_sub(1 << worth_log);
@@ -398,7 +403,7 @@ impl MatchState {
         let end = history.index(history.end());
         self.window.next = end;
         self.next_to_index = history.index(start as u32);
-        if owner == Owner::Dictionary {
+        if OWNER == Owner::Dictionary {
             self.dictionary_end = end;
         }
         if content.len() - start <= WORD_LEN {
@@ -407,8 +412,8 @@ impl MatchState {
 
         let last = history.end() - WORD;
         match tuning.strategy {
-            Strategy::Fast => fast::fill(self, &history, owner),
-            Strategy::DoubleFast => double_fast::fill(self, &history, owner),
+            Strategy::Fast => fast::fill::<OWNER>(self, &history),
+            Strategy::DoubleFast => double_fast::fill::<OWNER>(self, &history),
             _ if self.uses_rows => rows::fill(self, &history, last),
             Strategy::Greedy | Strategy::Lazy | Strategy::Lazy2 => {
                 chain::fill(self, &history, last);
@@ -496,8 +501,8 @@ impl MatchState {
         self.skip_indexing(history.index(end), 1024);
         let history = history.part(end, end);
         match self.tuning.strategy {
-            Strategy::Fast => fast::fill(self, &history, Owner::Frame),
-            Strategy::DoubleFast => double_fast::fill(self, &history, Owner::Frame),
+            Strategy::Fast => fast::fill::<{ Owner::Frame }>(self, &history),
+            Strategy::DoubleFast => double_fast::fill::<{ Owner::Frame }>(self, &history),
             _ => {}
         }
     }

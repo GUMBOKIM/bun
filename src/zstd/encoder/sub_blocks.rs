@@ -7,8 +7,7 @@ use crate::block::{self, BlockWriter, Content};
 use crate::bytes::is_one_byte_repeated;
 use crate::entropy::{Changes, CodesPlan, LiteralsPlan};
 use crate::parameters::Tuning;
-use crate::post_split::{literals_len, matches_len};
-use crate::sequences::Sequence;
+use crate::sequences::{Sequence, literals_len, matches_len};
 use crate::worst_case_len;
 
 /// Costs are in 1/256 of a byte.
@@ -103,7 +102,7 @@ fn try_write(
     out: &mut Output<'_>,
 ) -> Result<bool> {
     let written_before = out.written();
-    let Some(literals_plan) = writer.entropy.literals.plan(content.literals, tuning) else {
+    let Some(literals_plan) = writer.entropy.literals.plan(content.literals, tuning)? else {
         return Ok(false);
     };
     let codes_plan =
@@ -178,7 +177,7 @@ fn try_write(
     }
 
     let (len, written) = (content.bytes.len(), blocks.out.written() - written_before);
-    if written >= len.wrapping_sub(tuning.strategy.min_gain(len)) + BLOCK_HEADER_LEN {
+    if written >= tuning.strategy.worth_it_below(len) + BLOCK_HEADER_LEN {
         return Ok(false);
     }
     let changes = Changes {
@@ -204,16 +203,14 @@ pub(crate) fn write(
         && content.literals.len() < 10
         && is_one_byte_repeated(content.bytes)
     {
-        block::write_repeated(content.bytes, is_last, out)?;
+        block::write_repeated(content.bytes, is_last, out)
     } else {
         match try_write(writer, content, tuning, target_len, is_last, out) {
             Ok(false) | Err(Error::DstSizeTooSmall) => {
                 out.rewind(written_before);
-                block::write_raw(content.bytes, is_last, out)?;
+                block::write_raw(content.bytes, is_last, out)
             }
-            result => drop(result?),
+            result => result.map(drop),
         }
     }
-    writer.distrust_offset_table();
-    Ok(())
 }

@@ -5,21 +5,17 @@ use core::convert::Infallible;
 
 use bun_zstd_decoder::with_bmi2;
 
-use super::fast::{FILL_STEP, Near, look_up_tagged, tagged};
-use super::hash::Hasher;
-use super::{Attached, MatchState, Owner, Progress, Reach, SKIP_LOG, cells, prefetch};
+use super::hash::{Hasher, look_up_tagged, tagged};
+use super::near::Near;
+use super::{Attached, FILL_STEP, MatchState, Owner, Progress, Reach, SKIP_LOG, cells, prefetch};
 use crate::bytes::{AtLeast, chunk_at, likely, u32_at, u64_at, word_in};
 use crate::parameters::TAG_BITS;
 use crate::sequences::{OffsetValue, Repeats, Sequences};
 use crate::window::{FIRST_INDEX, History, WORD_LEN};
 
 /// Indexes the history up to its end.
-pub(super) fn fill(state: &mut MatchState, history: &History<'_>, owner: Owner) {
-    let tag_bits = if owner == Owner::Dictionary {
-        TAG_BITS
-    } else {
-        0
-    };
+pub(super) fn fill<const OWNER: Owner>(state: &mut MatchState, history: &History<'_>) {
+    let tag_bits = OWNER.tag_bits();
     let long_hasher = Hasher::new(8, state.tuning.hash_log + tag_bits);
     let short_hasher = Hasher::new(state.tuning.min_match, state.tuning.chain_log + tag_bits);
     let mut position = history.position(state.next_to_index);
@@ -35,7 +31,7 @@ pub(super) fn fill(state: &mut MatchState, history: &History<'_>, owner: Owner) 
             ) else {
                 return;
             };
-            if owner == Owner::Frame {
+            if OWNER == Owner::Frame {
                 (*long, *short) = (index, index);
                 break;
             }
@@ -58,7 +54,6 @@ pub(super) fn search<const REACH: Reach>(
     repeats: &mut Repeats,
 ) -> u32 {
     let (tuning, bounds) = (state.tuning, state.bounds());
-    let end = history.index(history.end());
     let tables = state.tables.split_mut();
     let mut searcher = Searcher {
         history: *history,
@@ -70,11 +65,15 @@ pub(super) fn search<const REACH: Reach>(
 
     if REACH == Reach::Attached {
         let mut progress = Progress::new(sequences, history.start, *repeats, u32::MAX);
-        searcher.search_with_attached(attached, &mut progress);
+        let progress_mut = &mut progress;
+        with_bmi2(
+            #[inline(always)]
+            move || searcher.search_with_attached(attached, progress_mut),
+        );
         return progress.finish(repeats, u32::MAX);
     }
 
-    let lowest = bounds.lowest(end);
+    let lowest = bounds.lowest(history.index(history.end()));
     if REACH == Reach::Older && lowest < history.prefix_index {
         searcher.history = history.from_older(lowest);
         let mut progress = Progress::new(sequences, history.start, *repeats, u32::MAX);
@@ -86,13 +85,9 @@ pub(super) fn search<const REACH: Reach>(
         return progress.finish(repeats, u32::MAX);
     }
 
-    let near = Near::new(history, bounds.lowest_in_prefix(end));
-    let first = near.history.index(near.history.start);
-    let max_offset = first - bounds.lowest_in_prefix(first);
-    let anchor = history.start - near.start;
-    let mut progress = Progress::new(sequences, anchor, *repeats, max_offset);
-    searcher.search_prefix(&near, &mut progress);
-    near.start + progress.finish(repeats, max_offset)
+    Near::search(history, bounds, sequences, repeats, |near, progress| {
+        searcher.search_prefix(near, progress)
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -360,6 +355,7 @@ impl<'a> Searcher<'a> {
         }
     }
 
+    #[inline(always)]
     fn search_with_attached(
         mut self,
         attached: &Attached<'_>,
@@ -370,7 +366,8 @@ impl<'a> Searcher<'a> {
         let tuning = &attached.tuning;
         let long_hasher = Hasher::new(8, tuning.hash_log + TAG_BITS);
         let short_hasher = Hasher::new(tuning.min_match, tuning.chain_log + TAG_BITS);
-        let find_long = |candidate: u32, word: u64| {
+        let find_long = #[inline(always)]
+        |candidate: u32, word: u64| {
             if u64_at(history.prefix, history.position(candidate)) == Some(word) {
                 return Some(candidate);
             }
@@ -378,7 +375,8 @@ impl<'a> Searcher<'a> {
             (index > FIRST_INDEX && u64_at(history.older, Attached::position(index)) == Some(word))
                 .then(|| index.wrapping_add(attached.delta))
         };
-        let find_short = |candidate: u32, word: u64| {
+        let find_short = #[inline(always)]
+        |candidate: u32, word: u64| {
             let (run, at, index) = if candidate > history.prefix_index {
                 (history.prefix, history.position(candidate), candidate)
             } else {

@@ -352,7 +352,7 @@ impl Table {
         self.assign_codes();
     }
 
-    fn set_limited_lens(&mut self, mut tree: Tree, limit: u32, symbol_count: usize) {
+    fn set_limited_lens(&mut self, tree: &mut Tree, limit: u32, symbol_count: usize) {
         let log = limit_code_len(&mut tree.leaves, tree.last_leaf, limit);
         let leaves = tree.leaves.iter().skip(FIRST_LEAF).take(tree.last_leaf);
         self.set_lens(leaves.map(|it| (it.symbol, it.bits)), log, symbol_count);
@@ -360,13 +360,13 @@ impl Table {
 
     /// For `len` symbols. `counts` end with one that occurs, and have another one.
     pub(super) fn build(&mut self, counts: &[u32], len: usize, tries_limits: bool) {
-        let tree = Tree::new(counts);
+        let mut tree = Tree::new(counts);
         let limit = if tries_limits {
             self.best_limit(&tree, counts)
         } else {
             fse::table_log_for(CODE_LEN_MAX, len, counts.len().saturating_sub(1), 1)
         };
-        self.set_limited_lens(tree, limit, counts.len());
+        self.set_limited_lens(&mut tree, limit, counts.len());
         self.assign_codes();
     }
 
@@ -374,7 +374,7 @@ impl Table {
         let shortest = highest_bit(tree.last_leaf as u32) + 1;
         let (mut best, mut best_len) = (CODE_LEN_MAX, usize::MAX - 1);
         for limit in shortest..=CODE_LEN_MAX {
-            self.set_limited_lens(Tree { ..*tree }, limit, counts.len());
+            self.set_limited_lens(&mut Tree { ..*tree }, limit, counts.len());
             if self.log < limit && limit > shortest {
                 break;
             }

@@ -240,6 +240,15 @@ impl Sequence {
     }
 }
 
+pub(crate) fn literals_len(sequences: &[Sequence]) -> usize {
+    sequences.iter().map(|it| it.literal_len() as usize).sum()
+}
+
+pub(crate) fn matches_len(sequences: &[Sequence]) -> usize {
+    let lens = sequences.iter().map(|it| it.match_base() + MIN_MATCH);
+    lens.sum::<u32>() as usize
+}
+
 /// How often each symbol occurs.
 pub(crate) type CodeCounts = [u32; 256];
 
@@ -319,14 +328,15 @@ impl Sequences {
         debug_assert!(pushed.is_ok());
     }
 
+    /// Before they are finished, if there are so few matches in `block` that it is quick to tell.
+    pub(crate) fn literal_count(&self, block: &[u8]) -> Option<usize> {
+        let lens = (self.list.iter()).map(|it| (it.extra >> 32) as usize + MIN_MATCH as usize);
+        (self.list.len() <= block.len() / 64).then(|| block.len().saturating_sub(lens.sum()))
+    }
+
     /// `block` is what was searched, and `end` where the last match ends.
     pub(crate) fn finish(&mut self, block: &[u8], end: u32) -> Result<()> {
-        let mut room = block.len();
-        // Where adding up is faster than making room for all.
-        if self.list.len() < room / 64 {
-            let lens = self.list.iter().map(|it| (it.extra >> 32) as usize);
-            room = room.saturating_sub(lens.sum());
-        }
+        let room = self.literal_count(block).unwrap_or(block.len());
         vec::grow(&mut self.literals, 0, room + OVERCOPY)?;
         let (list, literals) = (self.list.as_mut_slice(), self.literals.as_mut_slice());
         let counts = &mut self.counts;

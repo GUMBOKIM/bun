@@ -50,14 +50,14 @@ impl Strategy {
         (Self::Greedy..=Self::Lazy2).contains(&self)
     }
 
-    /// What compressing `len` bytes has to save to be worth it.
-    pub(crate) fn min_gain(self, len: usize) -> usize {
+    /// How small `len` bytes have to get.
+    pub(crate) fn worth_it_below(self, len: usize) -> usize {
         let log = if self >= Self::Ultra {
             self as u32 - 1
         } else {
             6
         };
-        (len >> log) + 2
+        len.saturating_sub((len >> log) + 2)
     }
 }
 

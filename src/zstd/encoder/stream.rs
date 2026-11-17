@@ -1,3 +1,5 @@
+//! Compression of input that comes in pieces, into output that is taken in pieces.
+
 use core::ops::Range;
 
 use bun_zstd_decoder::{Error, Output, Result, Status};
@@ -84,14 +86,10 @@ impl Buffered {
         dictionary: Option<&Dictionary>,
         earlier: Option<Box<Self>>,
     ) -> Result<Box<Self>> {
-        let start = Start::Frame(dictionary);
         let mut frame = match earlier {
-            Some(mut frame) => {
-                frame.writer.restart(plan, input_len, start)?;
-                frame
-            }
+            Some(frame) => frame,
             None => vec::boxed(Self {
-                writer: FrameWriter::new(plan, input_len, start)?,
+                writer: FrameWriter::new(plan),
                 buffer: Vec::new(),
                 capacity: 0,
                 older: Older::InDictionary,
@@ -102,6 +100,7 @@ impl Buffered {
                 has_ended: false,
             })?,
         };
+        (frame.writer).start(plan, input_len, Start::Frame(dictionary))?;
         let block_len = frame.writer.block_len_max();
         frame.capacity = frame.writer.window_len() + block_len;
         (frame.older, frame.start, frame.filled) = (Older::InDictionary, 0, 0);
@@ -129,20 +128,15 @@ impl Buffered {
         const SHORT_LEN: usize = 16 << 10;
         let len = input.len().min(self.target - self.filled);
         if self.filled + len > self.buffer.capacity() {
-            let is_short = self.filled + len <= SHORT_LEN;
-            let capacity = self
-                .capacity
-                .min(if is_short { SHORT_LEN } else { usize::MAX });
+            let capacity = match self.filled + len {
+                ..=SHORT_LEN => self.capacity.min(SHORT_LEN),
+                _ => self.capacity,
+            };
             self.buffer
                 .try_reserve_exact(capacity - self.buffer.len())?;
         }
-        let mut taken = input.split_off(..len).unwrap_or_default();
-        let used = self.buffer.get_mut(self.filled..).unwrap_or_default();
-        let overwritten = taken.split_off(..len.min(used.len())).unwrap_or_default();
-        for (to, from) in used.iter_mut().zip(overwritten) {
-            *to = *from;
-        }
-        self.buffer.extend_from_slice(taken);
+        let taken = input.split_off(..len).unwrap_or_default();
+        vec::write_at(&mut self.buffer, self.filled, taken);
         self.filled += len;
         Ok(())
     }
@@ -233,6 +227,7 @@ pub struct Encoder {
     /// From when the first frame starts, as the parameters are known then.
     dictionary: Option<Shared<Dictionary>>,
     frame: Option<Frame>,
+    /// The next one takes over its memory.
     finished: Option<Box<Buffered>>,
     pool: Pool,
     error: Option<Error>,

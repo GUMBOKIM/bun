@@ -2,6 +2,7 @@
 
 use core::hint::select_unpredictable;
 
+use crate::array::At;
 use crate::bytes::{
     AtLeast, chunk_at, common_suffix, compare, first_difference, likely, u32_at, u64_at,
 };
@@ -234,14 +235,22 @@ impl<'a> History<'a> {
     #[inline(always)]
     fn compare_in(&self, position: u32, run: &[u8], at: u32) -> (u32, bool) {
         let mut len = 0;
-        while let Some(a) = likely(u64_at(self.prefix, position.wrapping_add(len)))
-            && let Some(b) = likely(u64_at(run, at.wrapping_add(len)))
+        if let Some(a) = likely(u64_at(self.prefix, position))
+            && let Some(b) = likely(u64_at(run, at))
         {
             if a != b {
-                let len = len + (a ^ b).trailing_zeros() / 8;
+                let len = (a ^ b).trailing_zeros() / 8;
                 return (len, b.swap_bytes() < a.swap_bytes());
             }
-            len += WORD_LEN as u32;
+            len = WORD_LEN as u32;
+        }
+        while let Some(a) = likely(chunk_at(self.prefix, position.wrapping_add(len)))
+            && let Some(b) = likely(chunk_at(run, at.wrapping_add(len)))
+        {
+            if let Some(index) = first_difference(a, b) {
+                return (len + index, b.at(index as usize) < a.at(index as usize));
+            }
+            len += a.len() as u32;
         }
         let (position, at) = (position.wrapping_add(len), at.wrapping_add(len));
         let (more, is_below) = Self::compare_bytes(self.prefix, position, run, at);

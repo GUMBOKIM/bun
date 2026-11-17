@@ -60,7 +60,9 @@ pub fn compress_bound(len: usize) -> Option<usize> {
 pub fn compress(bytes: &[u8], out: &mut Output<'_>, level: i32) -> Result<()> {
     let (request, len) = (Request::new(level), Some(bytes.len() as u64));
     let tuning = request.tuning(len, Purpose::Frame { dictionary_len: 0 });
-    let mut writer = FrameWriter::new(request.plan(tuning), len, Start::Frame(None))?;
+    let plan = request.plan(tuning);
+    let mut writer = FrameWriter::new(plan);
+    writer.start(plan, len, Start::Frame(None))?;
     let written_before = out.written();
     let result = writer.write(&Input::alone(bytes, &[]), None, true, out);
     result.inspect_err(|_| out.rewind(written_before))

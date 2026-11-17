@@ -14,6 +14,7 @@ use crate::array::At;
 use crate::bytes::put;
 use crate::parameters::Strategy;
 use crate::sequences::{CodeCounts, Sequence};
+use crate::vec::boxed_in;
 
 type Histogram = super::histogram::Histogram<SYMBOLS>;
 
@@ -190,7 +191,7 @@ pub(super) fn write_count(count: usize, out: &mut [u8]) -> Result<usize> {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct CodesChoice([Encoding; 3]);
 
 impl CodesChoice {
@@ -211,6 +212,12 @@ pub(super) struct Chosen {
 }
 
 impl Chosen {
+    const PREDEFINED: Self = Self {
+        choice: CodesChoice::PREDEFINED,
+        len: 0,
+        last_compressed_len: 0,
+    };
+
     /// https://github.com/facebook/zstd/pull/1146
     pub(super) fn trips_old_decoders(&self, stream_len: usize) -> bool {
         self.last_compressed_len != 0 && self.last_compressed_len + stream_len < 4
@@ -281,54 +288,60 @@ fn select(
 
 /// The tables that a decoder has, and those for the next block.
 pub(crate) struct CodeTables {
-    sets: [TableSet; 2],
-    current: usize,
+    current: Option<Box<TableSet>>,
+    next: Option<Box<TableSet>>,
     reuse: [Reuse; 3],
 }
 
 impl CodeTables {
     pub(super) const EMPTY: Self = Self {
-        sets: [TableSet::EMPTY; 2],
-        current: 0,
+        current: None,
+        next: None,
         reuse: [Reuse::Never; 3],
     };
-
-    fn current_and_next(&mut self) -> (&TableSet, &mut TableSet) {
-        let [first, second] = &mut self.sets;
-        if self.current == 0 {
-            (first, second)
-        } else {
-            (second, first)
-        }
-    }
 
     pub(crate) fn reuse_mut(&mut self, kind: CodeKind) -> &mut Reuse {
         self.reuse.at_mut(kind as usize)
     }
 
-    pub(crate) fn load(&mut self, kind: CodeKind, normalized: &Normalized, reuse: Reuse) {
-        self.sets.at_mut(self.current).build(kind, normalized);
+    pub(crate) fn load(
+        &mut self,
+        kind: CodeKind,
+        normalized: &Normalized,
+        reuse: Reuse,
+    ) -> Result<()> {
+        boxed_in(&mut self.current, || TableSet::EMPTY)?.build(kind, normalized);
         *self.reuse_mut(kind) = reuse;
+        Ok(())
     }
 
     /// See [`fse::Tables::max_bits`].
     pub(crate) fn max_bits(&self, kind: CodeKind, code: usize) -> u32 {
-        let current = self.sets.at(self.current);
-        current
-            .tables
-            .max_bits(*current.shapes.at(kind as usize), code)
+        let TableSet { tables, shapes } = self.current.as_deref().unwrap_or(&PREDEFINED);
+        tables.max_bits(*shapes.at(kind as usize), code)
     }
 
-    pub(super) fn copy_from(&mut self, other: &Self) {
-        for kind in CodeKind::ALL {
-            let to = self.sets.at_mut(self.current);
-            to.copy_from(other.sets.at(other.current), kind);
+    pub(super) fn copy_from(&mut self, other: &Self) -> Result<()> {
+        if let Some(from) = &other.current {
+            let to = boxed_in(&mut self.current, || TableSet::EMPTY)?;
+            for kind in CodeKind::ALL {
+                to.copy_from(from, kind);
+            }
         }
         self.reuse = other.reuse;
+        Ok(())
+    }
+
+    fn chosen(&self, choice: CodesChoice) -> &TableSet {
+        let built = self
+            .next
+            .as_deref()
+            .filter(|_| choice != CodesChoice::PREDEFINED);
+        built.unwrap_or(&PREDEFINED)
     }
 
     pub(super) fn accept(&mut self, choice: CodesChoice) {
-        self.current ^= 1;
+        core::mem::swap(&mut self.current, &mut self.next);
         for (reuse, encoding) in self.reuse.iter_mut().zip(choice.0) {
             match encoding {
                 Encoding::Basic | Encoding::Rle => *reuse = Reuse::Never,
@@ -346,21 +359,25 @@ impl CodeTables {
         strategy: Strategy,
         out: &mut [u8],
     ) -> Result<Chosen> {
-        let mut chosen = Chosen {
-            choice: CodesChoice::PREDEFINED,
-            len: 0,
-            last_compressed_len: 0,
-        };
-        let (reuse, last) = (self.reuse, sequences.last().ok_or(Error::Internal)?);
-        let (current, next) = self.current_and_next();
-        for (kind, reuse) in CodeKind::ALL.into_iter().zip(reuse) {
-            let (alphabet, last) = (ALPHABETS.at(kind as usize), last.code(kind));
-            let mut histogram = kind.histogram(counts);
+        let mut chosen = Chosen::PREDEFINED;
+        let current = self.current.as_deref().unwrap_or(&PREDEFINED);
+        let histograms = CodeKind::ALL.map(|kind| kind.histogram(counts));
+        for (kind, histogram) in CodeKind::ALL.into_iter().zip(&histograms) {
+            let (alphabet, reuse) = (ALPHABETS.at(kind as usize), *self.reuse.at(kind as usize));
             let repeated_cost = |counts: &[u32]| current.cost(kind, counts);
             let total = sequences.len();
-            let encoding = select(alphabet, reuse, repeated_cost, &histogram, total, strategy)?;
-            *chosen.choice.0.at_mut(kind as usize) = encoding;
+            *chosen.choice.0.at_mut(kind as usize) =
+                select(alphabet, reuse, repeated_cost, histogram, total, strategy)?;
+        }
+        if chosen.choice == CodesChoice::PREDEFINED {
+            return Ok(chosen);
+        }
 
+        let next = boxed_in(&mut self.next, || TableSet::EMPTY)?;
+        let last = sequences.last().ok_or(Error::Internal)?;
+        let kinds = CodeKind::ALL.into_iter().zip(chosen.choice.0);
+        for ((kind, encoding), mut histogram) in kinds.zip(histograms) {
+            let (alphabet, last) = (ALPHABETS.at(kind as usize), last.code(kind));
             let out = out.get_mut(chosen.len..).ok_or(Error::Internal)?;
             match encoding {
                 Encoding::Basic => next.copy_from(&PREDEFINED, kind),
@@ -400,11 +417,7 @@ impl CodeTables {
     ) -> Result<CodesPlan> {
         let mut descriptions = [0; _];
         let chosen = if sequences.is_empty() {
-            Chosen {
-                choice: CodesChoice::PREDEFINED,
-                len: 0,
-                last_compressed_len: 0,
-            }
+            Chosen::PREDEFINED
         } else {
             self.choose(sequences, counts, strategy, &mut descriptions)?
         };
@@ -421,14 +434,11 @@ impl CodeTables {
             let bits = match plan.choice().0.at(kind as usize) {
                 Encoding::Basic => alphabet.predefined_cost(histogram.used()),
                 Encoding::Rle => Some(0),
-                _ => self.sets.at(self.current ^ 1).cost(kind, histogram.used()),
-            };
-            let Some(bits) = bits else {
-                return histogram.counts.iter().sum::<u32>() as usize * 10;
+                _ => self.chosen(plan.choice()).cost(kind, histogram.used()),
             };
             let pairs = histogram.counts.iter().zip(alphabet.extra_bits);
             let extra_bits: u32 = pairs.map(|(&count, bits)| count * u32::from(bits)).sum();
-            (bits + extra_bits as usize) / 8
+            (bits.unwrap_or_default() + extra_bits as usize) / 8
         });
         plan.chosen.len + lens.sum::<usize>()
     }
@@ -457,7 +467,7 @@ impl CodeTables {
         *modes = choice.modes();
         put(out, descriptions).ok_or(Error::DstSizeTooSmall)?;
         let out = out.get_mut(descriptions.len()..).unwrap_or_default();
-        let stream_len = self.encode(sequences, out)?;
+        let stream_len = self.encode(plan.choice(), sequences, out)?;
 
         let len = 1 + descriptions.len() + stream_len;
         // https://github.com/facebook/zstd/pull/1664
@@ -467,9 +477,14 @@ impl CodeTables {
         Ok(Some((count_len + len, true)))
     }
 
-    /// With the tables that were chosen last. Returns the length of the stream.
-    pub(super) fn encode(&self, sequences: &[Sequence], out: &mut [u8]) -> Result<usize> {
-        let set = self.sets.at(self.current ^ 1);
+    /// `choice` is the last one that was made. Returns the length of the stream.
+    pub(super) fn encode(
+        &self,
+        choice: CodesChoice,
+        sequences: &[Sequence],
+        out: &mut [u8],
+    ) -> Result<usize> {
+        let set = self.chosen(choice);
         let len = with_bmi2(
             #[inline(always)]
             move || encode(set, sequences, out),

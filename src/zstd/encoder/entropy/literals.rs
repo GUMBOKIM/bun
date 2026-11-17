@@ -6,9 +6,9 @@ use bun_zstd_decoder::{Error, Result};
 use super::Reuse;
 use super::histogram::Histogram;
 use super::huffman::{Description, Table};
-use crate::array::At;
 use crate::bytes::{is_one_byte_repeated, put};
 use crate::parameters::{Strategy, Tuning};
+use crate::vec::boxed_in;
 
 /// `content` is all `len` literals, or the one that they repeat.
 fn write_plain(encoding: Encoding, len: usize, content: &[u8], out: &mut [u8]) -> Result<usize> {
@@ -109,48 +109,50 @@ impl LiteralsPlan {
     }
 }
 
-/// The table that a decoder has, and room for the one that may replace it.
+fn reusable<'a>(table: &'a Option<Box<Table>>, reuse: Reuse, counts: &[u32]) -> Option<&'a Table> {
+    table.as_deref().filter(|table| match reuse {
+        Reuse::Never => false,
+        Reuse::IfComplete => table.has_codes_for(counts),
+        Reuse::Always => true,
+    })
+}
+
+/// The table that a decoder has, and the one that may replace it.
 pub(crate) struct LiteralTables {
-    tables: [Table; 2],
-    current: usize,
-    pub(crate) reuse: Reuse,
+    current: Option<Box<Table>>,
+    candidate: Option<Box<Table>>,
+    pub(super) reuse: Reuse,
 }
 
 impl LiteralTables {
     pub(super) const EMPTY: Self = Self {
-        tables: [Table::EMPTY; 2],
-        current: 0,
+        current: None,
+        candidate: None,
         reuse: Reuse::Never,
     };
 
-    pub(crate) fn current(&self) -> &Table {
-        self.tables.at(self.current)
+    /// The table, if it has codes for all bytes.
+    pub(crate) fn complete(&self) -> Option<&Table> {
+        (self.current.as_deref()).filter(|_| self.reuse == Reuse::Always)
     }
 
-    pub(crate) fn load(&mut self, weights: &[u8], log: u32, reuse: Reuse) {
-        self.tables
-            .at_mut(self.current)
-            .build_from_weights(weights, log);
+    pub(crate) fn load(&mut self, weights: &[u8], log: u32, reuse: Reuse) -> Result<()> {
+        boxed_in(&mut self.current, || Table::EMPTY)?.build_from_weights(weights, log);
         self.reuse = reuse;
-    }
-
-    fn current_and_candidate(&mut self) -> (&Table, &mut Table) {
-        let [first, second] = &mut self.tables;
-        if self.current == 0 {
-            (first, second)
-        } else {
-            (second, first)
-        }
+        Ok(())
     }
 
     pub(super) fn accept_candidate(&mut self) {
-        self.current ^= 1;
+        core::mem::swap(&mut self.current, &mut self.candidate);
         self.reuse = Reuse::IfComplete;
     }
 
-    pub(super) fn copy_from(&mut self, other: &Self) {
-        *self.tables.at_mut(self.current) = *other.current();
+    pub(super) fn copy_from(&mut self, other: &Self) -> Result<()> {
+        if let Some(table) = &other.current {
+            *boxed_in(&mut self.current, || Table::EMPTY)? = **table;
+        }
         self.reuse = other.reuse;
+        Ok(())
     }
 
     /// Returns the length of the section.
@@ -179,9 +181,9 @@ impl LiteralTables {
                 has_few_matches,
                 is_single_stream,
                 rest,
-            );
+            )?;
             if let Some((written, encoding)) = compressed
-                && written < len - tuning.strategy.min_gain(len)
+                && written < tuning.strategy.worth_it_below(len)
             {
                 if written == 1 && (len >= 8 || is_one_byte_repeated(literals)) {
                     return Ok((write_repeated(literals, out)?, Encoding::Rle));
@@ -201,72 +203,75 @@ impl LiteralTables {
         has_few_matches: bool,
         is_single_stream: bool,
         out: &mut [u8],
-    ) -> Option<(usize, Encoding)> {
+    ) -> Result<Option<(usize, Encoding)>> {
         let len = literals.len();
         let prefers_reuse = strategy < Strategy::Lazy && len <= 1024;
-        let mut reuse = self.reuse;
-        let (current, candidate) = self.current_and_candidate();
-        let repeat = |out: &mut [u8]| {
-            let written = current.compress(literals, out, is_single_stream)?;
-            Some((written, Encoding::Repeat))
+        let repeat = |table: &Table, out: &mut [u8]| {
+            let written = table.compress(literals, out, is_single_stream);
+            Ok(written.map(|written| (written, Encoding::Repeat)))
         };
 
-        if prefers_reuse && reuse == Reuse::Always {
-            return repeat(out);
+        if let Some(current) = self.complete().filter(|_| prefers_reuse) {
+            return repeat(current, out);
         }
         if has_few_matches && looks_random(literals) {
-            return None;
+            return Ok(None);
         }
         let histogram = Histogram::of(literals);
         if histogram.largest_count == len {
-            return Some((1, Encoding::Rle));
+            return Ok(Some((1, Encoding::Rle)));
         }
         if is_too_even(histogram.largest_count, len) {
-            return None;
+            return Ok(None);
         }
         let counts = histogram.used();
-        if reuse == Reuse::IfComplete && !current.has_codes_for(counts) {
-            reuse = Reuse::Never;
-        }
-        if prefers_reuse && reuse != Reuse::Never {
-            return repeat(out);
+        let current = reusable(&self.current, self.reuse, counts);
+        if let Some(current) = current.filter(|_| prefers_reuse) {
+            return repeat(current, out);
         }
 
+        let candidate = boxed_in(&mut self.candidate, || Table::EMPTY)?;
         candidate.build(counts, len, strategy >= Strategy::Ultra);
-        let description_len = candidate.describe(out).ok()?;
+        let Ok(description_len) = candidate.describe(out) else {
+            return Ok(None);
+        };
         let is_too_long = description_len + 12 >= len;
-        if reuse != Reuse::Never {
+        if let Some(current) = current {
             let new_len = description_len + candidate.compressed_len(counts);
             if current.compressed_len(counts) <= new_len || is_too_long {
-                return repeat(out);
+                return repeat(current, out);
             }
         }
         if is_too_long {
-            return None;
+            return Ok(None);
         }
-        let out = out.get_mut(description_len..)?;
-        let written = candidate.compress(literals, out, is_single_stream)?;
-        Some((description_len + written, Encoding::Compressed))
+        let out = out.get_mut(description_len..).ok_or(Error::Internal)?;
+        let written = candidate.compress(literals, out, is_single_stream);
+        Ok(written.map(|written| (description_len + written, Encoding::Compressed)))
     }
 
     /// `None` if there is a gain, but the table for it cannot be described.
-    pub(crate) fn plan(&mut self, literals: &[u8], tuning: &Tuning) -> Option<LiteralsPlan> {
+    pub(crate) fn plan(
+        &mut self,
+        literals: &[u8],
+        tuning: &Tuning,
+    ) -> Result<Option<LiteralsPlan>> {
         let len = literals.len();
-        let reuse = self.reuse;
-        let too_few = if reuse == Reuse::Always { 6 } else { 63 };
+        let plain = |encoding| Ok(Some(LiteralsPlan::plain(encoding)));
+        let too_few = if self.reuse == Reuse::Always { 6 } else { 63 };
         if !tuning.compresses_literals() || len <= too_few {
-            return Some(LiteralsPlan::plain(Encoding::Basic));
+            return plain(Encoding::Basic);
         }
         let histogram = Histogram::of(literals);
         if histogram.largest_count == len {
-            return Some(LiteralsPlan::plain(Encoding::Rle));
+            return plain(Encoding::Rle);
         }
         if is_too_even(histogram.largest_count, len) {
-            return Some(LiteralsPlan::plain(Encoding::Basic));
+            return plain(Encoding::Basic);
         }
 
         let counts = histogram.used();
-        let (current, candidate) = self.current_and_candidate();
+        let candidate = boxed_in(&mut self.candidate, || Table::EMPTY)?;
         candidate.build(counts, len, tuning.strategy >= Strategy::Ultra);
         let estimated_len = candidate.compressed_len(counts);
         let description = Description::of(candidate).ok();
@@ -274,23 +279,23 @@ impl LiteralTables {
         let description_len = description.as_ref().map_or(usize::MAX, |it| it.len);
         let new_len = estimated_len.wrapping_add(description_len);
 
-        if reuse == Reuse::Always || (reuse == Reuse::IfComplete && current.has_codes_for(counts)) {
+        if let Some(current) = reusable(&self.current, self.reuse, counts) {
             let old_len = current.compressed_len(counts);
             if old_len < len && (old_len <= new_len || description_len.wrapping_add(12) >= len) {
-                return Some(LiteralsPlan {
+                return Ok(Some(LiteralsPlan {
                     estimated_len: old_len,
                     ..LiteralsPlan::plain(Encoding::Repeat)
-                });
+                }));
             }
         }
         if new_len >= len {
-            return Some(LiteralsPlan::plain(Encoding::Basic));
+            return plain(Encoding::Basic);
         }
-        Some(LiteralsPlan {
+        Ok(description.map(|description| LiteralsPlan {
             encoding: Encoding::Compressed,
-            description: description?,
+            description,
             estimated_len,
-        })
+        }))
     }
 
     /// The section for a part of the literals that `plan` is for, and whether later parts can repeat its table. `None`
@@ -305,10 +310,11 @@ impl LiteralTables {
         let len = literals.len();
         let table = match plan.encoding {
             Encoding::Rle if len != 0 => return Ok(Some((write_repeated(literals, out)?, false))),
-            Encoding::Compressed if len != 0 => self.tables.at(self.current ^ 1),
-            Encoding::Repeat if len != 0 => self.current(),
+            Encoding::Compressed if len != 0 => &self.candidate,
+            Encoding::Repeat if len != 0 => &self.current,
             _ => return Ok(Some((write_raw(literals, out)?, false))),
         };
+        let table = table.as_ref().ok_or(Error::Internal)?;
 
         // The header comes first, so it has room for the description as well.
         let header_len = compressed_header_len(len + if describes_table { 200 } else { 0 });

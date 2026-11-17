@@ -9,7 +9,7 @@ use crate::block::{self, BlockWriter, Content, append};
 use crate::dictionary::Dictionary;
 use crate::entropy::looks_random;
 use crate::matches::long_distance::{self, Candidates};
-use crate::matches::{MatchState, Owner, Search, Usage};
+use crate::matches::{MatchState, Owner, Search};
 use crate::parameters::{Plan, Purpose};
 use crate::sequences::{Repeats, Sequences};
 use crate::window::{Input, WORD_LEN};
@@ -57,10 +57,11 @@ pub(crate) struct FrameWriter {
 }
 
 impl FrameWriter {
-    pub(crate) fn new(plan: Plan, input_len: Option<u64>, start: Start<'_>) -> Result<Self> {
-        let mut writer = Self {
+    /// Has to be [`start`](Self::start)ed.
+    pub(crate) fn new(plan: Plan) -> Self {
+        Self {
             plan,
-            input_len,
+            input_len: None,
             dictionary_id: 0,
             is_dictionary_attached: false,
             block_len_max: 0,
@@ -70,15 +71,13 @@ impl FrameWriter {
             hash: XxHash64::new(),
             state: MatchState::new(plan.tuning),
             sequences: Sequences::new(),
-            blocks: BlockWriter::new()?,
+            blocks: BlockWriter::new(),
             long_finder: None,
             long_matches: Candidates::default(),
-        };
-        writer.restart(plan, input_len, start)?;
-        Ok(writer)
+        }
     }
 
-    pub(crate) fn restart(
+    pub(crate) fn start(
         &mut self,
         mut plan: Plan,
         input_len: Option<u64>,
@@ -109,15 +108,11 @@ impl FrameWriter {
         self.stage = Stage::BeforeHeader;
         self.dictionary_id = dictionary.map_or(0, |it| it.id);
         self.is_dictionary_attached = false;
-        let usage = Usage {
-            owner: Owner::Frame,
-            preceding_len: match start {
-                Start::Frame(_) => 0,
-                Start::Part(earlier) => earlier.len(),
-            },
-            may_be_short: input_len.is_none(),
+        let loaded_len = match start {
+            Start::Frame(_) => 0,
+            Start::Part(earlier) => earlier.len(),
         };
-        self.state.reset(tuning, plan.uses_rows, &usage)?;
+        (self.state).reset(tuning, plan.uses_rows, Owner::Frame, loaded_len)?;
         self.blocks.is_at_start = true;
         self.long_finder = None;
         self.long_matches.clear();
@@ -134,7 +129,7 @@ impl FrameWriter {
                 self.blocks.repeats = Repeats::INITIAL;
             }
             Start::Frame(Some(dictionary)) => {
-                self.blocks.entropy.copy_from(&dictionary.entropy);
+                self.blocks.entropy.copy_from(&dictionary.entropy)?;
                 self.blocks.repeats = dictionary.repeats;
                 if !is_attached {
                     self.state.copy_from(&dictionary.state);
@@ -148,7 +143,7 @@ impl FrameWriter {
                 self.blocks.repeats = Repeats::default();
                 self.stage = Stage::InBlocks;
                 if earlier.len() >= WORD_LEN {
-                    self.state.load(earlier, Owner::Frame);
+                    self.state.load::<{ Owner::Frame }>(earlier);
                 }
             }
         }
@@ -271,6 +266,7 @@ impl FrameWriter {
             saved += len as i64 - (out.written() - written_before) as i64;
             start += len;
             self.blocks.is_at_start = false;
+            self.blocks.distrust_offset_table();
         }
         if is_last {
             self.stage = Stage::AfterLastBlock;
@@ -297,17 +293,21 @@ impl FrameWriter {
                 finder.skip(len);
             }
             self.state.window.next += len as u32;
-            self.blocks.distrust_offset_table();
             return block::write_raw(bytes, is_last, out);
         }
 
         let (matched_len, repeats) = self.find_sequences(input, dictionary, start, len)?;
-        if matched_len == 0 && self.plan.target_block_len == 0 && looks_random(bytes) {
-            self.blocks.distrust_offset_table();
-            return block::write_raw(bytes, is_last, out);
+        let (blocks, tuning) = (&mut self.blocks, &self.plan.tuning);
+        let is_hopeless = if tuning.compresses_literals() {
+            matched_len == 0 && looks_random(bytes)
+        } else {
+            let literal_count = self.sequences.literal_count(bytes);
+            literal_count.is_some_and(|count| count >= tuning.strategy.worth_it_below(len))
+        };
+        if is_hopeless && self.plan.target_block_len == 0 {
+            return blocks.write_uncompressed(bytes, is_last, out);
         }
         self.sequences.finish(bytes, matched_len)?;
-        let (blocks, tuning) = (&mut self.blocks, &self.plan.tuning);
         let content = Content {
             bytes,
             sequences: &self.sequences.list,

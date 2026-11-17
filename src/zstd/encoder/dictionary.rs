@@ -1,3 +1,5 @@
+//! Content that precedes each frame, and tables to start with.
+
 use core::ops::Range;
 
 use bun_zstd_decoder::format::{
@@ -10,10 +12,10 @@ use crate::array::At;
 use crate::bytes::{highest_bit, u32_at};
 use crate::entropy::fse::{Normalized, SYMBOLS};
 use crate::entropy::{CodeKind, Entropy, Reuse};
-use crate::matches::{MatchState, Owner, Usage};
+use crate::matches::{MatchState, Owner};
 use crate::parameters::{Purpose, Request};
 use crate::sequences::Repeats;
-use crate::vec::{self, Shared};
+use crate::vec::Shared;
 use crate::window::WORD_LEN;
 
 /// Ready for frames to start from.
@@ -22,15 +24,18 @@ pub(crate) struct Dictionary {
     content: Range<usize>,
     pub(crate) id: u32,
     pub(crate) state: MatchState,
-    pub(crate) entropy: Box<Entropy>,
+    pub(crate) entropy: Entropy,
     pub(crate) repeats: Repeats,
 }
 
-fn read_counts(bytes: &mut &[u8], max_symbol: usize, log_max: u32) -> Option<Normalized> {
+fn read_counts(bytes: &mut &[u8], max_symbol: usize, log_max: u32) -> Result<Normalized> {
     let mut counts = [0; SYMBOLS];
-    let description = read_normalized_counts(bytes, counts.get_mut(..=max_symbol)?).ok()?;
-    *bytes = bytes.get(description.len..)?;
-    (description.table_log <= log_max).then_some(Normalized {
+    let used = counts.get_mut(..=max_symbol).ok_or(Error::Internal)?;
+    let description = (read_normalized_counts(bytes, used).ok())
+        .filter(|description| description.table_log <= log_max)
+        .ok_or(Error::DictionaryCorrupted)?;
+    *bytes = bytes.get(description.len..).ok_or(Error::Internal)?;
+    Ok(Normalized {
         counts,
         max_symbol: description.max_symbol,
         table_log: description.table_log,
@@ -46,14 +51,14 @@ fn reuse(has_all_symbols: bool) -> Reuse {
 }
 
 /// Reads what is between the ID and the content, and returns the content.
-fn read_tables<'a>(mut bytes: &'a [u8], entropy: &mut Entropy) -> Option<(Repeats, &'a [u8])> {
-    let description = read_huffman_weights(bytes).ok()?;
-    bytes = bytes.get(description.len..)?;
-    let weights = description.weights.get(..description.symbol_count)?;
+fn read_tables<'a>(mut bytes: &'a [u8], entropy: &mut Entropy) -> Result<(Repeats, &'a [u8])> {
+    let description = read_huffman_weights(bytes).map_err(|_| Error::DictionaryCorrupted)?;
+    bytes = bytes.get(description.len..).ok_or(Error::Internal)?;
+    let weights = (description.weights.get(..description.symbol_count)).ok_or(Error::Internal)?;
     let has_all = weights.len() == 256 && *description.rank_counts.at(0) == 0;
     entropy
         .literals
-        .load(weights, description.table_log, reuse(has_all));
+        .load(weights, description.table_log, reuse(has_all))?;
 
     let offsets = read_counts(&mut bytes, MAX_OFFSET_CODE, OFFSET_TABLE_LOG_MAX)?;
     let match_lengths = read_counts(
@@ -66,7 +71,7 @@ fn read_tables<'a>(mut bytes: &'a [u8], entropy: &mut Entropy) -> Option<(Repeat
         MAX_LITERAL_LENGTH_CODE,
         LITERAL_LENGTH_TABLE_LOG_MAX,
     )?;
-    let (repeats, content) = bytes.split_first_chunk::<12>()?;
+    let (repeats, content) = (bytes.split_first_chunk::<12>()).ok_or(Error::DictionaryCorrupted)?;
     let repeats = [0, 4, 8].map(|at| u32_at(repeats, at).unwrap_or(0));
     let max_offset = u32::try_from(content.len() + BLOCK_LEN_MAX).unwrap_or(u32::MAX);
     for (kind, counts, max_needed) in [
@@ -79,9 +84,9 @@ fn read_tables<'a>(mut bytes: &'a [u8], entropy: &mut Entropy) -> Option<(Repeat
         ),
     ] {
         let has_all = (0..=max_needed).all(|symbol| *counts.counts.at(symbol) != 0);
-        entropy.codes.load(kind, &counts, reuse(has_all));
+        entropy.codes.load(kind, &counts, reuse(has_all))?;
     }
-    Some((Repeats(repeats), content))
+    Ok((Repeats(repeats), content))
 }
 
 impl Dictionary {
@@ -89,31 +94,25 @@ impl Dictionary {
     pub(crate) fn new(bytes: &Shared<Vec<u8>>, request: &Request) -> Result<Self> {
         let tuning = request.tuning(None, Purpose::Dictionary { len: bytes.len() });
         let mut state = MatchState::new(tuning);
-        let usage = Usage {
-            owner: Owner::Dictionary,
-            preceding_len: 0,
-            may_be_short: false,
-        };
-        state.reset(tuning, tuning.prefers_rows(), &usage)?;
-        let mut entropy = vec::boxed(Entropy::EMPTY)?;
+        state.reset(tuning, tuning.prefers_rows(), Owner::Dictionary, 0)?;
+        let mut entropy = Entropy::EMPTY;
 
         let has_tables = bytes.len() >= WORD_LEN && u32_at(bytes, 0) == Some(DICTIONARY_MAGIC);
         let (id, repeats, content) = match bytes.get(WORD_LEN..) {
             None => (0, Repeats::INITIAL, &[][..]),
             Some(rest) if has_tables => {
-                let (repeats, content) =
-                    read_tables(rest, &mut entropy).ok_or(Error::DictionaryCorrupted)?;
+                let (repeats, content) = read_tables(rest, &mut entropy)?;
                 (u32_at(bytes, 4).unwrap_or(0), repeats, content)
             }
             Some(_) => (0, Repeats::INITIAL, bytes.as_slice()),
         };
-        let content = state.loadable(content, Owner::Dictionary);
+        let content = state.loadable(content);
         let is_in_content = |offset: u32| (1..=content.len()).contains(&(offset as usize));
         if has_tables && !repeats.0.into_iter().all(is_in_content) {
             return Err(Error::DictionaryCorrupted);
         }
         if !content.is_empty() {
-            state.load(content, Owner::Dictionary);
+            state.load::<{ Owner::Dictionary }>(content);
         }
         Ok(Self {
             content: bytes.len() - content.len()..bytes.len(),

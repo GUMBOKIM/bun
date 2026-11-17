@@ -120,11 +120,8 @@ impl Normalized {
             };
         }
         let mut left = table_size.checked_sub(assigned).ok_or(Error::Internal)?;
-        if left == 0 {
-            return Ok(());
-        }
-
-        if total / left as usize > one_up_to as usize {
+        let average = total.checked_div(left as usize).ok_or(Error::Internal)?;
+        if average > one_up_to as usize {
             one_up_to = ((total * 3) / (left as usize * 2)) as u32;
             for (&count, out) in counts.iter().zip(&mut self.counts) {
                 if *out == UNASSIGNED && count <= one_up_to {

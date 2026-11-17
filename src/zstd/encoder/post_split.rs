@@ -2,27 +2,19 @@
 
 use core::ops::Range;
 
-use bun_zstd_decoder::format::{BLOCK_HEADER_LEN, LONG_SEQUENCE_COUNT, MIN_MATCH};
+use bun_zstd_decoder::format::{BLOCK_HEADER_LEN, LONG_SEQUENCE_COUNT};
 use bun_zstd_decoder::{Error, Output, Result};
 
 use crate::block::{BlockWriter, Content};
 use crate::entropy::LiteralsPlan;
 use crate::parameters::Tuning;
-use crate::sequences::{OffsetValue, Repeats, Sequence, Sequences, count_codes};
+use crate::sequences::{
+    OffsetValue, Repeats, Sequence, Sequences, count_codes, literals_len, matches_len,
+};
 
 const SPLITS_MAX: usize = 196;
 const SEQUENCES_MIN: usize = 300;
 
-pub(crate) fn literals_len(sequences: &[Sequence]) -> usize {
-    sequences.iter().map(|it| it.literal_len() as usize).sum()
-}
-
-pub(crate) fn matches_len(sequences: &[Sequence]) -> usize {
-    let lens = sequences.iter().map(|it| it.match_base() + MIN_MATCH);
-    lens.sum::<u32>() as usize
-}
-
-#[derive(Clone)]
 struct Part {
     sequences: Range<usize>,
     literals: Range<usize>,
@@ -44,7 +36,7 @@ impl Splitter<'_> {
         let sequences = self.sequences.get(part.sequences.clone())?;
         let counts = count_codes(sequences);
         let entropy = &mut self.writer.entropy;
-        let literals_plan = entropy.literals.plan(literals, self.tuning)?;
+        let literals_plan = entropy.literals.plan(literals, self.tuning).ok()??;
         let codes_plan = entropy
             .codes
             .plan(sequences, &counts, self.tuning.strategy)

@@ -95,7 +95,7 @@ pub(crate) fn put(out: &mut [u8], bytes: &[u8]) -> Option<()> {
 }
 
 /// How many bytes `a` and `b` start with in common, and whether the next one of `b` is below that of `a`.
-#[inline(always)]
+#[inline]
 pub(crate) fn compare(a: &[u8], b: &[u8]) -> (usize, bool) {
     let len = a.len().min(b.len());
     let (Some(a), Some(b)) = (a.get(..len), b.get(..len)) else {
@@ -138,7 +138,7 @@ pub(crate) fn first_difference(a: &[u8; 16], b: &[u8; 16]) -> Option<u32> {
 }
 
 /// How many bytes `a` and `b` end with in common.
-#[inline(always)]
+#[inline]
 pub(crate) fn common_suffix(a: &[u8], b: &[u8]) -> usize {
     let pairs = a.iter().rev().zip(b.iter().rev());
     pairs.take_while(|(a, b)| a == b).count()

@@ -15,16 +15,13 @@ pub(super) fn fill(state: &mut MatchState, history: &History<'_>, end: u32) {
     chains.insert_up_to(history, end, false);
 }
 
-#[inline(always)]
-fn link<T>(index: u32, chain: &[T]) -> usize {
-    index as usize & chain.len().wrapping_sub(1)
-}
-
 pub(super) struct Chains<'a> {
     attached: Attached<'a>,
     bounds: Bounds,
     heads: &'a mut [u32],
+    /// The compiler sees its length as `mask + 1`, and that a masked index is below it.
     chain: &'a mut [u32],
+    mask: usize,
     hasher: Hasher,
     attached_hasher: Hasher,
     attempts: u32,
@@ -40,6 +37,7 @@ impl<'a> Chains<'a> {
             attached: *attached,
             bounds,
             heads: tables.hash,
+            mask: tables.chain.len().wrapping_sub(1),
             chain: tables.chain,
             hasher: Hasher::new(min_match, tuning.hash_log),
             attached_hasher: Hasher::new(min_match, attached.tuning.hash_log),
@@ -54,7 +52,7 @@ impl<'a> Chains<'a> {
         for index in self.next_to_index..end {
             let word = likely(u64_at(history.prefix, history.position(index)))?;
             let head = likely(self.heads.get_mut(self.hasher.hash(word)))?;
-            *likely(self.chain.get_mut(link(index, self.chain)))? = *head;
+            *self.chain.get_mut(index as usize & self.mask)? = *head;
             *head = index;
             if is_skipping {
                 break;
@@ -68,6 +66,13 @@ impl<'a> Chains<'a> {
 impl Finder for Chains<'_> {
     const MARGIN: u32 = WORD;
     type Scratch = ();
+
+    #[inline(always)]
+    fn prepare(&mut self) -> Option<()> {
+        self.mask = self.mask as u32 as usize;
+        self.chain = core::mem::take(&mut self.chain).get_mut(..self.mask + 1)?;
+        Some(())
+    }
 
     #[inline(always)]
     fn find<const REACH: Reach>(
@@ -85,12 +90,12 @@ impl Finder for Chains<'_> {
         let mut attempts = self.attempts;
         let mut longest = Longest::new(at, word);
 
-        let mut index = *self.heads.get(self.hasher.hash(word))?;
+        let mut index = *likely(self.heads.get(self.hasher.hash(word)))?;
         while index >= lowest && attempts > 0 {
             if longest.consider::<REACH>(history, index).is_none() || index <= overwritten {
                 break;
             }
-            index = *likely(self.chain.get(link(index, self.chain)))?;
+            index = *self.chain.get(index as usize & self.mask)?;
             attempts -= 1;
         }
 
@@ -104,7 +109,11 @@ impl Finder for Chains<'_> {
                 {
                     break;
                 }
-                index = *attached.chain.get(link(index, attached.chain))?;
+                index = *likely(
+                    attached
+                        .chain
+                        .get(index as usize & (attached.chain.len() - 1)),
+                )?;
                 attempts -= 1;
             }
         }

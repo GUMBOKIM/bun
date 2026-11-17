@@ -5,35 +5,17 @@ use core::convert::Infallible;
 
 use bun_zstd_decoder::with_bmi2;
 
-use super::hash::Hasher;
-use super::{Attached, MatchState, Owner, Progress, Reach, SKIP_LOG, cells, prefetch};
+use super::hash::{Hasher, look_up_tagged, tagged};
+use super::near::Near;
+use super::{Attached, FILL_STEP, MatchState, Owner, Progress, Reach, SKIP_LOG, cells, prefetch};
 use crate::bytes::{AtLeast, chunk_at, likely, u32_at, u64_at, word_in};
 use crate::parameters::TAG_BITS;
 use crate::sequences::{OffsetValue, Repeats, Sequences};
 use crate::window::{FIRST_INDEX, History, WORD_LEN};
 
-pub(super) const FILL_STEP: usize = 3;
-
-/// The entry for `index` in the table of a dictionary.
-#[inline(always)]
-pub(super) fn tagged(index: u32, hash: usize) -> u32 {
-    index << TAG_BITS | u32::from(hash as u8)
-}
-
-/// The index that a dictionary has for `hash`, if its tag is the same.
-#[inline(always)]
-pub(super) fn look_up_tagged(table: &[u32], hash: usize) -> Option<u32> {
-    let &entry = table.get(hash >> TAG_BITS)?;
-    (entry as u8 == hash as u8).then_some(entry >> TAG_BITS)
-}
-
 /// Indexes the history up to its end.
-pub(super) fn fill(state: &mut MatchState, history: &History<'_>, owner: Owner) {
-    let tag_bits = if owner == Owner::Dictionary {
-        TAG_BITS
-    } else {
-        0
-    };
+pub(super) fn fill<const OWNER: Owner>(state: &mut MatchState, history: &History<'_>) {
+    let tag_bits = OWNER.tag_bits();
     let hasher = Hasher::new(state.tuning.min_match, state.tuning.hash_log + tag_bits);
     let mut position = history.position(state.next_to_index);
     let table = state.tables.split_mut().hash;
@@ -44,7 +26,7 @@ pub(super) fn fill(state: &mut MatchState, history: &History<'_>, owner: Owner) 
             let Some(entry) = table.get_mut(hash >> tag_bits) else {
                 return;
             };
-            if owner == Owner::Frame {
+            if OWNER == Owner::Frame {
                 *entry = index;
                 break;
             }
@@ -64,7 +46,6 @@ pub(super) fn search<const REACH: Reach>(
     repeats: &mut Repeats,
 ) -> u32 {
     let (tuning, bounds) = (state.tuning, state.bounds());
-    let end = history.index(history.end());
     let mut searcher = Searcher {
         history: *history,
         table: cells(state.tables.split_mut().hash),
@@ -74,11 +55,15 @@ pub(super) fn search<const REACH: Reach>(
 
     if REACH == Reach::Attached {
         let mut progress = Progress::new(sequences, history.start, *repeats, u32::MAX);
-        searcher.search_with_attached(attached, &mut progress);
+        let progress_mut = &mut progress;
+        with_bmi2(
+            #[inline(always)]
+            move || searcher.search_with_attached(attached, progress_mut),
+        );
         return progress.finish(repeats, u32::MAX);
     }
 
-    let lowest = bounds.lowest(end);
+    let lowest = bounds.lowest(history.index(history.end()));
     if REACH == Reach::Older && lowest < history.prefix_index {
         searcher.history = history.from_older(lowest);
         let max_offset = history.index(history.start) - lowest - 1;
@@ -91,18 +76,14 @@ pub(super) fn search<const REACH: Reach>(
         return progress.finish(repeats, max_offset);
     }
 
-    let near = Near::new(history, bounds.lowest_in_prefix(end));
-    let first = near.history.index(near.history.start);
-    let max_offset = first - bounds.lowest_in_prefix(first);
-    let anchor = history.start - near.start;
-    let mut progress = Progress::new(sequences, anchor, *repeats, max_offset);
-    // In a small window it is hard to predict whether a candidate is still in it.
-    if tuning.window_log < 19 {
-        searcher.search_prefix::<true>(&near, &mut progress);
-    } else {
-        searcher.search_prefix::<false>(&near, &mut progress);
-    }
-    near.start + progress.finish(repeats, max_offset)
+    Near::search(history, bounds, sequences, repeats, |near, progress| {
+        // In a small window it is hard to predict whether a candidate is still in it.
+        if tuning.window_log < 19 {
+            searcher.search_prefix::<true>(near, progress)
+        } else {
+            searcher.search_prefix::<false>(near, progress)
+        }
+    })
 }
 
 /// Two adjacent positions, each with a word to hash, and the margin that the search keeps.
@@ -135,7 +116,7 @@ impl<'a> Searcher<'a> {
         self,
         near: &Near<'a>,
         progress: &mut Progress<'_>,
-    ) -> Option<()> {
+    ) -> Option<u32> {
         let mut at = near.history.start;
         if !Near::has_repeats(progress, at) {
             at = self.start_prefix(near, progress)?;
@@ -144,7 +125,6 @@ impl<'a> Searcher<'a> {
             #[inline(always)]
             move || self.scan_prefix::<IS_BRANCHLESS, true>(near, at, progress),
         )
-        .map(drop)
     }
 
     #[inline(never)]
@@ -356,6 +336,7 @@ impl<'a> Searcher<'a> {
         }
     }
 
+    #[inline(always)]
     fn search_with_attached(
         mut self,
         attached: &Attached<'_>,
@@ -429,78 +410,5 @@ impl<'a> Searcher<'a> {
             self.insert(progress.anchor - 2)?;
             self.take_repeats(progress)?;
         }
-    }
-}
-
-/// The end of the prefix that is within reach of the whole block. One comparison tells whether a candidate is in it.
-pub(super) struct Near<'a> {
-    /// Starts at the first position that has something before it.
-    pub(super) history: History<'a>,
-    /// Offsets from earlier blocks can reach further.
-    all: History<'a>,
-    pub(super) start: u32,
-}
-
-impl<'a> Near<'a> {
-    pub(super) fn new(all: &History<'a>, lowest: u32) -> Self {
-        let start = all.position(lowest);
-        let history = History {
-            prefix: all.prefix.get(start as usize..).unwrap_or_default(),
-            prefix_index: lowest,
-            start: (all.start - start).max(1),
-            ..*all
-        };
-        Self {
-            history,
-            all: *all,
-            start,
-        }
-    }
-
-    /// Whether the recent offsets lead to something near from `at` on. The second one may be missing.
-    #[inline(always)]
-    pub(super) fn has_repeats(progress: &Progress<'_>, at: u32) -> bool {
-        progress.recent.wrapping_sub(1) < at && progress.second <= at
-    }
-
-    /// Whether `value` is `offset` bytes before `at` of the near `chunks`.
-    #[inline(always)]
-    pub(super) fn has_before<const HAS_REPEATS: bool, const N: usize>(
-        &self,
-        chunks: AtLeast<'_, N>,
-        at: usize,
-        offset: usize,
-        value: u32,
-    ) -> Option<bool> {
-        if HAS_REPEATS {
-            return Some(likely(chunks.word(at.wrapping_sub(offset)))? as u32 == value);
-        }
-        let back = (at as u32 + self.start).wrapping_sub(offset as u32);
-        Some(offset != 0 && u32_at(self.all.prefix, back) == Some(value))
-    }
-
-    /// The history for matches at recent offsets, and where `at` of the near one is in it.
-    #[inline(always)]
-    fn for_repeats<const HAS_REPEATS: bool>(
-        &self,
-        near: &History<'a>,
-        at: u32,
-    ) -> (History<'a>, u32) {
-        if HAS_REPEATS {
-            (*near, at)
-        } else {
-            (self.all, at + self.start)
-        }
-    }
-
-    #[inline(always)]
-    pub(super) fn repeat_len<const HAS_REPEATS: bool>(
-        &self,
-        near: &History<'a>,
-        at: u32,
-        offset: u32,
-    ) -> u32 {
-        let (history, at) = self.for_repeats::<HAS_REPEATS>(near, at);
-        4 + history.match_len(at + 4, (at + 4).wrapping_sub(offset))
     }
 }

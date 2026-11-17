@@ -1,3 +1,5 @@
+use crate::parameters::TAG_BITS;
+
 /// Hashes the lowest bytes of a word.
 #[derive(Clone, Copy)]
 pub(super) struct Hasher {
@@ -43,4 +45,17 @@ impl Hasher {
     pub(super) fn hash(self, word: u64) -> usize {
         word.wrapping_mul(self.multiplier).wrapping_shr(self.shift) as usize
     }
+}
+
+/// The entry for `index` in the table of a dictionary.
+#[inline(always)]
+pub(super) fn tagged(index: u32, hash: usize) -> u32 {
+    index << TAG_BITS | u32::from(hash as u8)
+}
+
+/// The index that a dictionary has for `hash`, if its tag is the same.
+#[inline(always)]
+pub(super) fn look_up_tagged(table: &[u32], hash: usize) -> Option<u32> {
+    let &entry = table.get(hash >> TAG_BITS)?;
+    (entry as u8 == hash as u8).then_some(entry >> TAG_BITS)
 }

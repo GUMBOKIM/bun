@@ -3,25 +3,27 @@
 use bun_zstd_decoder::format::BLOCK_LEN_MAX;
 
 use crate::array::At;
+use crate::bytes::chunk_at;
 use crate::entropy::histogram;
 use crate::parameters::Strategy;
 
 type Block = [u8; BLOCK_LEN_MAX];
 
+/// Products of two counts take no more than 30 bits.
 struct Fingerprint<const N: usize> {
     events: [u32; N],
-    count: u64,
+    count: u32,
 }
 
 impl<const N: usize> Fingerprint<N> {
-    fn distance(&self, other: &Self) -> u64 {
+    fn distance(&self, other: &Self) -> u32 {
         let pairs = self.events.iter().zip(&other.events);
-        let scaled = pairs.map(|(&a, &b)| (u64::from(a) * other.count, u64::from(b) * self.count));
-        scaled.map(|(a, b)| a.abs_diff(b)).sum()
+        let scaled = pairs.map(|(a, b)| (a * other.count) as i32 - (b * self.count) as i32);
+        scaled.map(i32::unsigned_abs).sum()
     }
 
     fn differs_from(&self, other: &Self, penalty: u64) -> bool {
-        self.distance(other) >= self.count * other.count * (14 + penalty) / 16
+        u64::from(self.distance(other)) >= u64::from(self.count * other.count) * (14 + penalty) / 16
     }
 }
 
@@ -33,7 +35,7 @@ fn split_by_borders(block: &Block) -> usize {
         histogram::add(&mut events, bytes);
         Fingerprint {
             events,
-            count: SAMPLE_LEN as u64,
+            count: SAMPLE_LEN as u32,
         }
     };
     let (first, last) = (sample(0), sample(block.len() - SAMPLE_LEN));
@@ -42,7 +44,7 @@ fn split_by_borders(block: &Block) -> usize {
     }
     let middle = sample((block.len() - SAMPLE_LEN) / 2);
     let (from_first, from_last) = (first.distance(&middle), last.distance(&middle));
-    if from_first.abs_diff(from_last) < (SAMPLE_LEN * SAMPLE_LEN / 3) as u64 {
+    if from_first.abs_diff(from_last) < (SAMPLE_LEN * SAMPLE_LEN / 3) as u32 {
         block.len() / 2
     } else if from_first > from_last {
         block.len() / 4
@@ -56,17 +58,19 @@ fn split_by_chunks<const RATE: usize, const N: usize>(block: &Block) -> usize {
     const CHUNK_LEN: usize = 8 << 10;
     let fingerprint = |chunk: &[u8; CHUNK_LEN]| {
         let mut events = [0; N];
-        for &pair @ [first, _] in chunk.array_windows().step_by(RATE) {
+        let mut at = 0;
+        while let Some(&pair @ [first, _]) = chunk_at(chunk, at) {
             let class = if N == 256 {
                 u32::from(first)
             } else {
                 u32::from(u16::from_le_bytes(pair)).wrapping_mul(0x9E37_79B9) >> (32 - N.ilog2())
             };
             *events.at_mut(class as usize) += 1;
+            at += RATE as u32;
         }
         Fingerprint {
             events,
-            count: ((CHUNK_LEN - 1) / RATE) as u64,
+            count: ((CHUNK_LEN - 1) / RATE) as u32,
         }
     };
 

@@ -38,12 +38,7 @@ impl LongMatcher {
             self.older_end = core::mem::take(&mut self.filled);
         }
         let start = self.filled;
-        let used = self.buffer.get_mut(start..).unwrap_or_default();
-        let (overwriting, appended) = section.split_at(section.len().min(used.len()));
-        for (to, from) in used.iter_mut().zip(overwriting) {
-            *to = *from;
-        }
-        self.buffer.extend_from_slice(appended);
+        vec::write_at(&mut self.buffer, start, section);
         self.filled += section.len();
 
         let older = self.buffer.get(self.filled..self.older_end);
@@ -85,6 +80,15 @@ struct Job {
     is_abandoned: Shared<AtomicBool>,
 }
 
+impl Job {
+    fn ensure_wanted(&self) -> Result<()> {
+        if self.is_abandoned.load(Ordering::SeqCst) {
+            return Err(Error::StageWrong);
+        }
+        Ok(())
+    }
+}
+
 #[derive(Default)]
 struct Worker {
     writer: Option<FrameWriter>,
@@ -94,11 +98,7 @@ struct Worker {
 
 impl Worker {
     fn compress(&mut self, job: &Job) -> Result<()> {
-        let ensure_wanted = || match job.is_abandoned.load(Ordering::SeqCst) {
-            true => Err(Error::StageWrong),
-            false => Ok(()),
-        };
-        ensure_wanted()?;
+        job.ensure_wanted()?;
         let (earlier, section) = job
             .input
             .split_at_checked(job.start)
@@ -112,7 +112,7 @@ impl Worker {
             hash.update(section);
         }
         job.relay.1.send(relay).map_err(|_| Error::Internal)?;
-        ensure_wanted()?;
+        job.ensure_wanted()?;
 
         let (len, dictionary, start) = match &job.frame {
             Some((len, dictionary)) => {
@@ -121,22 +121,17 @@ impl Worker {
             }
             None => (Some(section.len() as u64), None, Start::Part(earlier)),
         };
-        let writer = match &mut self.writer {
-            Some(writer) => {
-                writer.restart(job.plan, len, start)?;
-                writer
-            }
-            None => self.writer.insert(FrameWriter::new(job.plan, len, start)?),
-        };
+        let writer = (self.writer).get_or_insert_with(|| FrameWriter::new(job.plan));
+        writer.start(job.plan, len, start)?;
         core::mem::swap(&mut writer.long_matches, &mut self.long_matches);
-        if self.out.is_empty() {
-            let len = worst_case_len(CHUNK_LEN) + FRAME_HEADER_LEN_MAX + CHECKSUM_LEN;
-            self.out = vec::filled(0, len + 2 * worst_case_len(BLOCK_LEN_MAX))?;
-        }
+        let [for_chunk, for_block] =
+            [CHUNK_LEN, BLOCK_LEN_MAX].map(|len| worst_case_len(len.min(section.len())));
+        let room = FRAME_HEADER_LEN_MAX + for_chunk + 2 * for_block + CHECKSUM_LEN;
+        vec::grow(&mut self.out, 0, room)?;
 
         let mut start = job.start;
         loop {
-            ensure_wanted()?;
+            job.ensure_wanted()?;
             let end = job.input.len().min(start + CHUNK_LEN);
             let input = Input {
                 segment: job.input.get(..end).ok_or(Error::Internal)?,
@@ -212,6 +207,7 @@ impl Pool {
         if self.threads < useful_threads {
             let jobs = mpmc::Receiver::clone(receiver);
             let spawned = std::thread::Builder::new()
+                .name("Zstd Worker".into())
                 .stack_size(STACK_LEN)
                 .spawn(move || Worker::default().run(&jobs));
             self.threads += usize::from(spawned.is_ok());

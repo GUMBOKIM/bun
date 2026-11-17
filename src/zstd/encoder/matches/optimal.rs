@@ -252,9 +252,7 @@ fn parse<const REACH: Reach, const IS_ACCURATE: bool>(
     repeats: &mut Repeats,
 ) -> u32 {
     let (tuning, history) = (state.tuning, &search.history);
-    optimal
-        .prices
-        .start_block::<IS_ACCURATE>(history.block(), search.entropy);
+    optimal.prices.start_block(history.block(), search.entropy);
     let (min_match, hashed) = (tuning.min_match.min(4), tuning.min_match.min(6));
     let tree = Tree::new(state, hashed);
     let mut finder = Finder {
@@ -496,6 +494,7 @@ impl Finder<'_> {
         let (prefix, limit) = (history.prefix, history.end() - WORD);
         let mut ways = ways.as_mut()?;
         let mut at = anchor + u32::from(anchor == 0);
+        let mut is_first_match = true;
 
         'block: while at < limit {
             // What the literals so far cost is the same for all ways, unlike their number.
@@ -517,6 +516,9 @@ impl Finder<'_> {
                 )?;
                 if let Some(&longest) = matches.last() {
                     if current == 0 {
+                        if core::mem::take(&mut is_first_match) {
+                            prices.derive::<IS_ACCURATE>();
+                        }
                         ways.set(0, prices.literal_len(here.literal_len), here)?;
                         *ways.repeats(0)? = here_repeats;
                     }
