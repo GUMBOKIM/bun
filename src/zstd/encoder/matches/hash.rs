@@ -1,6 +1,11 @@
 //! From bytes to entries of tables.
 
+use core::hint::select_unpredictable;
+
+use super::Owner;
+use crate::bytes::likely;
 use crate::parameters::TAG_BITS;
+use crate::window::FIRST_INDEX;
 
 /// Hashes the lowest bytes of a word.
 #[derive(Clone, Copy)]
@@ -49,15 +54,49 @@ impl Hasher {
     }
 }
 
-/// The entry for `index` in the table of a dictionary.
-#[inline(always)]
-pub(super) fn tagged(index: u32, hash: usize) -> u32 {
-    index << TAG_BITS | u32::from(hash as u8)
+/// An entry in the table of a dictionary: an index, and some more bits of the hash.
+#[derive(Clone, Copy)]
+pub(super) struct Tagged(pub(super) u32);
+
+impl Tagged {
+    #[inline(always)]
+    pub(super) fn new(index: u32, hash: usize) -> Self {
+        Self(index << TAG_BITS | u32::from(hash as u8))
+    }
+
+    /// With the tag replaced by how it differs from that of `hash`.
+    #[inline(always)]
+    pub(super) fn look_up(table: &[u32], hash: usize) -> Option<Self> {
+        Some(Self(
+            likely(table.get(hash >> TAG_BITS))? ^ u32::from(hash as u8),
+        ))
+    }
+
+    /// Of what was looked up, if the tags were the same. The first byte of a dictionary is not searched.
+    #[inline(always)]
+    pub(super) fn index(self) -> Option<u32> {
+        if self.0 as u8 != 0 {
+            return None;
+        }
+        // Keeps the compiler from testing this first, which is hard to predict.
+        core::hint::black_box(());
+        Some(self.0 >> TAG_BITS).filter(|&index| index > FIRST_INDEX)
+    }
 }
 
-/// The index that a dictionary has for `hash`, if its tag is the same.
+/// Puts `index` into the table of `OWNER`, unless it only `fills_gaps` and there is none.
 #[inline(always)]
-pub(super) fn look_up_tagged(table: &[u32], hash: usize) -> Option<u32> {
-    let &entry = table.get(hash >> TAG_BITS)?;
-    (entry as u8 == hash as u8).then_some(entry >> TAG_BITS)
+pub(super) fn insert<const OWNER: Owner>(
+    table: &mut [u32],
+    hash: usize,
+    index: u32,
+    fills_gaps: bool,
+) -> Option<()> {
+    let entry = likely(table.get_mut(hash >> OWNER.tag_bits()))?;
+    let new = match OWNER {
+        Owner::Frame => index,
+        Owner::Dictionary => Tagged::new(index, hash).0,
+    };
+    *entry = select_unpredictable(fills_gaps && *entry != 0, *entry, new);
+    Some(())
 }

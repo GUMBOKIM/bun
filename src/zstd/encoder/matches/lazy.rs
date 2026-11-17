@@ -76,21 +76,32 @@ impl Longest {
         self.note(history, len, self.at.wrapping_sub(earlier))
     }
 
+    /// The same for a position in the older run.
+    #[inline(always)]
+    pub(super) fn consider_older(&mut self, history: &History<'_>, earlier: u32) -> Option<()> {
+        let tail = likely(u32_at(
+            history.older,
+            earlier.wrapping_add(self.best.len - 3),
+        ));
+        if tail.is_some_and(|tail| tail != self.tail) {
+            return Some(());
+        }
+        let len = history.older_match_len(self.at, earlier);
+        let offset = (self.at + history.older.len() as u32).wrapping_sub(earlier);
+        self.note(history, len, offset)
+    }
+
     #[inline(always)]
     pub(super) fn consider<const REACH: Reach>(
         &mut self,
         history: &History<'_>,
         index: u32,
     ) -> Option<()> {
-        if REACH == Reach::Prefix || index >= history.prefix_index {
-            return self.consider_position(history, history.position(index));
+        if REACH != Reach::Older || index >= history.prefix_index {
+            self.consider_position(history, history.position(index))
+        } else {
+            self.consider_older(history, history.older_position(index))
         }
-        let earlier = history.older_position(index);
-        if u32_at(history.older, earlier) != u32_at(history.prefix, self.at) {
-            return Some(());
-        }
-        let len = 4 + history.older_match_len(self.at + 4, earlier + 4);
-        self.note(history, len, history.index(self.at).wrapping_sub(index))
     }
 }
 
@@ -201,12 +212,14 @@ impl Parser<'_> {
         }
         let current = history.index(at);
         let earlier = current.wrapping_sub(offset);
-        let lowest = match REACH {
-            Reach::Older => self.bounds.lowest(current),
-            _ => 0,
+        let repeats = match REACH {
+            Reach::Older => {
+                offset.wrapping_sub(1) < current - self.bounds.lowest(current)
+                    && history.u32_at_index(earlier) == value
+            }
+            _ => history.u32_at_any_index(earlier) == value && offset != 0,
         };
-        (offset.wrapping_sub(1) < current - lowest && history.u32_at_index(earlier) == value)
-            .then(|| history.match_len_at_index(at, earlier, 4))
+        repeats.then(|| history.match_len_at_index(at, earlier, 4))
     }
 
     #[inline(always)]

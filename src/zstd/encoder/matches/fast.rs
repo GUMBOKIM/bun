@@ -5,37 +5,35 @@ use core::convert::Infallible;
 
 use bun_highway::with_bmi2;
 
-use super::hash::{Hasher, look_up_tagged, tagged};
+use super::hash::{Hasher, Tagged, insert};
 use super::near::Near;
-use super::{Attached, FILL_STEP, MatchState, Owner, Progress, Reach, SKIP_LOG, cells, prefetch};
+use super::{Attached, MatchState, Owner, Progress, Reach, SKIP_LOG, cells, prefetch};
 use crate::bytes::{AtLeast, chunk_at, likely, u32_at, u64_at, word_in};
 use crate::parameters::TAG_BITS;
 use crate::sequences::{OffsetValue, Repeats, Sequences};
-use crate::window::{FIRST_INDEX, History, WORD_LEN};
+use crate::window::{History, WORD_LEN};
 
 /// Indexes the history up to its end.
 pub(super) fn fill<const OWNER: Owner>(state: &mut MatchState, history: &History<'_>) {
-    let tag_bits = OWNER.tag_bits();
-    let hasher = Hasher::new(state.tuning.min_match, state.tuning.hash_log + tag_bits);
-    let mut position = history.position(state.next_to_index);
+    let bits = state.tuning.hash_log + OWNER.tag_bits();
+    let hasher = Hasher::new(state.tuning.min_match, bits);
+    let (history, mut position) = (*history, history.position(state.next_to_index));
     let table = state.tables.split_mut().hash;
-    while let Some(chunk) = chunk_at::<{ WORD_LEN + FILL_STEP - 1 }>(history.prefix, position) {
-        let index = history.index(position);
-        for (step, word) in chunk.array_windows().enumerate() {
-            let hash = hasher.hash(u64::from_le_bytes(*word));
-            let Some(entry) = table.get_mut(hash >> tag_bits) else {
-                return;
-            };
-            if OWNER == Owner::Frame {
-                *entry = index;
-                break;
+    with_bmi2(
+        #[inline(always)]
+        move || -> Option<Infallible> {
+            loop {
+                let chunk = likely(chunk_at::<{ WORD_LEN + 2 }>(history.prefix, position))?;
+                let index = history.index(position);
+                insert::<OWNER>(table, hasher.hash(word_in::<0, _>(chunk)), index, false)?;
+                if OWNER == Owner::Dictionary {
+                    insert::<OWNER>(table, hasher.hash(word_in::<1, _>(chunk)), index + 1, true)?;
+                    insert::<OWNER>(table, hasher.hash(word_in::<2, _>(chunk)), index + 2, true)?;
+                }
+                position += 3;
             }
-            if step == 0 || *entry == 0 {
-                *entry = tagged(index + step as u32, hash);
-            }
-        }
-        position += FILL_STEP as u32;
-    }
+        },
+    );
 }
 
 pub(super) fn search<const REACH: Reach>(
@@ -244,7 +242,7 @@ impl<'a> Searcher<'a> {
             let at = progress.anchor;
             let word = likely(u64_at(history.prefix, at))?;
             let earlier = history.index(at).wrapping_sub(progress.second);
-            if progress.second == 0 || history.u32_at_index(earlier) != Some(word as u32) {
+            if history.u32_at_any_index(earlier) != Some(word as u32) || progress.second == 0 {
                 return Some(());
             }
             let len = history.match_len_at_index(at, earlier, 4);
@@ -356,7 +354,8 @@ impl<'a> Searcher<'a> {
             let mut ahead_word = likely(u64_at(bytes, ahead))?;
             let mut word = likely(u64_at(bytes, at))?;
             let mut entry = self.entry(word)?;
-            let mut attached_candidate = look_up_tagged(attached.hash, attached_hasher.hash(word));
+            let mut attached_candidate =
+                Tagged::look_up(attached.hash, attached_hasher.hash(word))?;
             let mut candidate = entry.get();
 
             let (found, earlier, repeats) = loop {
@@ -366,11 +365,10 @@ impl<'a> Searcher<'a> {
                 let ahead_hash = attached_hasher.hash(ahead_word);
                 entry.set(current);
 
-                if history.u32_at_index(back) == Some((word >> 8) as u32) {
+                if history.u32_at_any_index(back) == Some((word >> 8) as u32) {
                     break (at + 1, back, true);
                 }
-                if let Some(index) = attached_candidate
-                    && index > FIRST_INDEX
+                if let Some(index) = attached_candidate.index()
                     && u32_at(history.older, Attached::position(index)) == Some(word as u32)
                     && candidate <= history.prefix_index
                 {
@@ -382,7 +380,7 @@ impl<'a> Searcher<'a> {
                     break (at, candidate, false);
                 }
 
-                attached_candidate = look_up_tagged(attached.hash, ahead_hash);
+                attached_candidate = Tagged::look_up(attached.hash, ahead_hash)?;
                 candidate = ahead_entry.get();
                 if ahead >= next_step {
                     step += 1;

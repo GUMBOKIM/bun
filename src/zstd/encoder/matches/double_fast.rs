@@ -5,45 +5,37 @@ use core::convert::{Infallible, identity};
 
 use bun_highway::with_bmi2;
 
-use super::hash::{Hasher, look_up_tagged, tagged};
+use super::hash::{Hasher, Tagged, insert};
 use super::near::Near;
-use super::{Attached, FILL_STEP, MatchState, Owner, Progress, Reach, SKIP_LOG, cells, prefetch};
+use super::{Attached, MatchState, Owner, Progress, Reach, SKIP_LOG, TablesMut, cells, prefetch};
 use crate::bytes::{AtLeast, chunk_at, likely, u32_at, u64_at, word_in};
 use crate::parameters::TAG_BITS;
 use crate::sequences::{OffsetValue, Repeats, Sequences};
-use crate::window::{FIRST_INDEX, History, WORD_LEN};
+use crate::window::{History, WORD_LEN};
 
 /// Indexes the history up to its end.
 pub(super) fn fill<const OWNER: Owner>(state: &mut MatchState, history: &History<'_>) {
-    let tag_bits = OWNER.tag_bits();
-    let long_hasher = Hasher::new(8, state.tuning.hash_log + tag_bits);
-    let short_hasher = Hasher::new(state.tuning.min_match, state.tuning.chain_log + tag_bits);
-    let mut position = history.position(state.next_to_index);
-    let tables = state.tables.split_mut();
-    while let Some(chunk) = chunk_at::<{ WORD_LEN + FILL_STEP - 1 }>(history.prefix, position) {
-        let index = history.index(position);
-        for (step, word) in chunk.array_windows().enumerate() {
-            let word = u64::from_le_bytes(*word);
-            let (long_hash, short_hash) = (long_hasher.hash(word), short_hasher.hash(word));
-            let (Some(long), Some(short)) = (
-                tables.hash.get_mut(long_hash >> tag_bits),
-                tables.chain.get_mut(short_hash >> tag_bits),
-            ) else {
-                return;
-            };
-            if OWNER == Owner::Frame {
-                (*long, *short) = (index, index);
-                break;
+    let tuning = state.tuning;
+    let long = Hasher::new(8, tuning.hash_log + OWNER.tag_bits());
+    let short = Hasher::new(tuning.min_match, tuning.chain_log + OWNER.tag_bits());
+    let (history, mut position) = (*history, history.position(state.next_to_index));
+    let TablesMut { hash, chain, .. } = state.tables.split_mut();
+    with_bmi2(
+        #[inline(always)]
+        move || -> Option<Infallible> {
+            loop {
+                let chunk = likely(chunk_at::<{ WORD_LEN + 2 }>(history.prefix, position))?;
+                let (index, word) = (history.index(position), word_in::<0, _>(chunk));
+                insert::<OWNER>(chain, short.hash(word), index, false)?;
+                insert::<OWNER>(hash, long.hash(word), index, false)?;
+                if OWNER == Owner::Dictionary {
+                    insert::<OWNER>(hash, long.hash(word_in::<1, _>(chunk)), index + 1, true)?;
+                    insert::<OWNER>(hash, long.hash(word_in::<2, _>(chunk)), index + 2, true)?;
+                }
+                position += 3;
             }
-            if step == 0 {
-                *short = tagged(index, short_hash);
-            }
-            if step == 0 || *long == 0 {
-                *long = tagged(index + step as u32, long_hash);
-            }
-        }
-        position += FILL_STEP as u32;
-    }
+        },
+    );
 }
 
 pub(super) fn search<const REACH: Reach>(
@@ -310,7 +302,7 @@ impl<'a> Searcher<'a> {
             let word = likely(u64_at(history.prefix, at))?;
             let current = history.index(at);
             let earlier = current.wrapping_sub(progress.second);
-            if history.u32_at_index(earlier) != Some(word as u32) || progress.second == 0 {
+            if history.u32_at_any_index(earlier) != Some(word as u32) || progress.second == 0 {
                 return Some(());
             }
             let len = history.match_len_at_index(at, earlier, 4);
@@ -360,35 +352,38 @@ impl<'a> Searcher<'a> {
         attached: &Attached<'_>,
         progress: &mut Progress<'_>,
     ) -> Option<Infallible> {
-        self.history = self.history.with_prefix_of::<WORD_LEN>()?;
-        let history = &self.history;
-        let tuning = &attached.tuning;
+        let words = AtLeast::<WORD_LEN>::new(self.history.prefix)?;
+        self.history.prefix = words.bytes;
+        let (history, attached) = (&self.history, *attached);
+        let tuning = attached.tuning;
         let long_hasher = Hasher::new(8, tuning.hash_log + TAG_BITS);
         let short_hasher = Hasher::new(tuning.min_match, tuning.chain_log + TAG_BITS);
+        let look_up_long = |word| Tagged::look_up(attached.hash, long_hasher.hash(word));
         let find_long = identity(
             #[inline(always)]
-            |candidate: u32, word: u64| {
-                if u64_at(history.prefix, history.position(candidate)) == Some(word) {
+            |candidate: u32, tagged: Tagged, word: u64| {
+                let position = history.position(candidate) as usize;
+                if words.matches_at::<true>(position, |it| it == word) {
                     return Some(candidate);
                 }
-                let index = look_up_tagged(attached.hash, long_hasher.hash(word))?;
-                (index > FIRST_INDEX
-                    && u64_at(history.older, Attached::position(index)) == Some(word))
-                .then(|| index.wrapping_add(attached.delta))
+                let index = tagged.index()?;
+                (u64_at(history.older, Attached::position(index)) == Some(word))
+                    .then(|| index.wrapping_add(attached.delta))
             },
         );
         let find_short = identity(
             #[inline(always)]
-            |candidate: u32, word: u64| {
-                let (run, at, index) = if candidate > history.prefix_index {
-                    (history.prefix, history.position(candidate), candidate)
-                } else {
-                    let index = look_up_tagged(attached.chain, short_hasher.hash(word))
-                        .filter(|&index| index > FIRST_INDEX)?;
-                    let at = Attached::position(index);
-                    (history.older, at, index.wrapping_add(attached.delta))
-                };
-                (u32_at(run, at) == Some(word as u32)).then_some(index)
+            |candidate: u32, tagged: Tagged, word: u64| {
+                let position = history.position(candidate) as usize;
+                if words.matches_at::<true>(position, |it| it as u32 == word as u32)
+                    && position != 0
+                {
+                    return Some(candidate);
+                }
+                let index = tagged.index()?;
+                (candidate <= history.prefix_index
+                    && u32_at(history.older, Attached::position(index)) == Some(word as u32))
+                .then(|| index.wrapping_add(attached.delta))
             },
         );
 
@@ -396,27 +391,30 @@ impl<'a> Searcher<'a> {
         loop {
             let [word, next_word] = adjacent_words(history.prefix, at)?;
             let (short_entry, long_entry) = (self.short_entry(word)?, self.long_entry(word)?);
+            let attached_long = look_up_long(word)?;
+            let attached_short = Tagged::look_up(attached.chain, short_hasher.hash(word))?;
             let current = history.index(at);
             let (short, long) = (short_entry.replace(current), long_entry.replace(current));
             let back = (current + 1).wrapping_sub(progress.recent);
 
-            let found =
-                if history.u32_at_index(back) == Some(next_word as u32) && progress.recent != 0 {
-                    Match::repeat(at + 1, back)
-                } else if let Some(long) = find_long(long, word) {
-                    Match::new(at, long, 8)
-                } else if let Some(short) = find_short(short, word) {
-                    let long = self.long_entry(next_word)?.replace(current + 1);
-                    match find_long(long, next_word) {
-                        Some(long) => Match::new(at + 1, long, 8),
-                        None => Match::new(at, short, 4),
-                    }
-                } else {
-                    at += ((at - progress.anchor) >> SKIP_LOG) + 1;
-                    #[cfg(target_arch = "aarch64")]
-                    prefetch(history.prefix, at as usize + 256);
-                    continue;
-                };
+            let found = if history.u32_at_any_index(back) == Some(next_word as u32)
+                && progress.recent != 0
+            {
+                Match::repeat(at + 1, back)
+            } else if let Some(long) = find_long(long, attached_long, word) {
+                Match::new(at, long, 8)
+            } else if let Some(short) = find_short(short, attached_short, word) {
+                let long = self.long_entry(next_word)?.replace(current + 1);
+                match find_long(long, look_up_long(next_word)?, next_word) {
+                    Some(long) => Match::new(at + 1, long, 8),
+                    None => Match::new(at, short, 4),
+                }
+            } else {
+                at += ((at - progress.anchor) >> SKIP_LOG) + 1;
+                #[cfg(target_arch = "aarch64")]
+                prefetch(history.prefix, at as usize + 256);
+                continue;
+            };
             self.take_match(at, found, progress)?;
             at = progress.anchor;
         }
@@ -425,7 +423,7 @@ impl<'a> Searcher<'a> {
 
 #[inline(always)]
 fn adjacent_words(bytes: &[u8], at: u32) -> Option<[u64; 2]> {
-    let chunk = chunk_at::<{ WORD_LEN + 1 }>(bytes, at)?;
+    let chunk = likely(chunk_at::<{ WORD_LEN + 1 }>(bytes, at))?;
     Some([word_in::<0, _>(chunk), word_in::<1, _>(chunk)])
 }
 

@@ -105,9 +105,8 @@ impl Finder for Chains<'_> {
             let overwritten = attached.end.saturating_sub(attached.chain.len() as u32);
             let mut index = *attached.hash.get(self.attached_hasher.hash(word))?;
             while index >= FIRST_INDEX && attempts > 0 {
-                let in_history = index.wrapping_add(attached.delta);
-                if longest.consider::<REACH>(history, in_history).is_none() || index <= overwritten
-                {
+                let earlier = Attached::position(index);
+                if longest.consider_older(history, earlier).is_none() || index <= overwritten {
                     break;
                 }
                 index = *likely(

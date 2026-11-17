@@ -30,8 +30,6 @@ use long_distance::Candidates;
 
 /// The more bytes in a row do not match, the more are skipped.
 const SKIP_LOG: u32 = 8;
-/// Of so many positions, the fast strategies index at least one in what they did not search.
-const FILL_STEP: usize = 3;
 const WORD: u32 = WORD_LEN as u32;
 
 /// What there is to search besides the prefix.
@@ -263,7 +261,7 @@ pub(crate) enum Owner {
 
 impl Owner {
     /// In the tables of the fast strategies.
-    fn tag_bits(self) -> u32 {
+    const fn tag_bits(self) -> u32 {
         match self {
             Self::Frame => 0,
             Self::Dictionary => TAG_BITS,

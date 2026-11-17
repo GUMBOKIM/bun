@@ -296,11 +296,11 @@ impl<const N: usize> Finder for Rows<'_, N> {
                 candidates.get_mut(..attempts)?,
                 |index| {
                     prefetch(history.older, Attached::position(index) as usize);
-                    index.wrapping_add(attached.delta)
+                    Attached::position(index)
                 },
             )?;
-            for &index in found {
-                if longest.consider::<REACH>(history, index).is_none() {
+            for &found in found {
+                if longest.consider_older(history, found).is_none() {
                     break;
                 }
             }
