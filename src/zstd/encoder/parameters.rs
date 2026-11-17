@@ -22,6 +22,31 @@ const WORKERS_MAX: i32 = 256;
 /// The bits of a hash that rows, and the tables of a dictionary for the two fast strategies, keep beside an index.
 pub(crate) const TAG_BITS: u32 = 8;
 
+/// The values of `ZSTD_cParameter`.
+mod key {
+    pub(super) const FORMAT: u32 = 10;
+    pub(super) const COMPRESSION_LEVEL: u32 = 100;
+    pub(super) const WINDOW_LOG: u32 = 101;
+    pub(super) const HASH_LOG: u32 = 102;
+    pub(super) const CHAIN_LOG: u32 = 103;
+    pub(super) const SEARCH_LOG: u32 = 104;
+    pub(super) const MIN_MATCH: u32 = 105;
+    pub(super) const TARGET_LENGTH: u32 = 106;
+    pub(super) const STRATEGY: u32 = 107;
+    pub(super) const TARGET_BLOCK_SIZE: u32 = 130;
+    pub(super) const ENABLE_LONG_DISTANCE_MATCHING: u32 = 160;
+    pub(super) const LDM_HASH_LOG: u32 = 161;
+    pub(super) const LDM_MIN_MATCH: u32 = 162;
+    pub(super) const LDM_BUCKET_SIZE_LOG: u32 = 163;
+    pub(super) const LDM_HASH_RATE_LOG: u32 = 164;
+    pub(super) const CONTENT_SIZE_FLAG: u32 = 200;
+    pub(super) const CHECKSUM_FLAG: u32 = 201;
+    pub(super) const DICTIONARY_ID_FLAG: u32 = 202;
+    pub(super) const WORKERS: u32 = 400;
+    pub(super) const JOB_SIZE: u32 = 401;
+    pub(super) const OVERLAP_LOG: u32 = 402;
+}
+
 /// The values are those of `ZSTD_strategy`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(u8)]
@@ -285,30 +310,38 @@ impl Request {
             _ => Err(Error::ParameterOutOfBound),
         };
         match key {
-            10 => self.header.has_magic = within(0..=1)? == 0,
-            100 => self.level = Self::new(value).level,
-            101 => self.window_log = within(WINDOW_LOG_MIN..=WINDOW_LOG_MAX)?,
-            102 => self.hash_log = within(HASH_LOG_MIN..=HASH_LOG_MAX)?,
-            103 => self.chain_log = within(HASH_LOG_MIN..=HASH_LOG_MAX)?,
-            104 => self.search_log = within(1..=WINDOW_LOG_MAX - 1)?,
-            105 => self.min_match = within(3..=7)?,
-            106 => self.target_length = within(0..=BLOCK_LEN_MAX as u32)?,
-            107 => self.strategy = within(1..=9).map(|_| Strategy::new(value))?,
-            130 if value > BLOCK_LEN_MAX as i32 => return Err(Error::ParameterOutOfBound),
-            130 if value == 0 => self.target_block_len = 0,
-            130 => self.target_block_len = value.max(TARGET_BLOCK_LEN_MIN) as usize,
-            160 => self.matches_long_distance = (within(0..=2)? != 0).then_some(value == 1),
-            161 => self.long_distance.hash_log = within(HASH_LOG_MIN..=HASH_LOG_MAX)?,
-            162 => self.long_distance.min_match = within(4..=4096)?,
-            163 => self.long_distance.bucket_log = within(1..=8)?,
-            164 => self.long_distance.hash_rate_log = within(0..=WINDOW_LOG_MAX - HASH_LOG_MIN)?,
-            200 => self.header.has_content_size = value != 0,
-            201 => self.header.has_checksum = value != 0,
-            202 => self.header.has_dictionary_id = value != 0,
-            400 => self.workers = value.clamp(0, WORKERS_MAX) as usize,
-            401 if value == 0 => self.job_len = 0,
-            401 => self.job_len = value.clamp(JOB_LEN_MIN as i32, JOB_LEN_MAX) as usize,
-            402 => self.overlap_log = value.clamp(0, 9) as u32,
+            key::FORMAT => self.header.has_magic = within(0..=1)? == 0,
+            key::COMPRESSION_LEVEL => self.level = Self::new(value).level,
+            key::WINDOW_LOG => self.window_log = within(WINDOW_LOG_MIN..=WINDOW_LOG_MAX)?,
+            key::HASH_LOG => self.hash_log = within(HASH_LOG_MIN..=HASH_LOG_MAX)?,
+            key::CHAIN_LOG => self.chain_log = within(HASH_LOG_MIN..=HASH_LOG_MAX)?,
+            key::SEARCH_LOG => self.search_log = within(1..=WINDOW_LOG_MAX - 1)?,
+            key::MIN_MATCH => self.min_match = within(3..=7)?,
+            key::TARGET_LENGTH => self.target_length = within(0..=BLOCK_LEN_MAX as u32)?,
+            key::STRATEGY => self.strategy = within(1..=9).map(|_| Strategy::new(value))?,
+            key::TARGET_BLOCK_SIZE if value > BLOCK_LEN_MAX as i32 => {
+                return Err(Error::ParameterOutOfBound);
+            }
+            key::TARGET_BLOCK_SIZE if value == 0 => self.target_block_len = 0,
+            key::TARGET_BLOCK_SIZE => {
+                self.target_block_len = value.max(TARGET_BLOCK_LEN_MIN) as usize
+            }
+            key::ENABLE_LONG_DISTANCE_MATCHING => {
+                self.matches_long_distance = (within(0..=2)? != 0).then_some(value == 1)
+            }
+            key::LDM_HASH_LOG => self.long_distance.hash_log = within(HASH_LOG_MIN..=HASH_LOG_MAX)?,
+            key::LDM_MIN_MATCH => self.long_distance.min_match = within(4..=4096)?,
+            key::LDM_BUCKET_SIZE_LOG => self.long_distance.bucket_log = within(1..=8)?,
+            key::LDM_HASH_RATE_LOG => {
+                self.long_distance.hash_rate_log = within(0..=WINDOW_LOG_MAX - HASH_LOG_MIN)?
+            }
+            key::CONTENT_SIZE_FLAG => self.header.has_content_size = value != 0,
+            key::CHECKSUM_FLAG => self.header.has_checksum = value != 0,
+            key::DICTIONARY_ID_FLAG => self.header.has_dictionary_id = value != 0,
+            key::WORKERS => self.workers = value.clamp(0, WORKERS_MAX) as usize,
+            key::JOB_SIZE if value == 0 => self.job_len = 0,
+            key::JOB_SIZE => self.job_len = value.clamp(JOB_LEN_MIN as i32, JOB_LEN_MAX) as usize,
+            key::OVERLAP_LOG => self.overlap_log = value.clamp(0, 9) as u32,
             _ => return Err(Error::ParameterUnsupported),
         }
         Ok(())

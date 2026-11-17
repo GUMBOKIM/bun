@@ -1,3 +1,5 @@
+//! Counting symbols.
+
 use crate::array::At;
 
 /// How often each of `N` symbols occurs.

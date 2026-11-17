@@ -6,7 +6,7 @@ use bun_zstd_decoder::{Error, Output, Result, Status};
 
 use crate::dictionary::Dictionary;
 use crate::frame::{FrameWriter, Start};
-use crate::parameters::{DEFAULT_LEVEL, JOB_LEN_MIN, Plan, Purpose, Request};
+use crate::parameters::{JOB_LEN_MIN, Plan, Purpose, Request};
 use crate::vec::{self, Shared};
 use crate::window::Input;
 use crate::workers::{Pool, Workers};
@@ -234,9 +234,9 @@ pub struct Encoder {
 }
 
 impl Encoder {
-    pub fn new() -> Self {
+    pub fn new(level: i32) -> Self {
         Self {
-            request: Request::new(DEFAULT_LEVEL),
+            request: Request::new(level),
             pledged_len: None,
             dictionary_bytes: None,
             dictionary: None,

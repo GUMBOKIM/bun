@@ -1,7 +1,7 @@
 //! A hash table for matches of 8 bytes, which are preferred, and one for shorter ones.
 
 use core::cell::Cell;
-use core::convert::Infallible;
+use core::convert::{Infallible, identity};
 
 use bun_zstd_decoder::with_bmi2;
 
@@ -328,7 +328,7 @@ impl<'a> Searcher<'a> {
         let history = &self.history;
         let (lowest, mut at) = (history.older_index(), history.start);
         loop {
-            let (word, next_word) = adjacent_words(history.prefix, at)?;
+            let [word, next_word] = adjacent_words(history.prefix, at)?;
             let (short_entry, long_entry) = (self.short_entry(word)?, self.long_entry(word)?);
             let current = history.index(at);
             let (short, long) = (short_entry.replace(current), long_entry.replace(current));
@@ -366,31 +366,36 @@ impl<'a> Searcher<'a> {
         let tuning = &attached.tuning;
         let long_hasher = Hasher::new(8, tuning.hash_log + TAG_BITS);
         let short_hasher = Hasher::new(tuning.min_match, tuning.chain_log + TAG_BITS);
-        let find_long = #[inline(always)]
-        |candidate: u32, word: u64| {
-            if u64_at(history.prefix, history.position(candidate)) == Some(word) {
-                return Some(candidate);
-            }
-            let index = look_up_tagged(attached.hash, long_hasher.hash(word))?;
-            (index > FIRST_INDEX && u64_at(history.older, Attached::position(index)) == Some(word))
+        let find_long = identity(
+            #[inline(always)]
+            |candidate: u32, word: u64| {
+                if u64_at(history.prefix, history.position(candidate)) == Some(word) {
+                    return Some(candidate);
+                }
+                let index = look_up_tagged(attached.hash, long_hasher.hash(word))?;
+                (index > FIRST_INDEX
+                    && u64_at(history.older, Attached::position(index)) == Some(word))
                 .then(|| index.wrapping_add(attached.delta))
-        };
-        let find_short = #[inline(always)]
-        |candidate: u32, word: u64| {
-            let (run, at, index) = if candidate > history.prefix_index {
-                (history.prefix, history.position(candidate), candidate)
-            } else {
-                let index = look_up_tagged(attached.chain, short_hasher.hash(word))
-                    .filter(|&index| index > FIRST_INDEX)?;
-                let at = Attached::position(index);
-                (history.older, at, index.wrapping_add(attached.delta))
-            };
-            (u32_at(run, at) == Some(word as u32)).then_some(index)
-        };
+            },
+        );
+        let find_short = identity(
+            #[inline(always)]
+            |candidate: u32, word: u64| {
+                let (run, at, index) = if candidate > history.prefix_index {
+                    (history.prefix, history.position(candidate), candidate)
+                } else {
+                    let index = look_up_tagged(attached.chain, short_hasher.hash(word))
+                        .filter(|&index| index > FIRST_INDEX)?;
+                    let at = Attached::position(index);
+                    (history.older, at, index.wrapping_add(attached.delta))
+                };
+                (u32_at(run, at) == Some(word as u32)).then_some(index)
+            },
+        );
 
         let mut at = history.start;
         loop {
-            let (word, next_word) = adjacent_words(history.prefix, at)?;
+            let [word, next_word] = adjacent_words(history.prefix, at)?;
             let (short_entry, long_entry) = (self.short_entry(word)?, self.long_entry(word)?);
             let current = history.index(at);
             let (short, long) = (short_entry.replace(current), long_entry.replace(current));
@@ -420,9 +425,9 @@ impl<'a> Searcher<'a> {
 }
 
 #[inline(always)]
-fn adjacent_words(bytes: &[u8], at: u32) -> Option<(u64, u64)> {
+fn adjacent_words(bytes: &[u8], at: u32) -> Option<[u64; 2]> {
     let chunk = chunk_at::<{ WORD_LEN + 1 }>(bytes, at)?;
-    Some((word_in::<0, _>(chunk), word_in::<1, _>(chunk)))
+    Some([word_in::<0, _>(chunk), word_in::<1, _>(chunk)])
 }
 
 #[derive(Clone, Copy)]

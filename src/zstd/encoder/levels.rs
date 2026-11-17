@@ -1,3 +1,5 @@
+//! What the compression levels stand for.
+
 use crate::parameters::Strategy::{self, *};
 
 pub(crate) const MAX_LEVEL: i32 = 22;

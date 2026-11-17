@@ -9,14 +9,7 @@
     clippy::unreachable
 )]
 #![warn(unused_must_use)]
-#![feature(
-    adt_const_params,
-    allocator_ext,
-    hint_prefetch,
-    mpmc_channel,
-    stmt_expr_attributes,
-    vec_push_within_capacity
-)]
+#![feature(adt_const_params, allocator_ext, hint_prefetch, mpmc_channel)]
 
 mod array;
 mod block;

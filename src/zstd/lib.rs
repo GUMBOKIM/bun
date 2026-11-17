@@ -29,8 +29,8 @@ pub fn compress_append(out: &mut Vec<u8>, bytes: &[u8], level: i32) -> Result<()
 pub struct Encoder(bun_zstd_encoder::Encoder);
 
 impl Encoder {
-    pub fn new() -> Self {
-        Self(bun_zstd_encoder::Encoder::new())
+    pub fn new(level: i32) -> Self {
+        Self(bun_zstd_encoder::Encoder::new(level))
     }
 
     pub fn load_dictionary(&mut self, dictionary: &[u8]) -> Result<(), Error> {
@@ -39,10 +39,6 @@ impl Encoder {
 
     pub fn set_pledged_len(&mut self, len: Option<u64>) -> Result<(), Error> {
         self.0.set_pledged_len(len)
-    }
-
-    pub fn set_level(&mut self, level: i32) -> Result<(), Error> {
-        self.set_parameter(100, level)
     }
 
     /// `key` is a `ZSTD_cParameter`.

@@ -1,6 +1,6 @@
 //! Finds long matches at any distance, ahead of the regular search.
 
-use bun_zstd_decoder::{Error, Result, XxHash64};
+use bun_zstd_decoder::{Result, XxHash64};
 
 use super::gear_table::GEAR_TABLE;
 use super::{MatchState, Search, WORD, prefetch};
@@ -312,7 +312,7 @@ impl Finder {
         start: usize,
         len: usize,
         candidates: &mut Candidates,
-    ) -> Result<()> {
+    ) {
         const CHUNK_LEN: usize = 1 << 20;
         let mut unmatched = 0;
         for chunk_start in (start..start + len).step_by(CHUNK_LEN) {
@@ -327,7 +327,7 @@ impl Finder {
             let first = candidates.list.len();
             if first < candidates.limit {
                 let history = self.window.history(input, chunk_start, chunk_len);
-                let left = self.find_in(&history, lowest, candidates)?;
+                let left = self.find_in(&history, lowest, candidates);
                 match candidates.list.get_mut(first) {
                     Some(first) => {
                         first.literal_len += unmatched;
@@ -339,7 +339,6 @@ impl Finder {
             self.window.next = chunk_end;
             self.window.raise_start(lowest);
         }
-        Ok(())
     }
 
     fn insert(&mut self, bucket: usize, entry: [u32; 2]) {
@@ -389,12 +388,7 @@ impl Finder {
     }
 
     /// Returns how many bytes follow the last match.
-    fn find_in(
-        &mut self,
-        history: &History<'_>,
-        lowest: u32,
-        candidates: &mut Candidates,
-    ) -> Result<u32> {
+    fn find_in(&mut self, history: &History<'_>, lowest: u32, candidates: &mut Candidates) -> u32 {
         let min_match = self.parameters.min_match;
         let bucket_mask = self.oldest.len() - 1;
         let bytes = |start: u32, end: u32| history.prefix.get(start as usize..end as usize);
@@ -427,14 +421,12 @@ impl Finder {
                 let Some((earlier, before, after)) = found else {
                     continue;
                 };
-                if candidates.list.len() == candidates.limit {
-                    return Err(Error::DstSizeTooSmall);
-                }
-                candidates.list.push(Candidate {
+                let candidate = Candidate {
                     offset: index - earlier,
                     literal_len: split.start - before - anchor,
                     match_len: before + after,
-                });
+                };
+                vec::push_into_room(&mut candidates.list, candidate);
                 anchor = split.start + after;
                 // A pattern that repeats needs no more than one entry.
                 if anchor > at {
@@ -443,6 +435,6 @@ impl Finder {
                 }
             }
         }
-        Ok(history.end() - anchor)
+        history.end() - anchor
     }
 }

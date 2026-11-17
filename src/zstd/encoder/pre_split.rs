@@ -27,6 +27,7 @@ impl<const N: usize> Fingerprint<N> {
     }
 }
 
+#[inline(never)]
 fn split_by_borders(block: &Block) -> usize {
     const SAMPLE_LEN: usize = 512;
     let sample = |start: usize| {
@@ -54,6 +55,7 @@ fn split_by_borders(block: &Block) -> usize {
 }
 
 /// Looks at one in `RATE` positions, and sorts them into `N` classes.
+#[inline(never)]
 fn split_by_chunks<const RATE: usize, const N: usize>(block: &Block) -> usize {
     const CHUNK_LEN: usize = 8 << 10;
     let fingerprint = |chunk: &[u8; CHUNK_LEN]| {
@@ -91,7 +93,6 @@ fn split_by_chunks<const RATE: usize, const N: usize>(block: &Block) -> usize {
 }
 
 /// How much of `block` to compress as one.
-#[inline(never)]
 pub(crate) fn block_len(block: &Block, strategy: Strategy) -> usize {
     match strategy {
         Strategy::Fast => split_by_borders(block),

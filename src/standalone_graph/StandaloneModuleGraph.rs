@@ -3911,8 +3911,7 @@ pub(crate) fn serialize_json_source_map_for_standalone(
             .reserve(bun_zstd::compress_bound(utf8.len()).ok_or(crate::Error::SourceMapTooLarge)?);
         if let Err(err) = bun_zstd::compress_append(string_payload, utf8, 1) {
             Output::panic(format_args!(
-                "Unexpected error compressing sourcemap: {}",
-                bstr::BStr::new(err.message().to_bytes())
+                "Unexpected error compressing sourcemap: {err}"
             ));
         }
 

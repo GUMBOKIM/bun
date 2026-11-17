@@ -1,3 +1,5 @@
+//! Huffman codes for literals.
+
 use bun_zstd_decoder::format::HUFFMAN_TABLE_LOG_MAX;
 use bun_zstd_decoder::{Error, Result, with_bmi2};
 
@@ -7,7 +9,7 @@ use super::histogram::Histogram;
 use crate::array::At;
 use crate::bytes::{highest_bit, put};
 
-pub(super) const DESCRIPTION_LEN_MAX: usize = 128;
+const DESCRIPTION_LEN_MAX: usize = 128;
 const CODE_LEN_MAX: u32 = 11;
 const RANKS: usize = 16;
 

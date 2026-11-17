@@ -1,5 +1,6 @@
 //! Looks for the cheapest way through all matches that there are.
 
+use core::convert::identity;
 use core::ops::RangeInclusive;
 
 use bun_zstd_decoder::Result;
@@ -34,78 +35,52 @@ struct Stretch {
     literal_len: u32,
 }
 
-/// For each position the cheapest way to it: what it costs, how it ends, and the recent offsets at its end.
-#[derive(Default)]
-struct Ways {
-    prices: Vec<i32>,
-    offsets: Vec<u32>,
-    match_lens: Vec<u32>,
-    literal_lens: Vec<u32>,
-    repeats: Vec<Repeats>,
+/// How the cheapest way to a position ends.
+#[derive(Clone, Copy, Default)]
+struct End {
+    stretch: Stretch,
+    repeats: Repeats,
 }
 
-struct WaysMut<'a> {
+/// By position. The prices are apart, as several are compared at once.
+struct Ways<'a> {
     prices: &'a mut [i32],
-    offsets: &'a mut [u32],
-    match_lens: &'a mut [u32],
-    literal_lens: &'a mut [u32],
-    repeats: &'a mut [Repeats],
+    ends: &'a mut [End],
 }
 
-impl Ways {
-    /// The compiler sees that all have the same length.
+impl<'a> Ways<'a> {
+    /// The compiler sees that both have the same length.
     #[inline(always)]
-    fn as_mut(&mut self) -> Option<WaysMut<'_>> {
-        let len = self.prices.len() as u32 as usize;
-        Some(WaysMut {
-            prices: self.prices.get_mut(..len)?,
-            offsets: self.offsets.get_mut(..len)?,
-            match_lens: self.match_lens.get_mut(..len)?,
-            literal_lens: self.literal_lens.get_mut(..len)?,
-            repeats: self.repeats.get_mut(..len)?,
+    fn new(prices: &'a mut [i32], ends: &'a mut [End]) -> Option<Self> {
+        let len = prices.len() as u32 as usize;
+        Some(Self {
+            prices: prices.get_mut(..len)?,
+            ends: ends.get_mut(..len)?,
         })
     }
-}
 
-impl WaysMut<'_> {
     #[inline(always)]
     fn price(&self, position: u32) -> Option<i32> {
         likely(self.prices.get(position as usize).copied())
     }
 
     #[inline(always)]
-    fn stretch(&self, position: u32) -> Option<Stretch> {
-        Some(Stretch {
-            offset: OffsetValue(*likely(self.offsets.get(position as usize))?),
-            match_len: *self.match_lens.get(position as usize)?,
-            literal_len: *self.literal_lens.get(position as usize)?,
-        })
-    }
-
-    #[inline(always)]
-    fn repeats(&mut self, position: u32) -> Option<&mut Repeats> {
-        likely(self.repeats.get_mut(position as usize))
-    }
-
-    #[inline(always)]
-    fn set_stretch(&mut self, position: u32, stretch: Stretch) -> Option<()> {
-        *likely(self.offsets.get_mut(position as usize))? = stretch.offset.0;
-        *self.match_lens.get_mut(position as usize)? = stretch.match_len;
-        *self.literal_lens.get_mut(position as usize)? = stretch.literal_len;
-        Some(())
+    fn end(&mut self, position: u32) -> Option<&mut End> {
+        likely(self.ends.get_mut(position as usize))
     }
 
     #[inline(always)]
     fn set(&mut self, position: u32, price: i32, stretch: Stretch) -> Option<()> {
         *likely(self.prices.get_mut(position as usize))? = price;
-        self.set_stretch(position, stretch)
+        self.end(position)?.stretch = stretch;
+        Some(())
     }
 
     /// The recent offsets after a match at `offset` that starts at `position`.
     #[inline(always)]
     fn repeats_after(&mut self, position: u32, offset: OffsetValue) -> Option<Repeats> {
-        let has_literals = *likely(self.literal_lens.get(position as usize))? != 0;
-        Some(self.repeats(position)?.after(offset, has_literals))
+        let End { stretch, repeats } = *self.end(position)?;
+        Some(repeats.after(offset, stretch.literal_len != 0))
     }
 
     /// There is no way to them yet. Also affects some positions after them.
@@ -114,8 +89,7 @@ impl WaysMut<'_> {
         let mut position = *positions.start() as usize;
         while position <= *positions.end() as usize {
             let lanes = position..position + LANES;
-            *likely(self.prices.get_mut(lanes.clone()))?.as_mut_array()? = [MAX_PRICE; LANES];
-            *self.literal_lens.get_mut(lanes)?.as_mut_array()? = [1; LANES];
+            *likely(self.prices.get_mut(lanes))?.as_mut_array()? = [MAX_PRICE; LANES];
             position += LANES;
         }
         Some(())
@@ -170,15 +144,18 @@ pub(super) struct State {
     prices: Prices,
     /// By length.
     matches: Vec<Match>,
-    ways: Ways,
+    way_prices: Vec<i32>,
+    way_ends: Vec<End>,
 }
 
 impl State {
+    #[inline(never)]
     pub(super) fn new() -> Result<Box<Self>> {
         vec::boxed(Self {
             prices: Prices::EMPTY,
             matches: Vec::new(),
-            ways: Ways::default(),
+            way_prices: Vec::new(),
+            way_ends: Vec::new(),
         })
     }
 
@@ -189,11 +166,8 @@ impl State {
     pub(super) fn reserve(&mut self, block_len: usize) -> Result<()> {
         let len = block_len.min(HORIZON as usize) + 3 + LANES;
         vec::clear_for(&mut self.matches, len)?;
-        vec::grow(&mut self.ways.offsets, 0, len)?;
-        vec::grow(&mut self.ways.match_lens, 0, len)?;
-        vec::grow(&mut self.ways.literal_lens, 0, len)?;
-        vec::grow(&mut self.ways.repeats, Repeats::default(), len)?;
-        vec::grow(&mut self.ways.prices, 0, len)
+        vec::grow(&mut self.way_prices, 0, len)?;
+        vec::grow(&mut self.way_ends, End::default(), len)
     }
 }
 
@@ -291,8 +265,7 @@ struct Finder<'a> {
 
 #[inline(always)]
 fn push(matches: &mut Vec<Match>, offset: OffsetValue, len: u32) {
-    let pushed = matches.push_within_capacity(Match { offset, len });
-    debug_assert!(pushed.is_ok());
+    vec::push_into_room(matches, Match { offset, len });
 }
 
 impl Finder<'_> {
@@ -417,16 +390,18 @@ impl Finder<'_> {
         let mut descent = Descent::new(nodes.get(current)?);
         let mut matched_end = current + WORD + 1;
         let mut attempts = self.tree.attempts;
-        let mut note = #[inline(always)]
-        |index: u32, len: u32| {
-            if len <= longest {
-                return false;
-            }
-            matched_end = matched_end.max(index + len);
-            longest = len;
-            push(matches, OffsetValue::new(current - index), len);
-            len > HORIZON || len == left
-        };
+        let mut note = identity(
+            #[inline(always)]
+            |index: u32, len: u32| {
+                if len <= longest {
+                    return false;
+                }
+                matched_end = matched_end.max(index + len);
+                longest = len;
+                push(matches, OffsetValue::new(current - index), len);
+                len > HORIZON || len == left
+            },
+        );
 
         while attempts > 0 && index >= lowest {
             let node = nodes.get(index)?;
@@ -482,7 +457,8 @@ impl Finder<'_> {
         State {
             prices,
             matches,
-            ways,
+            way_prices,
+            way_ends,
         }: &mut State,
         sequences: &mut Sequences,
         repeats: &mut Repeats,
@@ -492,7 +468,7 @@ impl Finder<'_> {
             return Some(anchor);
         };
         let (prefix, limit) = (history.prefix, history.end() - WORD);
-        let mut ways = ways.as_mut()?;
+        let mut ways = Ways::new(way_prices, way_ends)?;
         let mut at = anchor + u32::from(anchor == 0);
         let mut is_first_match = true;
 
@@ -520,7 +496,7 @@ impl Finder<'_> {
                             prices.derive::<IS_ACCURATE>();
                         }
                         ways.set(0, prices.literal_len(here.literal_len), here)?;
-                        *ways.repeats(0)? = here_repeats;
+                        ways.end(0)?.repeats = here_repeats;
                     }
                     let longest_end = current + longest.len;
                     if longest.len > self.sufficient_len
@@ -578,13 +554,15 @@ impl Finder<'_> {
                         + prices.one_more_literal(here.literal_len);
                     current += 1;
 
-                    let (mut price, ending_here) = (ways.price(current)?, ways.stretch(current)?);
+                    let (mut price, ending_here) =
+                        (ways.price(current)?, ways.end(current)?.stretch);
                     if with_literal <= price {
                         here.literal_len += 1;
                         ways.set(current, with_literal, here)?;
                         // The match may still be the better start for the literal after it.
                         if IS_ACCURATE
                             && ending_here.literal_len == 0
+                            && price != MAX_PRICE
                             && prices.one_more_literal(0) < 0
                             && let Some(&next) = prefix.get((at + current) as usize)
                         {
@@ -596,7 +574,7 @@ impl Finder<'_> {
                                 && after_match < ways.price(current + 1)?
                             {
                                 let start = current - ending_here.match_len;
-                                *ways.repeats(current + 1)? =
+                                ways.end(current + 1)?.repeats =
                                     ways.repeats_after(start, ending_here.offset)?;
                                 let stretch = Stretch {
                                     literal_len: 1,
@@ -612,10 +590,10 @@ impl Finder<'_> {
                         here_repeats = if here.literal_len == 0 {
                             ways.repeats_after(current - here.match_len, here.offset)?
                         } else {
-                            *ways.repeats(current)?
+                            ways.end(current)?.repeats
                         };
                     }
-                    *ways.repeats(current)? = here_repeats;
+                    ways.end(current)?.repeats = here_repeats;
 
                     if at + current <= limit
                         && current != end
@@ -637,9 +615,9 @@ impl Finder<'_> {
             let stored_end = last_start + 2;
             let (mut stored_start, mut position, mut next) = (stored_end, last_start, last);
             loop {
-                let stretch = ways.stretch(position)?;
+                let stretch = ways.end(position)?.stretch;
                 next.literal_len = stretch.literal_len;
-                ways.set_stretch(stored_start, next)?;
+                ways.end(stored_start)?.stretch = next;
                 if stretch.match_len == 0 {
                     break;
                 }
@@ -648,7 +626,7 @@ impl Finder<'_> {
             }
 
             for stored in stored_start..=stored_end {
-                let stored = ways.stretch(stored)?;
+                let stored = ways.end(stored)?.stretch;
                 let start = anchor + stored.literal_len;
                 let literals = prefix.get(anchor as usize..start as usize)?;
                 prices.add::<IS_ACCURATE>(literals, stored.offset, stored.match_len);

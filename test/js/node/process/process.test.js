@@ -791,6 +791,9 @@ it("process.versions", async () => {
     expect(process.versions[name]).toBe(expectedHash);
   }
 
+  // Not linked. It is the version whose output src/zstd reproduces.
+  expect(process.versions.zstd).toBe("1.5.7");
+
   expect(process.versions).toHaveProperty("usockets");
   expect(process.versions).toHaveProperty("uwebsockets");
   expect(process.versions.usockets).toBe(process.versions.uwebsockets);

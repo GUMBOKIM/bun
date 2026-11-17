@@ -275,7 +275,7 @@ impl LiteralTables {
         candidate.build(counts, len, tuning.strategy >= Strategy::Ultra);
         let estimated_len = candidate.compressed_len(counts);
         let description = Description::of(candidate).ok();
-        // zstd counts a description that failed as -1.
+        // One that there is no room for counts as -1.
         let description_len = description.as_ref().map_or(usize::MAX, |it| it.len);
         let new_len = estimated_len.wrapping_add(description_len);
 

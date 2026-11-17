@@ -1,3 +1,5 @@
+//! Streams of bits.
+
 use crate::bytes::likely;
 
 const WORD_LEN: usize = 8;

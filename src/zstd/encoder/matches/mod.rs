@@ -105,16 +105,6 @@ impl Tables {
         self.indices.0.truncate(used);
     }
 
-    fn split(&self) -> (&[u32], &[u32], &[u8]) {
-        let indices = self.indices.get().split_at_checked(self.hash_len);
-        let (hash, rest) = indices.unwrap_or_default();
-        let (chain, tags) = (
-            rest.get(..self.chain_len),
-            self.tags.get().get(..self.tags_len),
-        );
-        (hash, chain.unwrap_or_default(), tags.unwrap_or_default())
-    }
-
     fn split_mut(&mut self) -> TablesMut<'_> {
         let mut indices = self.indices.get_mut();
         let [hash, chain, hash3] = [self.hash_len, self.chain_len, self.hash3_len]
@@ -352,9 +342,26 @@ impl MatchState {
         }
     }
 
+    /// For a history whose prefix starts at `prefix_index`.
+    fn as_attached(&self, prefix_index: u32) -> Attached<'_> {
+        let (tables, end) = (&self.tables, self.window.next);
+        let indices = tables.indices.get().split_at_checked(tables.hash_len);
+        let (hash, chain) = indices.unwrap_or_default();
+        Attached {
+            hash,
+            chain,
+            tags: tables.tags.get(),
+            tuning: self.tuning,
+            end,
+            delta: prefix_index.wrapping_sub(end),
+        }
+    }
+
     /// Goes on from where the tables of a dictionary, which have the same sizes, are.
     pub(crate) fn copy_from(&mut self, dictionary: &Self) {
-        let (hash, chain, tags) = dictionary.tables.split();
+        let Attached {
+            hash, chain, tags, ..
+        } = dictionary.as_attached(0);
         self.tables.drop_unused();
         let to = self.tables.split_mut();
         let has_tags = self.tuning.strategy <= Strategy::DoubleFast;
@@ -520,16 +527,7 @@ impl MatchState {
                 self.search_in::<{ Reach::Older }>(search, &none, sequences, repeats)
             }
             Some(dictionary) => {
-                let (hash, chain, tags) = dictionary.tables.split();
-                let end = dictionary.window.next;
-                let attached = Attached {
-                    hash,
-                    chain,
-                    tags,
-                    tuning: dictionary.tuning,
-                    end,
-                    delta: search.history.prefix_index.wrapping_sub(end),
-                };
+                let attached = dictionary.as_attached(search.history.prefix_index);
                 self.search_in::<{ Reach::Attached }>(search, &attached, sequences, repeats)
             }
             None => {

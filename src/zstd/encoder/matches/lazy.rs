@@ -1,6 +1,6 @@
 //! Takes a match only if none of the next positions has a better one.
 
-use core::convert::Infallible;
+use core::convert::{Infallible, identity};
 
 use bun_zstd_decoder::with_bmi2;
 
@@ -174,12 +174,14 @@ impl Parser<'_> {
     /// Returns from which index on the tables are not up to date.
     #[inline(never)]
     fn run<const REACH: Reach, F: Finder>(self, finder: F, progress: &mut Progress<'_>) -> u32 {
-        let run = #[inline(always)]
-        move || {
-            let mut finder = finder;
-            self.parse::<REACH, _>(&mut finder, progress);
-            finder.next_to_index()
-        };
+        let run = identity(
+            #[inline(always)]
+            move || {
+                let mut finder = finder;
+                self.parse::<REACH, _>(&mut finder, progress);
+                finder.next_to_index()
+            },
+        );
         if F::GAINS_FROM_BMI2 {
             with_bmi2(run)
         } else {

@@ -347,7 +347,7 @@ mod _impl {
             self.state = Some(match self.mode {
                 NodeMode::ZSTD_COMPRESS => {
                     let mut state = Box::new(Compressor {
-                        encoder: Encoder::new(),
+                        encoder: Encoder::new(bun_zstd::DEFAULT_LEVEL),
                         pledged_src_size,
                         pledged_left: None,
                         has_broken_pledge: false,

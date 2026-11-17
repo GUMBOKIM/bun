@@ -12,15 +12,11 @@ pub(crate) const SYMBOLS: usize = 64;
 const STATES: usize = 512;
 const TABLE_LOG_MAX: u32 = 12;
 
-fn min_table_log(len: usize, max_symbol: usize) -> u32 {
-    (highest_bit(len as u32) + 1).min(highest_bit(max_symbol as u32) + 2)
-}
-
 /// For `len` symbols, of which there are at least 2.
 pub(super) fn table_log_for(max_log: u32, len: usize, max_symbol: usize, minus: u32) -> u32 {
     let useful = highest_bit(len.wrapping_sub(1) as u32).wrapping_sub(minus);
-    let log = max_log.min(useful).max(min_table_log(len, max_symbol));
-    log.clamp(FSE_TABLE_LOG_MIN, TABLE_LOG_MAX)
+    let needed = (highest_bit(len as u32) + 1).min(highest_bit(max_symbol as u32) + 2);
+    (max_log.min(useful).max(needed)).clamp(FSE_TABLE_LOG_MIN, TABLE_LOG_MAX)
 }
 
 /// Counts scaled to add up to a power of 2. -1 is a count of less than 1.
@@ -54,9 +50,6 @@ impl Normalized {
             0, 473_195, 504_333, 520_860, 550_000, 700_000, 750_000, 830_000,
         ];
         let max_symbol = counts.len().checked_sub(1).ok_or(Error::Internal)?;
-        if table_log < min_table_log(total, max_symbol) {
-            return Err(Error::Internal);
-        }
         let mut normalized = Self {
             counts: [0; SYMBOLS],
             max_symbol,

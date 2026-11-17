@@ -1836,7 +1836,7 @@ pub(crate) mod JSZstd {
         heap: &JsHeap<'a>,
         options: &ZstdCompressionOptions,
     ) -> bindgen::Result<'a, i32> {
-        let level = options.level.map_or(3, |level| level as i32);
+        let level = (options.level).map_or(bun_zstd::DEFAULT_LEVEL, |level| level as i32);
         if !(1..=22).contains(&level) {
             return Err(
                 heap.invalid_arguments(format_args!("Compression level must be between 1 and 22"))
@@ -1860,9 +1860,7 @@ pub(crate) mod JSZstd {
         fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
             match self {
                 Failure::OutOfMemory => f.write_str("Out of memory"),
-                Failure::Compression(err) => {
-                    write!(f, "{}", bstr::BStr::new(err.message().to_bytes()))
-                }
+                Failure::Compression(err) => write!(f, "{err}"),
                 Failure::Decompression(err) => write!(f, "Decompression failed: {err}"),
             }
         }

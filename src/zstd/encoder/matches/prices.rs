@@ -53,10 +53,7 @@ impl<const USED: usize, const N: usize> Frequencies<USED, N> {
 
     /// From how many bits each symbol takes in a dictionary.
     fn set_from_bits(&mut self, scale_log: u32, bits: impl Fn(usize) -> u32) {
-        self.set(|symbol| match bits(symbol) {
-            0 => 1,
-            bits => 1 << scale_log.saturating_sub(bits),
-        });
+        self.set(|symbol| 1 << scale_log.saturating_sub(bits(symbol)));
     }
 
     fn scale_down(&mut self, target_log: u32) {

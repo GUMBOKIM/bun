@@ -321,11 +321,11 @@ impl Sequences {
 
     #[inline(always)]
     pub(crate) fn push(&mut self, literal_len: u32, offset: OffsetValue, match_len: u32) {
-        let pushed = self.list.push_within_capacity(Sequence {
+        let found = Sequence {
             extra: u64::from(literal_len) | u64::from(match_len.wrapping_sub(MIN_MATCH)) << 32,
             symbols: offset.0.to_le_bytes(),
-        });
-        debug_assert!(pushed.is_ok());
+        };
+        vec::push_into_room(&mut self.list, found);
     }
 
     /// Before they are finished, if there are so few matches in `block` that it is quick to tell.

@@ -25,7 +25,7 @@ impl Budget {
         let mut cost = if is_first { 120 * BYTE } else { 0 };
         let mut len = 0;
         for (index, sequence) in sequences.iter().enumerate() {
-            // zstd goes by the lowest 16 bits.
+            // The lowest 16 bits do for an estimate.
             let literal_len = usize::from(sequence.literal_len() as u16);
             cost += literal_len * self.per_literal + self.per_sequence;
             len += literal_len + usize::from(sequence.match_base() as u16) + MIN_MATCH as usize;

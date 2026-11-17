@@ -1,3 +1,5 @@
+//! A random number for each byte.
+
 #[rustfmt::skip]
 pub(super) static GEAR_TABLE: [u64; 256] = [
     0xf5b8f72c5f77775c, 0x84935f266b7ac412, 0xb647ada9ca730ccc, 0xb065bb4b114fb1de,

@@ -50,7 +50,8 @@ impl LongMatcher {
         };
         candidates.clear_for(self.section_len, &self.parameters)?;
         self.finder.admit(&input);
-        self.finder.find(&input, start, section.len(), candidates)
+        self.finder.find(&input, start, section.len(), candidates);
+        Ok(())
     }
 }
 
@@ -370,7 +371,7 @@ impl Workers {
             Report::Output(bytes) => self.backlog = Backlog::of(bytes),
             Report::Done(input) => {
                 self.reports.pop_front();
-                let _ = self.spare_inputs.push_within_capacity(input);
+                vec::push_into_room(&mut self.spare_inputs, input);
             }
             Report::Failed(error) => return Err(error),
         }

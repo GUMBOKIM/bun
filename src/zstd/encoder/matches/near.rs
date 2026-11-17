@@ -1,3 +1,5 @@
+//! What the two fast strategies share when there is only the prefix to search.
+
 use super::{Bounds, Progress};
 use crate::bytes::{AtLeast, likely, u32_at};
 use crate::sequences::{Repeats, Sequences};

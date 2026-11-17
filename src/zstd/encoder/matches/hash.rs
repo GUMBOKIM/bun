@@ -1,3 +1,5 @@
+//! From bytes to entries of tables.
+
 use crate::parameters::TAG_BITS;
 
 /// Hashes the lowest bytes of a word.

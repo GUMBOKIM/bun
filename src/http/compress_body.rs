@@ -38,7 +38,7 @@ pub struct CompressOption {
 /// `compress: true` / `compress: "gzip"` path never allocates a fresh handle.
 pub const DEFAULT_DEFLATE_LEVEL: i32 = 6;
 pub const DEFAULT_BROTLI_QUALITY: i32 = 6;
-pub const DEFAULT_ZSTD_LEVEL: i32 = 3;
+pub const DEFAULT_ZSTD_LEVEL: i32 = bun_zstd::DEFAULT_LEVEL;
 
 /// Where [`compress_into`] put its output.
 pub(crate) enum CompressOutput {

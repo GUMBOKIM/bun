@@ -212,14 +212,9 @@ impl CompressionStreamCoder {
                     .ok_or(CodecError::Message("failed to initialize brotli decoder"))?;
                 Backend::BrotliDecode(p)
             }
-            (Format::Zstd, false) => {
-                let mut p = Box::new(bun_zstd::Encoder::new());
-                if let Some(level) = level {
-                    p.set_level(level)
-                        .map_err(|_| CodecError::Message("failed to set zstd level"))?;
-                }
-                Backend::ZstdEncode(p)
-            }
+            (Format::Zstd, false) => Backend::ZstdEncode(Box::new(bun_zstd::Encoder::new(
+                level.unwrap_or(bun_zstd::DEFAULT_LEVEL),
+            ))),
             (Format::Zstd, true) => Backend::ZstdDecode(Box::new(bun_zstd::Decoder::new())),
         };
         Ok(Box::new(Self {
