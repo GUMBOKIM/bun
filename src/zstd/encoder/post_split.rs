@@ -3,7 +3,7 @@
 use core::ops::Range;
 
 use bun_zstd_decoder::format::{BLOCK_HEADER_LEN, LONG_SEQUENCE_COUNT, MIN_MATCH};
-use bun_zstd_decoder::{Error, Result};
+use bun_zstd_decoder::{Error, Output, Result};
 
 use crate::block::{BlockWriter, Content};
 use crate::entropy::LiteralsPlan;
@@ -30,7 +30,8 @@ struct Part {
 
 struct Splitter<'a> {
     writer: &'a mut BlockWriter,
-    all: &'a Sequences,
+    sequences: &'a [Sequence],
+    literals: &'a [u8],
     tuning: &'a Tuning,
     /// The sequences that start a part, but for the first one.
     splits: [u16; SPLITS_MAX],
@@ -39,8 +40,8 @@ struct Splitter<'a> {
 
 impl Splitter<'_> {
     fn estimated_len(&mut self, part: &Part) -> Option<usize> {
-        let literals = self.all.literals().get(part.literals.clone())?;
-        let sequences = self.all.list.get(part.sequences.clone())?;
+        let literals = self.literals.get(part.literals.clone())?;
+        let sequences = self.sequences.get(part.sequences.clone())?;
         let counts = count_codes(sequences);
         let entropy = &mut self.writer.entropy;
         let literals_plan = entropy.literals.plan(literals, self.tuning)?;
@@ -69,7 +70,7 @@ impl Splitter<'_> {
         let middle = whole.sequences.start.midpoint(whole.sequences.end);
         let first = whole.sequences.start..middle;
         let literals_middle =
-            whole.literals.start + literals_len(self.all.list.get(first.clone())?);
+            whole.literals.start + literals_len(self.sequences.get(first.clone())?);
         let first = Part {
             sequences: first,
             literals: whole.literals.start..literals_middle,
@@ -111,15 +112,16 @@ pub(crate) fn write(
     repeats: Repeats,
     tuning: &Tuning,
     is_last: bool,
-    out: &mut [u8],
-) -> Result<usize> {
+    out: &mut Output<'_>,
+) -> Result<()> {
     let whole = Part {
         sequences: 0..all.list.len(),
-        literals: 0..all.literals().len(),
+        literals: 0..all.literals(bytes).len(),
     };
     let mut splitter = Splitter {
         writer,
-        all,
+        sequences: &all.list,
+        literals: all.literals(bytes),
         tuning,
         splits: [0; SPLITS_MAX],
         count: 0,
@@ -134,7 +136,7 @@ pub(crate) fn write(
         let content = Content {
             bytes,
             sequences: &all.list,
-            literals: all.literals(),
+            literals: all.literals(bytes),
             counts: &all.counts,
             repeats,
         };
@@ -143,7 +145,7 @@ pub(crate) fn write(
 
     let mut search_repeats = writer.repeats;
     let (list, mut literals) = all.split_mut();
-    let (mut start, mut written) = (0, 0);
+    let mut start = 0;
     let ends = splits.into_iter().take(count).map(usize::from);
     for end in ends.chain([whole.sequences.end]) {
         let is_last_part = end == whole.sequences.end;
@@ -163,9 +165,8 @@ pub(crate) fn write(
             counts: &count_codes(sequences),
             repeats,
         };
-        let out = out.get_mut(written..).ok_or(Error::Internal)?;
-        written += writer.write(&content, tuning, is_last && is_last_part, out)?;
+        writer.write(&content, tuning, is_last && is_last_part, out)?;
         start = end;
     }
-    Ok(written)
+    Ok(())
 }

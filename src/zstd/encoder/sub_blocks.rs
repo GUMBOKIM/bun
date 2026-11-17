@@ -1,7 +1,7 @@
 //! Writes a block as several that share their tables and come close to a given compressed length.
 
 use bun_zstd_decoder::format::{BLOCK_HEADER_LEN, BlockType, Encoding, MIN_MATCH};
-use bun_zstd_decoder::{Error, Result};
+use bun_zstd_decoder::{Error, Output, Result};
 
 use crate::block::{self, BlockWriter, Content};
 use crate::bytes::is_one_byte_repeated;
@@ -9,6 +9,7 @@ use crate::entropy::{Changes, CodesPlan, LiteralsPlan};
 use crate::parameters::Tuning;
 use crate::post_split::{literals_len, matches_len};
 use crate::sequences::Sequence;
+use crate::worst_case_len;
 
 /// Costs are in 1/256 of a byte.
 const BYTE: usize = 256;
@@ -37,7 +38,7 @@ impl Budget {
     }
 }
 
-struct SubBlocks<'a> {
+struct SubBlocks<'a, 'out> {
     writer: &'a BlockWriter,
     literals_plan: LiteralsPlan,
     codes_plan: CodesPlan,
@@ -45,11 +46,10 @@ struct SubBlocks<'a> {
     left: Content<'a>,
     needs_literal_table: bool,
     needs_code_tables: bool,
-    out: &'a mut [u8],
-    written: usize,
+    out: &'a mut Output<'out>,
 }
 
-impl SubBlocks<'_> {
+impl SubBlocks<'_, '_> {
     /// Leaves them for the next block if they do not get smaller.
     fn write(&mut self, count: usize, literals_len: usize, is_last: bool) -> Result<()> {
         let mut left = self.left;
@@ -60,8 +60,8 @@ impl SubBlocks<'_> {
         left.bytes = left.bytes.get(len..).ok_or(Error::Internal)?;
 
         let entropy = &self.writer.entropy;
-        let out = self.out.get_mut(self.written..).ok_or(Error::Internal)?;
-        let (header, out) = out.split_first_chunk_mut().ok_or(Error::DstSizeTooSmall)?;
+        // More than an attempt can take.
+        let (header, out) = block::room_for_block(self.out, 4 * worst_case_len(len) + 256)?;
         let Some((literals_len, has_literal_table)) = entropy.literals.write_part(
             &self.literals_plan,
             literals,
@@ -84,7 +84,7 @@ impl SubBlocks<'_> {
         let content_len = literals_len + codes_len;
         if BLOCK_HEADER_LEN + content_len < len {
             *header = block::header(BlockType::Compressed, content_len, is_last);
-            self.written += BLOCK_HEADER_LEN + content_len;
+            self.out.commit(BLOCK_HEADER_LEN + content_len);
             self.left = left;
             self.needs_literal_table &= !has_literal_table;
             self.needs_code_tables &= !has_code_tables;
@@ -93,17 +93,18 @@ impl SubBlocks<'_> {
     }
 }
 
-/// `None` if one uncompressed block is better.
+/// False if one uncompressed block is better.
 fn try_write(
     writer: &mut BlockWriter,
     content: &Content<'_>,
     tuning: &Tuning,
     target_len: usize,
     is_last: bool,
-    out: &mut [u8],
-) -> Result<Option<usize>> {
+    out: &mut Output<'_>,
+) -> Result<bool> {
+    let written_before = out.written();
     let Some(literals_plan) = writer.entropy.literals.plan(content.literals, tuning) else {
-        return Ok(None);
+        return Ok(false);
     };
     let codes_plan =
         writer
@@ -119,7 +120,6 @@ fn try_write(
         needs_literal_table: has_new_literal_table,
         needs_code_tables: true,
         out,
-        written: 0,
     };
 
     if !content.sequences.is_empty() {
@@ -135,7 +135,7 @@ fn try_write(
         let for_rest = for_codes + SECTION_HEADER_LEN + BLOCK_HEADER_LEN;
         let total = for_literals + for_rest;
         if total > content.bytes.len() {
-            return Ok(None);
+            return Ok(false);
         }
         let block_count = ((total + target_len / 2) / target_len).max(1);
         let budget = Budget {
@@ -163,12 +163,11 @@ fn try_write(
     blocks.write(sequences.len(), literals.len(), is_last)?;
 
     if blocks.needs_code_tables && blocks.codes_plan.has_descriptions() {
-        return Ok(None);
+        return Ok(false);
     }
-    let (mut written, mut repeats) = (blocks.written, content.repeats);
+    let mut repeats = content.repeats;
     if !blocks.left.bytes.is_empty() {
-        let out = blocks.out.get_mut(written..).ok_or(Error::Internal)?;
-        written += block::write_raw(blocks.left.bytes, is_last, out)?;
+        block::write_raw(blocks.left.bytes, is_last, blocks.out)?;
         if !blocks.left.sequences.is_empty() {
             let kept = content.sequences.len() - blocks.left.sequences.len();
             let kept = content.sequences.iter().take(kept);
@@ -178,16 +177,16 @@ fn try_write(
         }
     }
 
-    let len = content.bytes.len();
+    let (len, written) = (content.bytes.len(), blocks.out.written() - written_before);
     if written >= len.wrapping_sub(tuning.strategy.min_gain(len)) + BLOCK_HEADER_LEN {
-        return Ok(None);
+        return Ok(false);
     }
     let changes = Changes {
         has_new_literal_table: has_new_literal_table && !blocks.needs_literal_table,
         codes: Some(blocks.codes_plan.choice()),
     };
     writer.accept(changes, repeats);
-    Ok(Some(written))
+    Ok(true)
 }
 
 pub(crate) fn write(
@@ -196,23 +195,24 @@ pub(crate) fn write(
     tuning: &Tuning,
     target_len: usize,
     is_last: bool,
-    out: &mut [u8],
-) -> Result<usize> {
-    let written = if !writer.is_at_start
+    out: &mut Output<'_>,
+) -> Result<()> {
+    let written_before = out.written();
+    if !writer.is_at_start
         && content.sequences.len() < 4
         && content.literals.len() < 10
         && is_one_byte_repeated(content.bytes)
     {
-        block::write_repeated(content.bytes, is_last, out)?
+        block::write_repeated(content.bytes, is_last, out)?;
     } else {
         match try_write(writer, content, tuning, target_len, is_last, out) {
-            Ok(Some(written)) => written,
-            Ok(None) | Err(Error::DstSizeTooSmall) => {
-                block::write_raw(content.bytes, is_last, out)?
+            Ok(false) | Err(Error::DstSizeTooSmall) => {
+                out.rewind(written_before);
+                block::write_raw(content.bytes, is_last, out)?;
             }
-            Err(error) => return Err(error),
+            result => drop(result?),
         }
-    };
+    }
     writer.distrust_offset_table();
-    Ok(written)
+    Ok(())
 }

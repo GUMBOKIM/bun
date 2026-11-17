@@ -3,9 +3,10 @@
 use bun_zstd_decoder::format::Encoding;
 use bun_zstd_decoder::{Error, Result};
 
+use super::Reuse;
 use super::histogram::Histogram;
 use super::huffman::{Description, Table};
-use super::{Reuse, Slots};
+use crate::array::At;
 use crate::bytes::{is_one_byte_repeated, put};
 use crate::parameters::{Strategy, Tuning};
 
@@ -63,7 +64,8 @@ fn is_too_even(largest_count: usize, len: usize) -> bool {
     largest_count <= (len >> 7) + 4
 }
 
-fn samples_are_too_even(literals: &[u8]) -> bool {
+/// Going by samples.
+pub(crate) fn looks_random(literals: &[u8]) -> bool {
     const SAMPLE_LEN: usize = 4096;
     if literals.len() < 10 * SAMPLE_LEN {
         return false;
@@ -107,21 +109,60 @@ impl LiteralsPlan {
     }
 }
 
-pub(crate) struct LiteralTables(pub(crate) Slots<Table>);
+/// The table that a decoder has, and room for the one that may replace it.
+pub(crate) struct LiteralTables {
+    tables: [Table; 2],
+    current: usize,
+    pub(crate) reuse: Reuse,
+}
 
 impl LiteralTables {
-    pub(super) const EMPTY: Self = Self(Slots::new(Table::EMPTY));
+    pub(super) const EMPTY: Self = Self {
+        tables: [Table::EMPTY; 2],
+        current: 0,
+        reuse: Reuse::Never,
+    };
+
+    pub(crate) fn current(&self) -> &Table {
+        self.tables.at(self.current)
+    }
+
+    pub(crate) fn load(&mut self, weights: &[u8], log: u32, reuse: Reuse) {
+        self.tables
+            .at_mut(self.current)
+            .build_from_weights(weights, log);
+        self.reuse = reuse;
+    }
+
+    fn current_and_candidate(&mut self) -> (&Table, &mut Table) {
+        let [first, second] = &mut self.tables;
+        if self.current == 0 {
+            (first, second)
+        } else {
+            (second, first)
+        }
+    }
+
+    pub(super) fn accept_candidate(&mut self) {
+        self.current ^= 1;
+        self.reuse = Reuse::IfComplete;
+    }
+
+    pub(super) fn copy_from(&mut self, other: &Self) {
+        *self.tables.at_mut(self.current) = *other.current();
+        self.reuse = other.reuse;
+    }
 
     /// Returns the length of the section.
     pub(super) fn compress(
         &mut self,
         literals: &[u8],
         tuning: &Tuning,
-        looks_random: bool,
+        has_few_matches: bool,
         out: &mut [u8],
     ) -> Result<(usize, Encoding)> {
         let len = literals.len();
-        let min_len = match self.0.reuse {
+        let min_len = match self.reuse {
             Reuse::Always => 6,
             _ => 8 << (9 - tuning.strategy as usize).min(3),
         };
@@ -131,11 +172,11 @@ impl LiteralTables {
                 return Err(Error::DstSizeTooSmall);
             }
             let (header, rest) = out.split_at_mut(header_len);
-            let is_single_stream = len < 256 || (self.0.reuse == Reuse::Always && header_len == 3);
+            let is_single_stream = len < 256 || (self.reuse == Reuse::Always && header_len == 3);
             let compressed = self.compress_streams(
                 literals,
                 tuning.strategy,
-                looks_random,
+                has_few_matches,
                 is_single_stream,
                 rest,
             );
@@ -157,14 +198,14 @@ impl LiteralTables {
         &mut self,
         literals: &[u8],
         strategy: Strategy,
-        looks_random: bool,
+        has_few_matches: bool,
         is_single_stream: bool,
         out: &mut [u8],
     ) -> Option<(usize, Encoding)> {
         let len = literals.len();
         let prefers_reuse = strategy < Strategy::Lazy && len <= 1024;
-        let mut reuse = self.0.reuse;
-        let (current, candidate) = self.0.current_and_candidate();
+        let mut reuse = self.reuse;
+        let (current, candidate) = self.current_and_candidate();
         let repeat = |out: &mut [u8]| {
             let written = current.compress(literals, out, is_single_stream)?;
             Some((written, Encoding::Repeat))
@@ -173,7 +214,7 @@ impl LiteralTables {
         if prefers_reuse && reuse == Reuse::Always {
             return repeat(out);
         }
-        if looks_random && samples_are_too_even(literals) {
+        if has_few_matches && looks_random(literals) {
             return None;
         }
         let histogram = Histogram::<256>::of(literals);
@@ -211,7 +252,7 @@ impl LiteralTables {
     /// `None` if there is a gain, but the table for it cannot be described.
     pub(crate) fn plan(&mut self, literals: &[u8], tuning: &Tuning) -> Option<LiteralsPlan> {
         let len = literals.len();
-        let reuse = self.0.reuse;
+        let reuse = self.reuse;
         let too_few = if reuse == Reuse::Always { 6 } else { 63 };
         if !tuning.compresses_literals() || len <= too_few {
             return Some(LiteralsPlan::plain(Encoding::Basic));
@@ -225,7 +266,7 @@ impl LiteralTables {
         }
 
         let counts = histogram.used();
-        let (current, candidate) = self.0.current_and_candidate();
+        let (current, candidate) = self.current_and_candidate();
         candidate.build(counts, len, tuning.strategy >= Strategy::Ultra);
         let estimated_len = candidate.compressed_len(counts);
         let description = Description::of(candidate).ok();
@@ -264,8 +305,8 @@ impl LiteralTables {
         let len = literals.len();
         let table = match plan.encoding {
             Encoding::Rle if len != 0 => return Ok(Some((write_repeated(literals, out)?, false))),
-            Encoding::Compressed if len != 0 => self.0.candidate(),
-            Encoding::Repeat if len != 0 => self.0.current(),
+            Encoding::Compressed if len != 0 => self.tables.at(self.current ^ 1),
+            Encoding::Repeat if len != 0 => self.current(),
             _ => return Ok(Some((write_raw(literals, out)?, false))),
         };
 

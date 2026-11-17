@@ -11,9 +11,8 @@ use bun_zstd_decoder::format::Encoding;
 use bun_zstd_decoder::{Error, Result};
 
 pub(crate) use codes::{CodeKind, CodeTables, CodesChoice, CodesPlan};
-pub(crate) use literals::{LiteralTables, LiteralsPlan};
+pub(crate) use literals::{LiteralTables, LiteralsPlan, looks_random};
 
-use crate::array::At;
 use crate::block::Content;
 use crate::parameters::Tuning;
 
@@ -24,55 +23,6 @@ pub(crate) enum Reuse {
     /// If it has all symbols of the block.
     IfComplete,
     Always,
-}
-
-/// The table that a decoder has, and room for the one that may replace it.
-#[derive(Clone, Copy)]
-pub(crate) struct Slots<T> {
-    tables: [T; 2],
-    current: usize,
-    pub(crate) reuse: Reuse,
-}
-
-impl<T: Copy> Slots<T> {
-    const fn new(empty: T) -> Self {
-        Self {
-            tables: [empty; 2],
-            current: 0,
-            reuse: Reuse::Never,
-        }
-    }
-
-    pub(crate) fn current(&self) -> &T {
-        self.tables.at(self.current)
-    }
-
-    pub(crate) fn current_mut(&mut self) -> &mut T {
-        self.tables.at_mut(self.current)
-    }
-
-    fn candidate(&self) -> &T {
-        self.tables.at(self.current ^ 1)
-    }
-
-    fn current_and_candidate(&mut self) -> (&T, &mut T) {
-        let [first, second] = &mut self.tables;
-        if self.current == 0 {
-            (first, second)
-        } else {
-            (second, first)
-        }
-    }
-
-    fn accept_candidate(&mut self) {
-        self.current ^= 1;
-        self.reuse = Reuse::IfComplete;
-    }
-
-    fn copy_from(&mut self, other: &Self) {
-        *self.current_mut() = *other.current();
-        self.reuse = other.reuse;
-    }
 }
 
 pub(crate) struct Entropy {
@@ -94,18 +44,18 @@ impl Entropy {
     };
 
     pub(crate) fn forget(&mut self) {
-        self.literals.0.reuse = Reuse::Never;
+        self.literals.reuse = Reuse::Never;
         self.codes.accept(CodesChoice::PREDEFINED);
     }
 
     pub(crate) fn copy_from(&mut self, other: &Self) {
-        self.literals.0.copy_from(&other.literals.0);
+        self.literals.copy_from(&other.literals);
         self.codes.copy_from(&other.codes);
     }
 
     pub(crate) fn accept(&mut self, changes: Changes) {
         if changes.has_new_literal_table {
-            self.literals.0.accept_candidate();
+            self.literals.accept_candidate();
         }
         if let Some(choice) = changes.codes {
             self.codes.accept(choice);
@@ -141,10 +91,10 @@ impl Entropy {
         out: &mut [u8],
     ) -> Result<Option<(usize, Changes)>> {
         let literals_per_sequence = literals.len().checked_div(sequences.len());
-        let looks_random = literals_per_sequence.is_none_or(|ratio| ratio >= 20);
+        let has_few_matches = literals_per_sequence.is_none_or(|ratio| ratio >= 20);
         let (mut written, encoding) =
             self.literals
-                .compress(literals, tuning, looks_random, out)?;
+                .compress(literals, tuning, has_few_matches, out)?;
         let mut changes = Changes {
             has_new_literal_table: encoding == Encoding::Compressed,
             codes: None,
@@ -162,7 +112,7 @@ impl Entropy {
         let chosen = self.codes.choose(sequences, counts, tuning.strategy, out)?;
         *modes = chosen.choice.modes();
         let out = out.get_mut(chosen.len..).ok_or(Error::Internal)?;
-        let stream_len = self.codes.encode(chosen.choice, sequences, out)?;
+        let stream_len = self.codes.encode(sequences, out)?;
         if chosen.trips_old_decoders(stream_len) {
             return Ok(None);
         }

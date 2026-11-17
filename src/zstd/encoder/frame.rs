@@ -5,21 +5,14 @@ use bun_zstd_decoder::format::{
 };
 use bun_zstd_decoder::{Error, Output, Result, XxHash64};
 
-use crate::block::{self, BlockWriter, Content};
+use crate::block::{self, BlockWriter, Content, append};
 use crate::dictionary::Dictionary;
 use crate::matches::long_distance::{self, Candidates};
 use crate::matches::{MatchState, Owner, Search};
 use crate::parameters::{Plan, Purpose};
 use crate::sequences::{Repeats, Sequences};
 use crate::window::{Input, WORD_LEN};
-use crate::{post_split, pre_split, sub_blocks, worst_case_len};
-
-pub(crate) fn append(out: &mut Output<'_>, bytes: &[u8]) -> Result<()> {
-    if out.append(bytes) < bytes.len() {
-        return Err(Error::DstSizeTooSmall);
-    }
-    Ok(())
-}
+use crate::{post_split, pre_split, sub_blocks};
 
 pub(crate) fn last_empty_block() -> [u8; BLOCK_HEADER_LEN] {
     block::header(BlockType::Raw, 0, true)
@@ -266,20 +259,10 @@ impl FrameWriter {
                 }
                 _ => left.len().min(self.block_len_max),
             };
-            if out.room() < BLOCK_HEADER_LEN + 3 {
-                return Err(Error::DstSizeTooSmall);
-            }
-            // Several blocks in place of one, and attempts at them, can take more.
-            let is_one_block = self.plan.target_block_len == 0 && !self.plan.splits_blocks;
             let written_before = out.written();
-            let room = out
-                .lend(worst_case_len(len) * if is_one_block { 1 } else { 3 })
-                .get_mut(written_before..)
-                .unwrap_or_default();
             let is_last = is_last && len == left.len();
-            let written = self.write_block(input, dictionary, start, len, is_last, room)?;
-            out.commit(written);
-            saved += len as i64 - written as i64;
+            self.write_block(input, dictionary, start, len, is_last, out)?;
+            saved += len as i64 - (out.written() - written_before) as i64;
             start += len;
             self.blocks.is_at_start = false;
         }
@@ -296,8 +279,8 @@ impl FrameWriter {
         start: usize,
         len: usize,
         is_last: bool,
-        out: &mut [u8],
-    ) -> Result<usize> {
+        out: &mut Output<'_>,
+    ) -> Result<()> {
         const WORTH_TRYING_FROM: usize = 7;
         let bytes = input.segment.get(start..start + len);
         let bytes = bytes.ok_or(Error::Internal)?;
@@ -317,7 +300,7 @@ impl FrameWriter {
         let content = Content {
             bytes,
             sequences: &self.sequences.list,
-            literals: self.sequences.literals(),
+            literals: self.sequences.literals(bytes),
             counts: &self.sequences.counts,
             repeats,
         };

@@ -80,7 +80,7 @@ fn collect<'a, const N: usize>(
 
 #[inline(always)]
 fn prefetch_row<const N: usize>(indices: &[[u32; N]], tags: &[[u8; N]], hash: u32) {
-    let first = (hash >> TAG_BITS) * N as u32;
+    let first = (hash >> TAG_BITS) as usize * N;
     prefetch(indices.as_flattened(), first);
     if N >= 32 {
         prefetch(indices.as_flattened(), first + 16);
@@ -239,9 +239,9 @@ impl<const N: usize> Finder for Rows<'_, N> {
             |index| match REACH {
                 Reach::Older => {
                     let (run, at) = history.locate(index);
-                    prefetch(run, at);
+                    prefetch(run, at as usize);
                 }
-                _ => prefetch(history.prefix, history.position(index)),
+                _ => prefetch(history.prefix, history.position(index) as usize),
             },
         );
         add((indices, tags), current, hash as u8);
@@ -265,7 +265,7 @@ impl<const N: usize> Finder for Rows<'_, N> {
                 attached_hash as u8,
                 FIRST_INDEX,
                 candidates.get_mut(..attempts)?,
-                |index| prefetch(history.older, Attached::position(index)),
+                |index| prefetch(history.older, Attached::position(index) as usize),
             );
             for &index in found {
                 let index = index.wrapping_add(self.attached_delta);

@@ -210,6 +210,8 @@ pub(crate) struct Workers {
     /// Of the jobs whose output is still to come, in order.
     reports: VecDeque<mpsc::Receiver<Report>>,
     backlog: Backlog,
+    /// The section filled up before the frame was told to end.
+    is_followed: bool,
     has_posted_last: bool,
     /// What follows the output of the jobs.
     needs_last_block: bool,
@@ -264,6 +266,7 @@ impl Workers {
             threads_max: request.workers,
             reports,
             backlog: Backlog::default(),
+            is_followed: false,
             has_posted_last: false,
             needs_last_block: false,
             needs_checksum: false,
@@ -303,7 +306,7 @@ impl Workers {
         }
         let frame = self.frame.take();
         let mut plan = self.plan;
-        self.has_posted_last = is_last;
+        (self.has_posted_last, self.is_followed) = (is_last, false);
         if frame.is_none() {
             self.needs_checksum = is_last && plan.header.has_checksum;
             plan.header.has_checksum = false;
@@ -353,7 +356,7 @@ impl Workers {
             report => report.ok(),
         };
         match report.ok_or(Error::Internal)? {
-            Report::Output(bytes) => self.backlog.bytes = bytes,
+            Report::Output(bytes) => self.backlog = Backlog::of(bytes),
             Report::Done(input) => {
                 self.reports.pop_front();
                 let _ = self.spare_inputs.push_within_capacity(input);
@@ -365,11 +368,11 @@ impl Workers {
 
     fn finish(&mut self) -> Result<bool> {
         if core::mem::take(&mut self.needs_last_block) {
-            self.backlog.bytes = vec::copied(&frame::last_empty_block())?;
+            self.backlog = Backlog::of(vec::copied(&frame::last_empty_block())?);
         } else if core::mem::take(&mut self.needs_checksum) {
             let relay = self.relay.recv().map_err(|_| Error::Internal)?;
             let hash = relay.hash.as_ref().ok_or(Error::Internal)?;
-            self.backlog.bytes = vec::copied(&frame::checksum(hash))?;
+            self.backlog = Backlog::of(vec::copied(&frame::checksum(hash))?);
         }
         Ok(!self.backlog.is_empty())
     }
@@ -385,8 +388,10 @@ impl Workers {
         }
         loop {
             self.fill(input)?;
-            let is_last = directive == EndDirective::End && input.is_empty();
-            let is_due = self.filled() == self.section_len
+            let is_full = self.filled() == self.section_len;
+            self.is_followed |= is_full && directive != EndDirective::End;
+            let is_last = directive == EndDirective::End && input.is_empty() && !self.is_followed;
+            let is_due = is_full
                 || (directive != EndDirective::Continue && self.filled() != 0)
                 || (is_last && !self.has_posted_last);
             if is_due && self.reports.len() < self.threads_max + 2 {

@@ -103,16 +103,15 @@ impl Prices {
             self.literal_lengths.scale_down(11);
             self.match_lengths.scale_down(11);
             self.offsets.scale_down(11);
-        } else if entropy.literals.0.reuse == Reuse::Always {
-            let table = |kind| entropy.codes.get(kind).current();
-            let literals = entropy.literals.0.current();
+        } else if entropy.literals.reuse == Reuse::Always {
+            let literals = entropy.literals.current();
             self.literals.set_from_bits(11, |it| literals.code_len(it));
             self.literal_lengths
-                .set_from_bits(10, |it| table(CodeKind::LiteralLength).max_bits(it));
+                .set_from_bits(10, |it| entropy.codes.max_bits(CodeKind::LiteralLength, it));
             self.match_lengths
-                .set_from_bits(10, |it| table(CodeKind::MatchLength).max_bits(it));
+                .set_from_bits(10, |it| entropy.codes.max_bits(CodeKind::MatchLength, it));
             self.offsets
-                .set_from_bits(10, |it| table(CodeKind::Offset).max_bits(it));
+                .set_from_bits(10, |it| entropy.codes.max_bits(CodeKind::Offset, it));
         } else {
             self.is_fixed = block.len() <= FIXED_UP_TO;
             let mut counts = [0; 256];

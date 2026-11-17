@@ -260,56 +260,95 @@ struct Transform {
     bits_delta: u32,
 }
 
+/// Which part of [`Tables`] a table takes.
 #[derive(Clone, Copy)]
-pub(crate) struct Table {
+pub(crate) struct Shape {
+    first_state: usize,
+    first_symbol: usize,
     log: u32,
     max_symbol: usize,
-    next_states: [u16; STATES],
-    transforms: [Transform; SYMBOLS],
 }
 
-impl Table {
+impl Shape {
     pub(super) const EMPTY: Self = Self {
+        first_state: 0,
+        first_symbol: 0,
         log: 0,
         max_symbol: 0,
-        next_states: [0; STATES],
+    };
+
+    #[inline(always)]
+    pub(super) fn finish(self, writer: &mut BitWriter<'_>, state: u32) {
+        writer.add(state, self.log);
+        writer.flush();
+    }
+}
+
+/// Room for tables side by side. Where no [`Shape`] is given, symbols count from the first table on.
+pub(crate) struct Tables<const ALL_STATES: usize, const ALL_SYMBOLS: usize> {
+    next_states: [u16; ALL_STATES],
+    transforms: [Transform; ALL_SYMBOLS],
+}
+
+impl<const ALL_STATES: usize, const ALL_SYMBOLS: usize> Tables<ALL_STATES, ALL_SYMBOLS> {
+    pub(super) const EMPTY: Self = Self {
+        next_states: [0; ALL_STATES],
         transforms: [Transform {
             state_delta: 0,
             bits_delta: 0,
-        }; SYMBOLS],
+        }; ALL_SYMBOLS],
     };
 
-    pub(super) const fn new(normalized: &Normalized) -> Self {
-        let mut table = Self::EMPTY;
-        table.build(normalized);
-        table
+    pub(super) fn copy_from(&mut self, other: &Self, shape: Shape) {
+        let states = shape.first_state..shape.first_state + (1 << shape.log);
+        let symbols = shape.first_symbol..=shape.first_symbol + shape.max_symbol;
+        if let Some(to) = self.next_states.get_mut(states.clone())
+            && let Some(from) = other.next_states.get(states)
+        {
+            to.copy_from_slice(from);
+        }
+        if let Some(to) = self.transforms.get_mut(symbols.clone())
+            && let Some(from) = other.transforms.get(symbols)
+        {
+            to.copy_from_slice(from);
+        }
     }
 
-    /// For a single symbol, which takes no bits.
-    pub(super) fn build_for_one(&mut self, symbol: u8) {
-        (self.log, self.max_symbol) = (0, usize::from(symbol));
-        *self.next_states.at_mut(0) = 0;
-        *self.transforms.at_mut(self.max_symbol) = *Self::EMPTY.transforms.at(0);
+    /// The table number `index`, for a single symbol, which takes no bits.
+    pub(super) fn build_for_one(&mut self, index: usize, symbol: usize) -> Shape {
+        let (first_state, first_symbol) = (index * STATES, index * SYMBOLS);
+        *self.next_states.at_mut(first_state) = 0;
+        *self.transforms.at_mut(first_symbol + symbol) = Transform {
+            state_delta: first_state as i32,
+            bits_delta: 0,
+        };
+        Shape {
+            first_state,
+            first_symbol,
+            log: 0,
+            max_symbol: symbol,
+        }
     }
 
+    /// The table number `index`.
     #[expect(clippy::indexing_slicing, reason = "each index is wrapped")]
-    pub(crate) const fn build(&mut self, normalized: &Normalized) {
+    pub(super) const fn build(&mut self, index: usize, normalized: &Normalized) -> Shape {
+        let (first_state, first_symbol) = (index * STATES, index * SYMBOLS);
         let log = normalized.table_log;
         let size = 1usize << log;
         let step = fse_table_step(size);
         let counts = &normalized.counts;
         let symbol_count = normalized.max_symbol % SYMBOLS + 1;
-        (self.log, self.max_symbol) = (log, normalized.max_symbol);
 
         let mut symbol_of_state = [0u8; STATES];
         let mut starts = [0u16; SYMBOLS];
         let mut last_spread = size - 1;
-        let mut total = 0;
+        let mut total = first_state as i32;
         let mut symbol = 0;
         while symbol < symbol_count {
             let count = counts[symbol] as i32;
             starts[symbol] = total as u16;
-            self.transforms[symbol] = match count {
+            self.transforms[(first_symbol + symbol) % ALL_SYMBOLS] = match count {
                 0 => Transform {
                     state_delta: 0,
                     bits_delta: ((log + 1) << BITS_SHIFT) - size as u32,
@@ -379,38 +418,45 @@ impl Table {
         let mut state = 0;
         while state < size {
             let start = &mut starts[symbol_of_state[state % STATES] as usize % SYMBOLS];
-            self.next_states[*start as usize % STATES] = (size + state) as u16;
+            self.next_states[*start as usize % ALL_STATES] = (size + state) as u16;
             *start += 1;
             state += 1;
+        }
+        Shape {
+            first_state,
+            first_symbol,
+            log,
+            max_symbol: normalized.max_symbol,
         }
     }
 
     /// The most bits that `symbol` takes. One more than the log of the table if it cannot be encoded.
-    pub(crate) fn max_bits(&self, symbol: usize) -> u32 {
-        if symbol > self.max_symbol {
-            return self.log + 1;
+    pub(super) fn max_bits(&self, shape: Shape, symbol: usize) -> u32 {
+        if symbol > shape.max_symbol {
+            return shape.log + 1;
         }
-        self.transforms
-            .at(symbol)
-            .bits_delta
-            .div_ceil(1 << BITS_SHIFT)
+        let transform = self.transforms.at(shape.first_symbol + symbol);
+        transform.bits_delta.div_ceil(1 << BITS_SHIFT)
     }
 
     /// About how many bits symbols with these counts take, if they can be encoded.
-    pub(super) fn cost(&self, counts: &[u32]) -> Option<usize> {
+    pub(super) fn cost(&self, shape: Shape, counts: &[u32]) -> Option<usize> {
         const ACCURACY_LOG: u32 = 8;
-        if counts.len() > self.max_symbol + 1 {
+        if counts.len() > shape.max_symbol + 1 {
             return None;
         }
         let mut cost = 0;
-        for (&count, transform) in counts.iter().zip(&self.transforms) {
+        for (&count, transform) in counts
+            .iter()
+            .zip(self.transforms.get(shape.first_symbol..)?)
+        {
             if count == 0 {
                 continue;
             }
             let max_bits = (transform.bits_delta >> BITS_SHIFT) + 1;
-            let below = (max_bits << BITS_SHIFT) - (transform.bits_delta + (1 << self.log));
-            let bits = (max_bits << ACCURACY_LOG) - ((below << ACCURACY_LOG) >> self.log);
-            if bits >= (self.log + 1) << ACCURACY_LOG {
+            let below = (max_bits << BITS_SHIFT) - (transform.bits_delta + (1 << shape.log));
+            let bits = (max_bits << ACCURACY_LOG) - ((below << ACCURACY_LOG) >> shape.log);
+            if bits >= (shape.log + 1) << ACCURACY_LOG {
                 return None;
             }
             cost += count as usize * bits as usize;
@@ -441,14 +487,8 @@ impl Table {
         *state = self.next_state(*state >> bits, *transform);
     }
 
-    #[inline(always)]
-    pub(super) fn finish(&self, writer: &mut BitWriter<'_>, state: u32) {
-        writer.add(state, self.log);
-        writer.flush();
-    }
-
     /// With two states that take turns. `None` if there is nothing to gain, or no room.
-    pub(super) fn compress(&self, symbols: &[u8], out: &mut [u8]) -> Option<usize> {
+    pub(super) fn compress(&self, shape: Shape, symbols: &[u8], out: &mut [u8]) -> Option<usize> {
         let &[ref rest @ .., before_last, last] = symbols else {
             return None;
         };
@@ -467,8 +507,8 @@ impl Table {
             self.encode(&mut writer, &mut other, first);
             writer.flush();
         }
-        self.finish(&mut writer, due);
-        self.finish(&mut writer, other);
+        shape.finish(&mut writer, due);
+        shape.finish(&mut writer, other);
         writer.finish()
     }
 }

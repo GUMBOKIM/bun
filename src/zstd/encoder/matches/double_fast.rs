@@ -8,7 +8,7 @@ use bun_zstd_decoder::with_bmi2;
 use super::fast::{FILL_STEP, Near, look_up_tagged, tagged};
 use super::hash::Hasher;
 use super::{Attached, MatchState, Owner, Progress, Reach, SKIP_LOG, cells, prefetch};
-use crate::bytes::{chunk_at, u32_at, u64_at, word_in};
+use crate::bytes::{AtLeast, chunk_at, likely, u32_at, u64_at, word_in};
 use crate::parameters::TAG_BITS;
 use crate::sequences::{OffsetValue, Repeats, Sequences};
 use crate::window::{FIRST_INDEX, History, WORD_LEN};
@@ -69,36 +69,29 @@ pub(super) fn search<const REACH: Reach>(
     };
 
     if REACH == Reach::Attached {
-        let mut progress = Progress::new(history.start, *repeats, u32::MAX);
-        searcher.search_with_attached(attached, &mut progress, sequences);
+        let mut progress = Progress::new(sequences, history.start, *repeats, u32::MAX);
+        searcher.search_with_attached(attached, &mut progress);
         return progress.finish(repeats, u32::MAX);
     }
 
     let lowest = bounds.lowest(end);
     if REACH == Reach::Older && lowest < history.prefix_index {
-        let progress = Progress::new(history.start, *repeats, u32::MAX);
-        let progress = with_bmi2(
+        let mut progress = Progress::new(sequences, history.start, *repeats, u32::MAX);
+        let progress_mut = &mut progress;
+        with_bmi2(
             #[inline(always)]
-            move || {
-                let mut progress = progress;
-                searcher.search_with_older(lowest, &mut progress, sequences);
-                progress
-            },
+            move || searcher.search_with_older(lowest, progress_mut),
         );
         return progress.finish(repeats, u32::MAX);
     }
 
-    let lowest = history.position(bounds.lowest_in_prefix(end));
-    let start = history.start + u32::from(history.start == lowest);
-    let max_offset = history.index(start) - bounds.lowest_in_prefix(history.index(start));
-    let progress = Progress::new(history.start, *repeats, max_offset);
-    // In a small window it is hard to predict whether a candidate is still in it.
-    let progress = if tuning.window_log < tuning.hash_log + 4 {
-        searcher.search_prefix::<true>(lowest, start, progress, sequences)
-    } else {
-        searcher.search_prefix::<false>(lowest, start, progress, sequences)
-    };
-    progress.finish(repeats, max_offset)
+    let near = Near::new(history, bounds.lowest_in_prefix(end));
+    let first = near.history.index(near.history.start);
+    let max_offset = first - bounds.lowest_in_prefix(first);
+    let anchor = history.start - near.start;
+    let mut progress = Progress::new(sequences, anchor, *repeats, max_offset);
+    searcher.search_prefix(&near, &mut progress);
+    near.start + progress.finish(repeats, max_offset)
 }
 
 #[derive(Clone, Copy)]
@@ -113,20 +106,23 @@ struct Searcher<'a> {
 impl<'a> Searcher<'a> {
     #[inline(always)]
     fn long_entry(&self, word: u64) -> Option<&'a Cell<u32>> {
-        self.long_table.get(self.long_hasher.hash(word))
+        likely(self.long_table.get(self.long_hasher.hash(word)))
     }
 
     #[inline(always)]
     fn short_entry(&self, word: u64) -> Option<&'a Cell<u32>> {
-        self.short_table.get(self.short_hasher.hash(word))
+        likely(self.short_table.get(self.short_hasher.hash(word)))
     }
 
     /// Some positions of a match that was found at `searched` and ends at `end`.
     #[inline(always)]
     fn insert_match(&self, searched: u32, end: u32) -> Option<()> {
         let history = &self.history;
-        let before_end = chunk_at::<{ WORD_LEN + 2 }>(history.prefix, end.wrapping_sub(2))?;
-        let inside = u64_at(history.prefix, searched + 2)?;
+        let before_end = likely(chunk_at::<{ WORD_LEN + 2 }>(
+            history.prefix,
+            end.wrapping_sub(2),
+        ))?;
+        let inside = likely(u64_at(history.prefix, searched + 2))?;
         let (inside_index, end_index) = (history.index(searched + 2), history.index(end));
         self.long_entry(inside)?.set(inside_index);
         self.long_entry(word_in::<0, _>(before_end))?
@@ -138,78 +134,60 @@ impl<'a> Searcher<'a> {
     }
 
     #[inline(never)]
-    fn search_prefix<const IS_BRANCHLESS: bool>(
-        self,
-        lowest: u32,
-        start: u32,
-        progress: Progress,
-        sequences: &mut Sequences,
-    ) -> Progress {
+    fn search_prefix(self, near: &Near<'a>, progress: &mut Progress<'_>) -> Option<Infallible> {
         with_bmi2(
             #[inline(always)]
-            move || {
-                let mut progress = progress;
-                progress.anchor -= lowest;
-                self.scan_prefix::<IS_BRANCHLESS>(lowest, start, &mut progress, sequences);
-                progress.anchor += lowest;
-                progress
-            },
+            move || self.scan_prefix(near, progress),
         )
     }
 
     #[inline(always)]
-    fn scan_prefix<const IS_BRANCHLESS: bool>(
-        mut self,
-        lowest: u32,
-        start: u32,
-        progress: &mut Progress,
-        sequences: &mut Sequences,
-    ) -> Option<Infallible> {
-        const STEP_GROWS_AFTER: u32 = 1 << SKIP_LOG;
-        let near = Near::<WORD_LEN>::new(self.history, lowest)?;
+    fn scan_prefix(mut self, near: &Near<'a>, progress: &mut Progress<'_>) -> Option<Infallible> {
+        const STEP_GROWS_AFTER: usize = 1 << SKIP_LOG;
+        let chunks = AtLeast::<WORD_LEN>::new(near.history.prefix)?;
         self.history = near.history;
-        let (history, bytes) = (&self.history, self.history.prefix);
-        let mut at = start - lowest;
+        self.history.prefix = chunks.bytes;
+        let history = &self.history;
+        let index = |at: usize| history.index(at as u32);
+        let position = |entry: &Cell<u32>| history.position(entry.get()) as usize;
+        let match_len = |at: usize, earlier: usize, known: u32| {
+            known + history.match_len(at as u32 + known, earlier as u32 + known)
+        };
+        let mut at = history.start as usize;
+        let mut recent = near.distance(progress.recent);
 
         loop {
             let mut step = 1;
             let mut next_step = at + STEP_GROWS_AFTER;
             let mut ahead = at + step;
-            let mut ahead_word = u64_at(bytes, ahead)?;
-            let mut word = u64_at(bytes, at)?;
+            let mut word = likely(chunks.word(at))?;
             let mut long_entry = self.long_entry(word)?;
-            let mut long = history.position(long_entry.get());
+            let mut long = position(long_entry);
 
             'stored: {
                 let (found, earlier, len, ahead_entry) = loop {
+                    let ahead_word = likely(chunks.word(ahead))?;
                     let short_entry = self.short_entry(word)?;
-                    let short = history.position(short_entry.get());
-                    long_entry.set(history.index(at));
-                    short_entry.set(history.index(at));
+                    let short = position(short_entry);
+                    long_entry.set(index(at));
+                    short_entry.set(index(at));
 
-                    if near.repeats(at + 1, progress.recent, (word >> 8) as u32) {
-                        let len = near.repeat_len(at + 1, progress.recent);
-                        progress.store(sequences, at + 1, OffsetValue::FIRST_REPEAT, len);
+                    if near.has_before(chunks, at + 1, recent, (word >> 8) as u32) {
+                        let len = near.repeat_len(at as u32 + 1, recent as u32);
+                        progress.store(at as u32 + 1, OffsetValue::FIRST_REPEAT, len);
                         break 'stored;
                     }
 
                     let ahead_entry = self.long_entry(ahead_word)?;
-                    if near
-                        .bytes
-                        .matches_at::<IS_BRANCHLESS>(long, |it| it == word)
-                    {
-                        let len = 8 + history.match_len(at + 8, long + 8);
-                        break (at, long, len, ahead_entry);
+                    if chunks.matches_at::<true>(long, |it| it == word) {
+                        break (at, long, match_len(at, long, 8), ahead_entry);
                     }
 
-                    let ahead_long = history.position(ahead_entry.get());
-                    if near
-                        .bytes
-                        .matches_at::<IS_BRANCHLESS>(short, |it| it as u32 == word as u32)
-                    {
-                        let len = 4 + history.match_len(at + 4, short + 4);
-                        if ahead_long != 0 && u64_at(bytes, ahead_long) == Some(ahead_word) {
-                            let ahead_len = 8 + history.match_len(ahead + 8, ahead_long + 8);
+                    let ahead_long = position(ahead_entry);
+                    if chunks.matches_at::<true>(short, |it| it as u32 == word as u32) {
+                        let len = match_len(at, short, 4);
+                        if ahead_long != 0 && chunks.word(ahead_long) == Some(ahead_word) {
+                            let ahead_len = match_len(ahead, ahead_long, 8);
                             if ahead_len > len {
                                 break (ahead, ahead_long, ahead_len, ahead_entry);
                             }
@@ -218,41 +196,43 @@ impl<'a> Searcher<'a> {
                     }
 
                     if ahead >= next_step {
-                        prefetch(bytes, ahead + 64);
-                        prefetch(bytes, ahead + 128);
+                        prefetch(chunks.bytes, ahead + 64);
+                        prefetch(chunks.bytes, ahead + 128);
                         step += 1;
                         next_step += STEP_GROWS_AFTER;
                     }
                     (at, word, long_entry, long) = (ahead, ahead_word, ahead_entry, ahead_long);
                     ahead += step;
                     #[cfg(target_arch = "aarch64")]
-                    prefetch(bytes, at + 256);
-                    ahead_word = u64_at(bytes, ahead)?;
+                    prefetch(chunks.bytes, at + 256);
                 };
 
-                let max = earlier.min(found - progress.anchor);
-                let before = history.match_len_before(found, earlier, max);
-                progress.note_offset(found.wrapping_sub(earlier));
                 // Only if the search is certain to go on after it.
                 if step < 4 {
-                    ahead_entry.set(history.index(ahead));
+                    ahead_entry.set(index(ahead));
                 }
-                let offset = OffsetValue::new(progress.recent);
-                progress.store(sequences, found - before, offset, before + len);
+                let (found, earlier) = (found as u32, earlier as u32);
+                let max = earlier.min(found - progress.anchor);
+                let before = history.match_len_before(found, earlier, max);
+                let offset = found.wrapping_sub(earlier);
+                progress.note_offset(offset);
+                progress.store(found - before, OffsetValue::new(offset), before + len);
+                recent = offset as usize;
             }
 
-            self.insert_match(at, progress.anchor)?;
+            self.insert_match(at as u32, progress.anchor)?;
             loop {
-                at = progress.anchor;
-                let word = u64_at(bytes, at)?;
-                if !near.repeats(at, progress.second, word as u32) {
+                at = progress.anchor as usize;
+                let word = likely(chunks.word(at))?;
+                if !near.has_before(chunks, at, near.distance(progress.second), word as u32) {
                     break;
                 }
-                let len = near.repeat_len(at, progress.second);
+                let len = near.repeat_len(at as u32, progress.second);
                 progress.swap_offsets();
-                self.short_entry(word)?.set(history.index(at));
-                self.long_entry(word)?.set(history.index(at));
-                progress.store(sequences, at, OffsetValue::FIRST_REPEAT, len);
+                recent = progress.recent as usize;
+                self.short_entry(word)?.set(index(at));
+                self.long_entry(word)?.set(index(at));
+                progress.store(at as u32, OffsetValue::FIRST_REPEAT, len);
             }
         }
     }
@@ -264,8 +244,7 @@ impl<'a> Searcher<'a> {
         searched: u32,
         found: Match,
         lowest: u32,
-        progress: &mut Progress,
-        sequences: &mut Sequences,
+        progress: &mut Progress<'_>,
     ) -> Option<()> {
         let history = &self.history;
         let (offset, before) = if found.repeats {
@@ -277,12 +256,12 @@ impl<'a> Searcher<'a> {
             (OffsetValue::new(progress.recent), before)
         };
         let len = before + history.match_len_at_index(found.at, found.earlier, found.known);
-        progress.store(sequences, found.at - before, offset, len);
+        progress.store(found.at - before, offset, len);
 
         self.insert_match(searched, progress.anchor)?;
         loop {
             let at = progress.anchor;
-            let word = u64_at(history.prefix, at)?;
+            let word = likely(u64_at(history.prefix, at))?;
             let current = history.index(at);
             let earlier = current.wrapping_sub(progress.second);
             if progress.second.wrapping_sub(1) >= current - lowest
@@ -294,17 +273,12 @@ impl<'a> Searcher<'a> {
             progress.swap_offsets();
             self.short_entry(word)?.set(current);
             self.long_entry(word)?.set(current);
-            progress.store(sequences, at, OffsetValue::FIRST_REPEAT, len);
+            progress.store(at, OffsetValue::FIRST_REPEAT, len);
         }
     }
 
     #[inline(always)]
-    fn search_with_older(
-        mut self,
-        lowest: u32,
-        progress: &mut Progress,
-        sequences: &mut Sequences,
-    ) -> Option<Infallible> {
+    fn search_with_older(mut self, lowest: u32, progress: &mut Progress<'_>) -> Option<Infallible> {
         self.history = self.history.with_prefix_of::<WORD_LEN>()?;
         let history = &self.history;
         let mut at = history.start;
@@ -332,7 +306,7 @@ impl<'a> Searcher<'a> {
                 at += ((at - progress.anchor) >> SKIP_LOG) + 1;
                 continue;
             };
-            self.take_match(at, found, lowest, progress, sequences)?;
+            self.take_match(at, found, lowest, progress)?;
             at = progress.anchor;
         }
     }
@@ -340,8 +314,7 @@ impl<'a> Searcher<'a> {
     fn search_with_attached(
         mut self,
         attached: &Attached<'_>,
-        progress: &mut Progress,
-        sequences: &mut Sequences,
+        progress: &mut Progress<'_>,
     ) -> Option<Infallible> {
         self.history = self.history.with_prefix_of::<WORD_LEN>()?;
         let history = &self.history;
@@ -389,10 +362,10 @@ impl<'a> Searcher<'a> {
             } else {
                 at += ((at - progress.anchor) >> SKIP_LOG) + 1;
                 #[cfg(target_arch = "aarch64")]
-                prefetch(history.prefix, at + 256);
+                prefetch(history.prefix, at as usize + 256);
                 continue;
             };
-            self.take_match(at, found, history.older_index(), progress, sequences)?;
+            self.take_match(at, found, history.older_index(), progress)?;
             at = progress.anchor;
         }
     }

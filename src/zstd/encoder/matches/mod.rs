@@ -103,8 +103,8 @@ fn cells(table: &mut [u32]) -> &[Cell<u32>] {
 }
 
 #[inline(always)]
-fn prefetch<T>(items: &[T], at: u32) {
-    let item = items.as_ptr().wrapping_add(at as usize);
+fn prefetch<T>(items: &[T], at: usize) {
+    let item = items.as_ptr().wrapping_add(at);
     core::hint::prefetch_read(item, core::hint::Locality::L1);
 }
 
@@ -165,8 +165,8 @@ impl Attached<'_> {
 }
 
 /// Where a search that knows two recent offsets has got to.
-#[derive(Clone, Copy)]
-struct Progress {
+struct Progress<'a> {
+    sequences: &'a mut Sequences,
     /// The first byte that no sequence covers.
     anchor: u32,
     /// 0 stands for one that is out of reach.
@@ -174,12 +174,13 @@ struct Progress {
     second: u32,
 }
 
-impl Progress {
-    fn new(anchor: u32, repeats: Repeats, max_offset: u32) -> Self {
+impl<'a> Progress<'a> {
+    fn new(sequences: &'a mut Sequences, anchor: u32, repeats: Repeats, max_offset: u32) -> Self {
         let [recent, second, _] = repeats
             .0
             .map(|offset| if offset > max_offset { 0 } else { offset });
         Self {
+            sequences,
             anchor,
             recent,
             second,
@@ -188,8 +189,9 @@ impl Progress {
 
     /// For a match that starts at `start`.
     #[inline(always)]
-    fn store(&mut self, sequences: &mut Sequences, start: u32, offset: OffsetValue, len: u32) {
-        sequences.push(start.wrapping_sub(self.anchor), offset, len);
+    fn store(&mut self, start: u32, offset: OffsetValue, len: u32) {
+        self.sequences
+            .push(start.wrapping_sub(self.anchor), offset, len);
         self.anchor = start.wrapping_add(len);
     }
 

@@ -37,21 +37,23 @@ fn read_counts(bytes: &mut &[u8], max_symbol: usize, log_max: u32) -> Option<Nor
     })
 }
 
+fn reuse(has_all_symbols: bool) -> Reuse {
+    if has_all_symbols {
+        Reuse::Always
+    } else {
+        Reuse::IfComplete
+    }
+}
+
 /// Reads what is between the ID and the content, and returns the content.
 fn read_tables<'a>(mut bytes: &'a [u8], entropy: &mut Entropy) -> Option<(Repeats, &'a [u8])> {
     let description = read_huffman_weights(bytes).ok()?;
     bytes = bytes.get(description.len..)?;
     let weights = description.weights.get(..description.symbol_count)?;
-    let literals = &mut entropy.literals.0;
-    literals
-        .current_mut()
-        .build_from_weights(weights, description.table_log);
     let has_all = weights.len() == 256 && *description.rank_counts.at(0) == 0;
-    literals.reuse = if has_all {
-        Reuse::Always
-    } else {
-        Reuse::IfComplete
-    };
+    entropy
+        .literals
+        .load(weights, description.table_log, reuse(has_all));
 
     let offsets = read_counts(&mut bytes, MAX_OFFSET_CODE, OFFSET_TABLE_LOG_MAX)?;
     let match_lengths = read_counts(
@@ -83,21 +85,15 @@ fn read_tables<'a>(mut bytes: &'a [u8], entropy: &mut Entropy) -> Option<(Repeat
             MAX_LITERAL_LENGTH_CODE,
         ),
     ] {
-        let slots = entropy.codes.get_mut(kind);
-        slots.current_mut().build(&counts);
         let has_all = (0..=max_needed).all(|symbol| *counts.counts.at(symbol) != 0);
-        slots.reuse = if has_all {
-            Reuse::Always
-        } else {
-            Reuse::IfComplete
-        };
+        entropy.codes.load(kind, &counts, reuse(has_all));
     }
     Some((Repeats(repeats), content))
 }
 
 impl Dictionary {
-    /// Without the magic number, it is all content.
-    pub(crate) fn new(bytes: Vec<u8>, request: &Request) -> Result<Self> {
+    /// Takes `bytes` unless it fails. Without the magic number, they are all content.
+    pub(crate) fn new(bytes: &mut Vec<u8>, request: &Request) -> Result<Self> {
         let tuning = request.tuning(None, Purpose::Dictionary { len: bytes.len() });
         let mut state = MatchState::new(tuning);
         state.reset(tuning, tuning.prefers_rows(), Owner::Dictionary, 0)?;
@@ -110,7 +106,7 @@ impl Dictionary {
                     read_tables(rest, &mut entropy).ok_or(Error::DictionaryCorrupted)?;
                 (u32_at(header, 4).unwrap_or(0), repeats, content)
             }
-            Some(_) => (0, Repeats::INITIAL, &*bytes),
+            Some(_) => (0, Repeats::INITIAL, bytes.as_slice()),
         };
         let content = state.loadable(content, Owner::Dictionary);
         if !content.is_empty() {
@@ -118,7 +114,7 @@ impl Dictionary {
         }
         Ok(Self {
             content: bytes.len() - content.len()..bytes.len(),
-            bytes,
+            bytes: core::mem::take(bytes),
             id,
             state,
             entropy,

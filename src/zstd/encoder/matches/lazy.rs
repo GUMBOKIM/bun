@@ -124,19 +124,19 @@ pub(super) fn search<const REACH: Reach>(
         start,
         depth: (state.tuning.strategy as u32 - Strategy::Greedy as u32).min(2),
     };
-    let progress = Progress::new(history.start, *repeats, max_offset);
+    let mut progress = Progress::new(sequences, history.start, *repeats, max_offset);
 
-    let (progress, next_to_index) = if state.tuning.strategy == Strategy::TreeLazy2 {
+    let next_to_index = if state.tuning.strategy == Strategy::TreeLazy2 {
         let finder = LazyTree::new(state, attached);
-        parser.run::<REACH>(finder, progress, sequences)
+        parser.run::<REACH>(finder, &mut progress)
     } else if !state.uses_rows {
         let finder = Chains::new(state, attached);
-        parser.run::<REACH>(finder, progress, sequences)
+        parser.run::<REACH>(finder, &mut progress)
     } else {
         match state.tuning.row_log() {
-            4 => parser.run::<REACH>(Rows::<16>::new(state, attached), progress, sequences),
-            5 => parser.run::<REACH>(Rows::<32>::new(state, attached), progress, sequences),
-            _ => parser.run::<REACH>(Rows::<64>::new(state, attached), progress, sequences),
+            4 => parser.run::<REACH>(Rows::<16>::new(state, attached), &mut progress),
+            5 => parser.run::<REACH>(Rows::<32>::new(state, attached), &mut progress),
+            _ => parser.run::<REACH>(Rows::<64>::new(state, attached), &mut progress),
         }
     };
     state.next_to_index = next_to_index;
@@ -152,19 +152,15 @@ struct Parser<'a> {
 }
 
 impl Parser<'_> {
+    /// Returns from which index on the tables are not up to date.
     #[inline(never)]
-    fn run<const REACH: Reach>(
-        self,
-        finder: impl Finder,
-        progress: Progress,
-        sequences: &mut Sequences,
-    ) -> (Progress, u32) {
+    fn run<const REACH: Reach>(self, finder: impl Finder, progress: &mut Progress<'_>) -> u32 {
         with_bmi2(
             #[inline(always)]
             move || {
-                let (mut finder, mut progress) = (finder, progress);
-                self.parse::<REACH, _>(&mut finder, &mut progress, sequences);
-                (progress, finder.next_to_index())
+                let mut finder = finder;
+                self.parse::<REACH, _>(&mut finder, progress);
+                finder.next_to_index()
             },
         )
     }
@@ -193,8 +189,7 @@ impl Parser<'_> {
     fn parse<const REACH: Reach, F: Finder>(
         mut self,
         finder: &mut F,
-        progress: &mut Progress,
-        sequences: &mut Sequences,
+        progress: &mut Progress<'_>,
     ) -> Option<Infallible> {
         const SKIPS_INDEXING_FROM: u32 = 8;
         self.history = self.history.with_prefix_of::<WORD_LEN>()?;
@@ -258,7 +253,7 @@ impl Parser<'_> {
                 }
             }
 
-            progress.store(sequences, start, best.offset, best.len);
+            progress.store(start, best.offset, best.len);
             at = progress.anchor;
             if is_skipping {
                 finder.resume(history, &mut scratch);
@@ -269,7 +264,7 @@ impl Parser<'_> {
                 && let Some(len) = self.repeat_len::<REACH>(at, progress.second)
             {
                 progress.swap_offsets();
-                progress.store(sequences, at, OffsetValue::FIRST_REPEAT, len);
+                progress.store(at, OffsetValue::FIRST_REPEAT, len);
                 at = progress.anchor;
             }
         }

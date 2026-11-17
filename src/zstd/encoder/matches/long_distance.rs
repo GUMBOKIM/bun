@@ -419,10 +419,7 @@ impl Finder {
                     bucket: hash as usize & bucket_mask,
                     checksum: (hash >> 32) as u32,
                 };
-                prefetch(
-                    &self.entries,
-                    (split.bucket as u32) << self.parameters.bucket_log,
-                );
+                prefetch(&self.entries, split.bucket << self.parameters.bucket_log);
             }
             at += fed;
 

@@ -236,7 +236,9 @@ fn compress_weights(weights: &[u8], out: &mut [u8]) -> Result<Option<usize>> {
     let normalized = Normalized::new(histogram.used(), weights.len(), log, false)?;
     let header_len = normalized.write(out)?;
     let out = out.get_mut(header_len..).unwrap_or_default();
-    let len = fse::Table::new(&normalized).compress(weights, out);
+    let mut table = fse::Tables::<64, 16>::EMPTY;
+    let shape = table.build(0, &normalized);
+    let len = table.compress(shape, weights, out);
     Ok(len.map(|len| header_len + len))
 }
 
@@ -299,7 +301,7 @@ impl Table {
     }
 
     /// `weights` are those of a valid description.
-    pub(crate) fn build_from_weights(&mut self, weights: &[u8], log: u32) {
+    pub(super) fn build_from_weights(&mut self, weights: &[u8], log: u32) {
         let (mut lens, mut per_len) = ([0; 256], [0; RANKS]);
         for (len, &weight) in lens.iter_mut().zip(weights) {
             if weight != 0 {

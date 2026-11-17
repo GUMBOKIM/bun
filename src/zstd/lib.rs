@@ -52,6 +52,11 @@ impl Encoder {
         self.0.set_parameter(key, value)
     }
 
+    /// Forgets the frame in progress and an error, but not the parameters and the dictionary.
+    pub fn reset_session(&mut self) {
+        self.0.reset_session();
+    }
+
     /// See [`bun_zstd_encoder::Encoder::step`].
     #[inline(never)]
     pub fn step(

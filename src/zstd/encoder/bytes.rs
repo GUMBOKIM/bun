@@ -1,5 +1,14 @@
 //! Reads, writes and comparisons of bytes that cannot panic.
 
+/// Tells the compiler which loops are worth its registers.
+#[inline(always)]
+pub(crate) fn likely<T>(found: Option<T>) -> Option<T> {
+    if found.is_none() {
+        core::hint::cold_path();
+    }
+    found
+}
+
 /// With 32 bits, the end cannot overflow, which leaves one comparison.
 #[inline(always)]
 pub(crate) fn chunk_at<const N: usize>(bytes: &[u8], at: u32) -> Option<&[u8; N]> {
@@ -10,28 +19,46 @@ pub(crate) fn chunk_at<const N: usize>(bytes: &[u8], at: u32) -> Option<&[u8; N]
 #[derive(Clone, Copy)]
 pub(crate) struct AtLeast<'a, const N: usize> {
     pub(crate) bytes: &'a [u8],
-    last: u32,
+    last: usize,
 }
 
 impl<'a, const N: usize> AtLeast<'a, N> {
     #[inline(always)]
     pub(crate) fn new(bytes: &'a [u8]) -> Option<Self> {
-        let last = bytes.len().checked_sub(N)? as u32;
-        let bytes = bytes.get(..last as usize + N)?;
+        let last = bytes.len().checked_sub(N)? as u32 as usize;
+        let bytes = bytes.get(..last + N)?;
         Some(Self { bytes, last })
     }
 
-    /// Whether there is a word at `at` for which `is_match` holds. A branch on the former may be hard to predict.
+    #[inline(always)]
+    pub(crate) fn chunk(self, at: usize) -> Option<&'a [u8; N]> {
+        if at > self.last {
+            return None;
+        }
+        self.bytes.get(at..at + N)?.as_array()
+    }
+
+    #[inline(always)]
+    pub(crate) fn word(self, at: usize) -> Option<u64> {
+        if at > self.last + (N - 8) {
+            return None;
+        }
+        Some(u64::from_le_bytes(*self.bytes.get(at..at + 8)?.as_array()?))
+    }
+
+    /// Whether there is a chunk at `at` for whose first word `is_match` holds. A branch on the former may be hard to
+    /// predict.
     #[inline(always)]
     pub(crate) fn matches_at<const IS_BRANCHLESS: bool>(
         self,
-        at: u32,
+        at: usize,
         is_match: impl FnOnce(u64) -> bool,
     ) -> bool {
+        let is_match = |chunk| is_match(word_in::<0, N>(chunk));
         if !IS_BRANCHLESS {
-            return at <= self.last && u64_at(self.bytes, at).is_some_and(is_match);
+            return self.chunk(at).is_some_and(is_match);
         }
-        u64_at(self.bytes, at.min(self.last)).is_some_and(is_match) && {
+        self.chunk(at.min(self.last)).is_some_and(is_match) && {
             // Keeps the compiler from testing this first.
             core::hint::black_box(());
             at <= self.last

@@ -1,3 +1,5 @@
+use core::ops::Range;
+
 use bun_zstd_decoder::{Error, Output, Result, Status};
 
 use crate::dictionary::Dictionary;
@@ -21,21 +23,36 @@ pub enum EndDirective {
 /// The output that there was no room for.
 #[derive(Default)]
 pub(crate) struct Backlog {
-    pub(crate) bytes: Vec<u8>,
-    flushed: usize,
+    bytes: Vec<u8>,
+    left: Range<usize>,
 }
 
 impl Backlog {
+    pub(crate) fn of(bytes: Vec<u8>) -> Self {
+        let left = 0..bytes.len();
+        Self { bytes, left }
+    }
+
     pub(crate) fn is_empty(&self) -> bool {
-        self.bytes.is_empty()
+        self.left.is_empty()
+    }
+
+    fn fill(
+        &mut self,
+        room: usize,
+        write: impl FnOnce(&mut Output<'_>) -> Result<()>,
+    ) -> Result<()> {
+        if self.bytes.is_empty() {
+            self.bytes = vec::filled(0, room)?;
+        }
+        let mut out = Output::slice(&mut self.bytes);
+        write(&mut out)?;
+        self.left = 0..out.written();
+        Ok(())
     }
 
     pub(crate) fn flush(&mut self, out: &mut Output<'_>) {
-        self.flushed += out.append(self.bytes.get(self.flushed..).unwrap_or_default());
-        if self.flushed == self.bytes.len() {
-            self.bytes.clear();
-            self.flushed = 0;
-        }
+        self.left.start += out.append(self.bytes.get(self.left.clone()).unwrap_or_default());
     }
 }
 
@@ -124,11 +141,9 @@ impl Buffered {
         if out.room() >= worst_case_len(input.len) {
             self.writer.write(&input, dictionary, is_last, out)?;
         } else {
-            let room = worst_case_len(block_len) + 1;
-            vec::clear_for(&mut self.backlog.bytes, room)?;
-            let mut backlog = Output::spare_capacity(&mut self.backlog.bytes, room);
-            self.writer
-                .write(&input, dictionary, is_last, &mut backlog)?;
+            self.backlog.fill(worst_case_len(block_len) + 1, |out| {
+                self.writer.write(&input, dictionary, is_last, out)
+            })?;
         }
         self.has_ended = is_last;
 
@@ -240,11 +255,16 @@ impl Encoder {
         self.request.set(key, value)
     }
 
+    /// Forgets the frame in progress and an error, but not the parameters and the dictionary.
+    pub fn reset_session(&mut self) {
+        (self.frame, self.error, self.pledged_len) = (None, None, None);
+    }
+
     fn start_frame(&mut self, input_len: Option<u64>) -> Result<Frame> {
         if !self.dictionary_bytes.is_empty() {
-            let bytes = core::mem::take(&mut self.dictionary_bytes);
-            let dictionary = Shared::try_new(Dictionary::new(bytes, &self.request)?);
-            self.dictionary = Some(dictionary.map_err(|_| Error::MemoryAllocation)?);
+            let dictionary = Dictionary::new(&mut self.dictionary_bytes, &self.request)?;
+            let dictionary = Shared::try_new(dictionary).map_err(|_| Error::MemoryAllocation)?;
+            self.dictionary = Some(dictionary);
         }
         let dictionary = self.dictionary.as_deref();
         let copied = dictionary.filter(|it| !it.is_attached_for(input_len));
@@ -296,7 +316,7 @@ impl Encoder {
     }
 
     /// Takes all of `input` unless `out` fills up. Returns how much it took, and whether there is output left that
-    /// `directive` asks for. After an error, every call returns that error.
+    /// `directive` asks for. After an error, every call returns that error until [`reset_session`](Self::reset_session).
     pub fn step(
         &mut self,
         input: &[u8],
