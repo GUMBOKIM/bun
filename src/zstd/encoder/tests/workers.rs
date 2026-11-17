@@ -11,8 +11,8 @@ use common::*;
 
 /// How many allocations are granted before one is refused.
 static GRANTS: AtomicUsize = AtomicUsize::new(usize::MAX);
-/// The threads and channels of `std` ask for no more, and cannot do without.
-const ALWAYS_GRANTED: usize = 8 << 10;
+/// The threads of `std` ask for no more, and cannot do without.
+const ALWAYS_GRANTED: usize = 64;
 
 struct Refusing;
 

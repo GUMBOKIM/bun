@@ -1,14 +1,13 @@
 //! Cuts the input into sections, which threads compress. Each job owns what it works on.
 
 use std::collections::VecDeque;
-use std::sync::mpmc;
-use std::sync::mpsc::{self, TryRecvError};
 use std::thread::JoinHandle;
 
 use bun_zstd_decoder::array::allocate;
 use bun_zstd_decoder::format::{BLOCK_LEN_MAX, CHECKSUM_LEN, FRAME_HEADER_LEN_MAX};
 use bun_zstd_decoder::{Error, Output, Result, Status, XxHash64};
 
+use crate::channel::{self, Receiver, Sender};
 use crate::dictionary::Dictionary;
 use crate::frame::{self, FrameWriter, Interest, Start};
 use crate::matches::long_distance::{Candidates, Finder};
@@ -77,8 +76,9 @@ struct Job {
     /// For the first one: the length of all input, and the dictionary.
     frame: Option<(Option<u64>, Option<Shared<Dictionary>>)>,
     is_last: bool,
-    relay: (mpsc::Receiver<Box<Relay>>, mpsc::SyncSender<Box<Relay>>),
-    reports: mpsc::Sender<Report>,
+    relay: Receiver<Box<Relay>>,
+    next_relay: Option<Sender<Box<Relay>>>,
+    reports: Sender<Report>,
     interest: Interest,
 }
 
@@ -90,13 +90,13 @@ struct Worker {
 }
 
 impl Worker {
-    fn compress(&mut self, job: &Job) -> Result<()> {
+    fn compress(&mut self, job: &mut Job) -> Result<()> {
         job.interest.ensure()?;
         let (earlier, section) = job
             .input
             .split_at_checked(job.start)
             .ok_or(Error::Internal)?;
-        let mut relay = job.relay.0.recv().map_err(|_| Error::Internal)?;
+        let mut relay = job.relay.wait()?;
         self.long_matches.clear();
         if let Some(matcher) = &mut relay.long_matcher {
             matcher.find(section, &mut self.long_matches)?;
@@ -104,7 +104,7 @@ impl Worker {
         if let Some(hash) = &mut relay.hash {
             hash.update(section);
         }
-        job.relay.1.send(relay).map_err(|_| Error::Internal)?;
+        (job.next_relay.take().ok_or(Error::Internal)?).send_last(relay);
         job.interest.ensure()?;
 
         let (len, dictionary, start) = match &job.frame {
@@ -138,8 +138,7 @@ impl Worker {
             let written = out.written();
             drop(out);
             let output = vec::copied(self.out.get(..written).unwrap_or_default())?;
-            let sent = job.reports.send(Report::Output(output));
-            sent.map_err(|_| Error::Internal)?;
+            job.reports.send(Report::Output(output))?;
             if end == job.input.len() {
                 return Ok(());
             }
@@ -147,13 +146,13 @@ impl Worker {
         }
     }
 
-    fn run(mut self, jobs: &mpmc::Receiver<Job>) {
-        for job in jobs {
-            let report = match self.compress(&job) {
+    fn run(mut self, jobs: &Receiver<Job>) {
+        while let Ok(mut job) = jobs.wait() {
+            let report = match self.compress(&mut job) {
                 Ok(()) => Report::Done(job.input),
                 Err(error) => Report::Failed(error),
             };
-            let _ = job.reports.send(report);
+            job.reports.send_last(report);
         }
     }
 }
@@ -188,17 +187,20 @@ fn section_and_overlap_len(plan: &Plan, request: &Request) -> (usize, usize) {
 
 #[derive(Default)]
 pub(crate) struct Pool {
-    jobs: Option<(mpmc::Sender<Job>, mpmc::Receiver<Job>)>,
+    jobs: Option<(Sender<Job>, Receiver<Job>)>,
     threads: Vec<JoinHandle<()>>,
 }
 
 impl Pool {
     /// Starts another thread if there are fewer. One is enough to go on.
-    fn prepare(&mut self, useful_threads: usize) -> Result<&mpmc::Sender<Job>> {
-        let (sender, receiver) = self.jobs.get_or_insert_with(mpmc::channel);
+    fn prepare(&mut self, useful_threads: usize) -> Result<&Sender<Job>> {
+        let (sender, receiver) = match &mut self.jobs {
+            Some(jobs) => jobs,
+            none => none.insert(channel::new()?),
+        };
         if self.threads.len() < useful_threads {
             self.threads.try_reserve(1)?;
-            let jobs = mpmc::Receiver::clone(receiver);
+            let jobs = receiver.share();
             let spawned = std::thread::Builder::new()
                 .name("Zstd Worker".into())
                 .stack_size(STACK_LEN)
@@ -233,12 +235,12 @@ pub(crate) struct Workers {
     /// For the next job.
     input: Vec<u8>,
     start: usize,
-    relay: mpsc::Receiver<Box<Relay>>,
+    relay: Receiver<Box<Relay>>,
     spare_inputs: Vec<Vec<u8>>,
     threads_max: usize,
     interest: Interest,
     /// Of the jobs whose output is still to come, in order.
-    reports: VecDeque<mpsc::Receiver<Report>>,
+    reports: VecDeque<Receiver<Report>>,
     backlog: Backlog,
     /// The section filled up before the frame was told to end.
     is_followed: bool,
@@ -273,12 +275,11 @@ impl Workers {
             }
             None => None,
         };
-        let (sender, relay) = mpsc::sync_channel(1);
-        let first = allocate(|| Relay {
+        let (sender, relay) = channel::new()?;
+        sender.send_last(allocate(|| Relay {
             hash: plan.header.has_checksum.then(XxHash64::new),
             long_matcher,
-        })?;
-        sender.send(first).map_err(|_| Error::Internal)?;
+        })?);
 
         let jobs_max = request.workers + 2;
         let mut reports = VecDeque::new();
@@ -341,22 +342,20 @@ impl Workers {
             let overlap = self.input.len() - self.overlap_len.min(self.filled());
             next_input.extend_from_slice(self.input.get(overlap..).unwrap_or_default());
         }
-        let (relay_sender, next_relay) = mpsc::sync_channel(1);
-        let (reports, receiver) = mpsc::channel();
+        let (relay_sender, next_relay) = channel::new()?;
+        let (reports, receiver) = channel::new()?;
         let job = Job {
             plan,
             start: core::mem::replace(&mut self.start, next_input.len()),
             input: core::mem::replace(&mut self.input, next_input),
             frame,
             is_last,
-            relay: (
-                core::mem::replace(&mut self.relay, next_relay),
-                relay_sender,
-            ),
+            relay: core::mem::replace(&mut self.relay, next_relay),
+            next_relay: Some(relay_sender),
             reports,
             interest: self.interest.clone(),
         };
-        pool.prepare(1)?.send(job).map_err(|_| Error::Internal)?;
+        pool.prepare(1)?.send(job)?;
         self.reports.push_back(receiver);
         if !is_last {
             // It gets ready while the section fills up.
@@ -370,12 +369,10 @@ impl Workers {
         let Some(oldest) = self.reports.front() else {
             return self.finish();
         };
-        let report = match oldest.try_recv() {
-            Err(TryRecvError::Empty) if waits => oldest.recv().ok(),
-            Err(TryRecvError::Empty) => return Ok(false),
-            report => report.ok(),
+        let Some(report) = oldest.receive(waits)? else {
+            return Ok(false);
         };
-        match report.ok_or(Error::Internal)? {
+        match report {
             Report::Output(bytes) => self.backlog = Backlog::of(bytes),
             Report::Done(input) => {
                 self.reports.pop_front();
@@ -390,7 +387,7 @@ impl Workers {
         if core::mem::take(&mut self.needs_last_block) {
             self.backlog = Backlog::of(vec::copied(&frame::last_empty_block())?);
         } else if core::mem::take(&mut self.needs_checksum) {
-            let relay = self.relay.recv().map_err(|_| Error::Internal)?;
+            let relay = self.relay.wait()?;
             let hash = relay.hash.as_ref().ok_or(Error::Internal)?;
             self.backlog = Backlog::of(vec::copied(&frame::checksum(hash))?);
         }

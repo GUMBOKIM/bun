@@ -1,8 +1,7 @@
 //! What the search for matches makes of a block.
 
-use core::hint::select_unpredictable;
-
 use core::convert::identity;
+use core::hint::select_unpredictable;
 
 use bun_highway::with_bmi2;
 use bun_zstd_decoder::array::{At, grow};

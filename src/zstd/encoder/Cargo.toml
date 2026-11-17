@@ -13,6 +13,7 @@ workspace = true
 bun_highway.workspace = true
 bun_pod = { workspace = true, features = ["alloc"] }
 bun_removable_features.workspace = true
+bun_threading.workspace = true
 bun_zstd_decoder.workspace = true
 
 [[test]]

@@ -2313,6 +2313,7 @@ dependencies = [
  "bun_highway",
  "bun_pod",
  "bun_removable_features",
+ "bun_threading",
  "bun_zstd_decoder",
 ]
 

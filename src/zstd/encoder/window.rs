@@ -210,17 +210,6 @@ impl<'a> History<'a> {
             .or_else(|| u32_at(self.older, self.older_position(index)))
     }
 
-    /// Positions wrap around for what is in the older run.
-    #[inline(always)]
-    pub(crate) fn has_at(&self, position: u32, value: u32) -> bool {
-        match u32_at(self.prefix, position) {
-            Some(found) => found == value,
-            None => {
-                u32_at(self.older, position.wrapping_add(self.older.len() as u32)) == Some(value)
-            }
-        }
-    }
-
     /// The same for when it is hard to predict which.
     #[inline(always)]
     pub(crate) fn u32_at_any_index(&self, index: u32) -> Option<u32> {
@@ -232,6 +221,17 @@ impl<'a> History<'a> {
     pub(crate) fn u64_at_any_index(&self, index: u32) -> Option<u64> {
         let (run, at) = self.locate(index);
         likely(u64_at(run, at))
+    }
+
+    /// Positions wrap around for what is in the older run.
+    #[inline(always)]
+    pub(crate) fn has_at(&self, position: u32, value: u32) -> bool {
+        match u32_at(self.prefix, position) {
+            Some(found) => found == value,
+            None => {
+                u32_at(self.older, position.wrapping_add(self.older.len() as u32)) == Some(value)
+            }
+        }
     }
 
     /// For the ends of runs. After the older one, the prefix follows.

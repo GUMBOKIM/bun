@@ -332,14 +332,7 @@ impl<'a> Searcher<'a> {
         self.history.prefix = chunks.bytes;
         let history = &self.history;
         let index = |at: usize| history.index(at as u32);
-        let has_at = |index: u32, value: u32| history.u32_at_any_index(index) == Some(value);
-        // The position wraps around if it is in the older run, which is rare.
-        let repeats_at = |at: u32, value: u32| match chunks.chunk(at as usize) {
-            Some(chunk) => word_in::<0, _>(chunk) as u32 == value,
-            None => {
-                u32_at(history.older, at.wrapping_add(history.older.len() as u32)) == Some(value)
-            }
-        };
+        let has_at_index = |index, value| history.u32_at_any_index(index) == Some(value);
         let mut at = history.start as usize;
 
         loop {
@@ -360,17 +353,17 @@ impl<'a> Searcher<'a> {
                 let back = (ahead as u32).wrapping_sub(recent);
 
                 entry.set(index(at));
-                if repeats_at(back, ahead_word as u32) && recent != 0 && back != 0 {
+                if history.has_at(back, ahead_word as u32) && recent != 0 && back != 0 {
                     break (at, true, at + 1, next_entry);
                 }
-                if has_at(candidate, word as u32) {
+                if has_at_index(candidate, word as u32) {
                     break (at, false, at + 1, next_entry);
                 }
 
                 candidate = next_entry.get();
                 entry = self.entry(ahead_word)?;
                 next_entry.set(index(at + 1));
-                if has_at(candidate, (word >> 8) as u32) {
+                if has_at_index(candidate, (word >> 8) as u32) {
                     break (at + 1, false, ahead, entry);
                 }
 

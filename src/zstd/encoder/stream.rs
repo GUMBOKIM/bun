@@ -55,7 +55,9 @@ impl Backlog {
     }
 
     pub(crate) fn flush(&mut self, out: &mut Output<'_>) {
-        self.left.start += out.append(self.bytes.get(self.left.clone()).unwrap_or_default());
+        if let Some(left @ [_, ..]) = self.bytes.get(self.left.clone()) {
+            self.left.start += out.append(left);
+        }
     }
 }
 
