@@ -13,6 +13,7 @@ const ADJACENT_HISTORY_MAX: usize = (1 << 32) - (1 << 19);
 const CREDIBLE_SIZE: u64 = 16 << 20;
 /// ...or this many times what has turned out to be there.
 const CREDIBLE_FACTOR: u64 = 8;
+const STAND_IN_LEN: usize = 1024;
 /// More output than this is not moved to make room for the overshoot.
 const CHEAP_TO_MOVE: usize = 1 << 20;
 
@@ -30,8 +31,8 @@ pub(crate) struct Destination<'o, 'a> {
 }
 
 pub(crate) struct Loan<'a> {
-    /// The older and the newer part of the history before `out`. If one is empty, it is the older.
-    pub(crate) detached: [&'a [u8]; 2],
+    /// The end of the history before `out`.
+    pub(crate) detached: &'a [u8],
     /// The rest of the history, and room for the block.
     pub(crate) out: &'a mut [u8],
 }
@@ -102,6 +103,66 @@ impl<'o, 'a> Destination<'o, 'a> {
         self.out.reserve(len.max(left))
     }
 
+    /// Writes a sequence that fits behind the first `len` bytes of the block, and nothing behind it.
+    pub(crate) fn write(
+        &mut self,
+        mut len: usize,
+        literals: &[u8],
+        offset: usize,
+        match_len: usize,
+    ) -> Result<()> {
+        let end = len + literals.len() + match_len;
+        if end > self.limit {
+            return Err(Error::Internal);
+        }
+        self.reserve(end)?;
+        self.out.write_ahead(len, literals);
+        len += literals.len();
+        if let Some(distance @ 1..) = offset.checked_sub(self.history_len + len) {
+            let from = self.external.len().checked_sub(distance);
+            let from = from.and_then(|from| self.external.get(from..));
+            let from = from.ok_or(Error::CorruptionDetected)?;
+            let from = from.get(..match_len).unwrap_or(from);
+            self.out.write_ahead(len, from);
+            len += from.len();
+        }
+        if len < end {
+            self.out.repeat_ahead(len, offset, end - len)?;
+        }
+        Ok(())
+    }
+
+    /// Has `write` write the start of the block. It returns the length of that, and what else there is to return. For a
+    /// short frame that leaves no room for the overshoot, it gets a stand-in that has it.
+    #[inline(always)]
+    pub(crate) fn with_overshoot<T>(
+        &mut self,
+        write: impl FnOnce(&mut Destination<'_, '_>) -> Result<(usize, T)>,
+    ) -> Result<(usize, T)> {
+        let is_short = self.history_len == 0 && self.limit <= STAND_IN_LEN && !self.grows();
+        let is_tight =
+            |size| self.limit + OVERSHOOT > self.out.room_with_slack() && size <= self.limit as u64;
+        if !(is_short && self.frame.content_size.is_some_and(is_tight)) {
+            return write(self);
+        }
+        let mut bytes = [0; STAND_IN_LEN + OVERSHOOT];
+        let mut out = Output::slice(&mut bytes);
+        let (len, rest) = write(&mut Destination::new(
+            &mut out,
+            self.frame,
+            0,
+            self.external,
+            self.room,
+        ))?;
+        drop(out);
+        (self.out).write_ahead(0, bytes.get(..len).ok_or(Error::Internal)?);
+        Ok((len, rest))
+    }
+
+    pub(crate) fn grows(&self) -> bool {
+        self.out.grows()
+    }
+
     /// About how far back matches can be.
     pub(crate) fn reach(&self) -> u64 {
         ((self.history_len + self.external.len()) as u64).min(self.frame.window_size)
@@ -139,9 +200,9 @@ impl<'o, 'a> Destination<'o, 'a> {
             .ok_or(Error::Internal)?;
         Ok(Loan {
             detached: if detached.is_empty() {
-                [&[], self.external]
+                self.external
             } else {
-                [self.external, detached]
+                detached
             },
             out,
         })

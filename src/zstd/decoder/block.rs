@@ -111,21 +111,15 @@ impl BlockDecoder {
         let (mut len, mut used_literals) = (0, 0);
         if count != 0 {
             let (own, sources) = (&mut self.sequence_tables, &mut self.sequence_sources);
-            let (tables, stream) = select_tables(descriptions, own, sources, entropy)?;
+            let (tables, stream) = select_tables(descriptions, count, own, sources, entropy)?;
             if room == 0 {
                 return Err(Error::DstSizeTooSmall);
             }
             let start = block.len() - stream.len();
             let offsets = &mut self.repeat_offsets;
-            (len, used_literals) = run_sequences(
-                tables,
-                block,
-                start,
-                count,
-                literals,
-                offsets,
-                &mut destination,
-            )?;
+            (len, used_literals) = destination.with_overshoot(|destination| {
+                run_sequences(tables, block, start, count, literals, offsets, destination)
+            })?;
         } else if !descriptions.is_empty() {
             return Err(Error::CorruptionDetected);
         }
@@ -134,13 +128,17 @@ impl BlockDecoder {
     }
 }
 
-/// Returns the tables, and what follows their descriptions in `src`.
+/// For no more sequences, it is not worth copying tables to have them in one place.
+const SCATTERED_TABLES_COUNT_MAX: usize = 10;
+
+/// Returns where the table of each [`CodeKind`] is, and what follows their descriptions in `src`.
 fn select_tables<'t, 's>(
     src: &'s [u8],
+    count: usize,
     own: &'t mut Option<Box<SequenceTables>>,
     sources: &mut [Source; 3],
     entropy: Option<&'t Entropy>,
-) -> Result<(&'t SequenceTables, &'s [u8])> {
+) -> Result<([&'t SequenceTables; 3], &'s [u8])> {
     let (&modes, mut src) = src.split_first().ok_or(Error::SrcSizeWrong)?;
     if modes & 3 != 0 {
         return Err(Error::CorruptionDetected);
@@ -160,8 +158,10 @@ fn select_tables<'t, 's>(
         _ => None,
     };
     let [first, second, third] = *sources;
-    if let Some(tables) = shared(first).filter(|_| first == second && second == third) {
-        return Ok((tables, src));
+    if let (Some(a), Some(b), Some(c)) = (shared(first), shared(second), shared(third))
+        && ((first == second && first == third) || count <= SCATTERED_TABLES_COUNT_MAX)
+    {
+        return Ok(([a, b, c], src));
     }
 
     let own = get_or_allocate(own, || SequenceTables::EMPTY)?;
@@ -180,5 +180,5 @@ fn select_tables<'t, 's>(
         }
         *source = Source::Own;
     }
-    Ok((own, src))
+    Ok(([own; 3], src))
 }

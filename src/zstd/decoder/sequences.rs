@@ -32,17 +32,17 @@ struct States {
 
 impl States {
     #[inline(always)]
-    fn rows(self, tables: &SequenceTables) -> (&LengthRow, &OffsetRow, &LengthRow) {
+    fn rows(self, tables: [&SequenceTables; 3]) -> (&LengthRow, &OffsetRow, &LengthRow) {
         (
-            tables.literal_lengths.at(self.literal_len),
-            tables.offsets.at(self.offset),
-            tables.match_lengths.at(self.match_len),
+            tables[0].literal_lengths.at(self.literal_len),
+            tables[1].offsets.at(self.offset),
+            tables[2].match_lengths.at(self.match_len),
         )
     }
 
     /// What the sequence takes, and the way to the next states.
     #[inline(always)]
-    fn total_bits(self, tables: &SequenceTables) -> isize {
+    fn total_bits(self, tables: [&SequenceTables; 3]) -> isize {
         let (literal_len, offset, match_len) = self.rows(tables);
         isize::from(offset.total_bits)
             + isize::from(match_len.total_bits)
@@ -51,7 +51,9 @@ impl States {
 }
 
 struct Reader<'a> {
-    tables: &'a SequenceTables,
+    /// By [`CodeKind`]: where its table is.
+    tables: [&'a SequenceTables; 3],
+    are_tables_together: bool,
     bits: BackwardBits<'a>,
     states: States,
     left: usize,
@@ -61,16 +63,17 @@ struct Reader<'a> {
 
 impl<'a> Reader<'a> {
     fn new(
-        tables: &'a SequenceTables,
+        tables: [&'a SequenceTables; 3],
         mut bits: BackwardBits<'a>,
         padded_start: &'a PaddedStart,
         count: usize,
     ) -> Self {
         let [literal_len, offset, match_len] =
-            CodeKind::ALL.map(|kind| bits.read(tables.log(kind)) as usize);
+            CodeKind::ALL.map(|kind| bits.read(tables.at(kind as usize).log(kind)) as usize);
         bits.refill();
         Self {
             tables,
+            are_tables_together: tables.iter().all(|&it| core::ptr::eq(it, tables[0])),
             bits,
             states: States {
                 literal_len,
@@ -83,7 +86,8 @@ impl<'a> Reader<'a> {
     }
 
     fn is_quick(&self) -> bool {
-        self.quick_count(self.bits.position) != 0
+        self.are_tables_together
+            && self.quick_count(self.bits.position) != 0
             && self.bits.available >= self.states.total_bits(self.tables)
     }
 
@@ -140,7 +144,7 @@ struct Slot {
 
 const REPEATS: usize = 3;
 const AHEAD_MAX: usize = 8;
-/// One more is read before the first turns out to take care, and one more with care.
+/// One more is read before the first turns out to take care, and then the last of the block.
 const PENDING_MAX: usize = AHEAD_MAX + 2;
 const BATCH: usize = 64;
 /// They do not need as many slots, which take time to clear.
@@ -433,7 +437,8 @@ fn read_and_run<const AHEAD: usize>(
     const { assert!(1 <= AHEAD && AHEAD <= AHEAD_MAX) };
     let buffers = Buffers::new(literals, detached, out);
     let mut buffers = buffers.ok_or(Error::Internal)?;
-    let (tables, src) = (reader.tables, reader.bits.src);
+    debug_assert!(reader.are_tables_together);
+    let (tables, src) = ([reader.tables[0]; 3], reader.bits.src);
     let mut states = reader.states;
     let mut position = reader.bits.position as u32;
     let mut container = reader.bits.container;
@@ -518,13 +523,6 @@ fn read_and_run<const AHEAD: usize>(
     reader.bits.position = position as usize;
     reader.bits.container = container;
     reader.bits.available = spare_bits + states.total_bits(tables);
-    Ok(())
-}
-
-#[inline(always)]
-fn copy(from: &[u8], to: Option<&mut [u8]>) -> Result<()> {
-    let to = to.and_then(|to| to.get_mut(..from.len()));
-    to.ok_or(Error::Internal)?.copy_from_slice(from);
     Ok(())
 }
 
@@ -633,10 +631,8 @@ impl Queue<'_> {
         let [third, second, first, current, following] = slots.ok_or(Error::Internal)?;
         let (literal_len, match_len) = (sequence.literal_len as usize, sequence.match_len as usize);
         let (start, literal_start) = (current.position as usize, current.literal_position as usize);
-        let match_start = start + literal_len;
-        let end = match_start + match_len;
-        let block_len = end - destination.position();
-        destination.check_block_len(block_len)?;
+        let end = start + literal_len + match_len;
+        destination.check_block_len(end - destination.position())?;
         if literal_start + literal_len + LITERALS_PADDING > literals.len() {
             return Err(Error::CorruptionDetected);
         }
@@ -645,42 +641,32 @@ impl Queue<'_> {
                 .ok_or(Error::CorruptionDetected)?,
             _ => sequence.offset,
         };
-        let offset = current.offset as usize;
-        let Loan {
-            detached: [older, newer],
-            out,
-        } = destination.lend(block_len, 0)?;
-        if offset > older.len() + newer.len() + match_start {
-            return Err(Error::CorruptionDetected);
-        }
         let literals = literals.get(literal_start..literal_start + literal_len);
-        copy(literals.ok_or(Error::Internal)?, out.get_mut(start..))?;
-
-        let mut to = match_start;
-        for (part, len_behind) in [(older, newer.len()), (newer, 0)] {
-            if let Some(distance @ 1..) = offset.checked_sub(to + len_behind) {
-                let from = part
-                    .len()
-                    .checked_sub(distance)
-                    .and_then(|from| part.get(from..));
-                let from = from.unwrap_or_default();
-                let from = from.get(..end - to).unwrap_or(from);
-                copy(from, out.get_mut(to..))?;
-                to += from.len();
-            }
-        }
-        let from = to.saturating_sub(offset);
-        while to < end {
-            let (written, room) = out.split_at_mut_checked(to).ok_or(Error::Internal)?;
-            let from = written.get(from..).filter(|from| !from.is_empty());
-            let from = from.ok_or(Error::Internal)?;
-            let from = from.get(..end - to).unwrap_or(from);
-            copy(from, Some(room))?;
-            to += from.len();
-        }
+        let (len, offset) = (start - destination.position(), current.offset as usize);
+        destination.write(len, literals.ok_or(Error::Internal)?, offset, match_len)?;
         following.position = end as u32;
         following.literal_position = (literal_start + literal_len) as u32;
         self.start += 1;
+        Ok(())
+    }
+
+    /// For when the output cannot take the overshoot any more.
+    fn run_rest_carefully(
+        &mut self,
+        reader: &mut Reader<'_>,
+        large: Option<Sequence>,
+        literals: &[u8],
+        destination: &mut Destination<'_, '_>,
+    ) -> Result<()> {
+        while self.pending != 0 {
+            self.run_pending_carefully(literals, destination)?;
+        }
+        if let Some(large) = large {
+            self.run_carefully(&large, literals, destination)?;
+        }
+        while reader.left != 0 {
+            self.run_carefully(&reader.next(), literals, destination)?;
+        }
         Ok(())
     }
 
@@ -692,14 +678,14 @@ impl Queue<'_> {
     ) -> Result<()> {
         const LOAN_MAX: usize = 16 << 10;
 
-        let block_len = reader.bits.src.len();
+        let (block_len, position) = (reader.bits.src.len(), destination.position());
         // Too large for a slot. It waits for those that are pending.
         let mut large = None;
         loop {
             reader.bits.move_to(reader.padded_start);
             while large.is_none()
                 && reader.left != 0
-                && (self.pending < AHEAD || (self.pending < AHEAD + 2 && !reader.is_quick()))
+                && (self.pending < AHEAD || (self.pending < PENDING_MAX && !reader.is_quick()))
             {
                 large = self.push(reader.next())?;
             }
@@ -711,18 +697,24 @@ impl Queue<'_> {
                 continue;
             }
             let next = self.next()?;
-            let len = next.position as usize - destination.position();
+            let len = next.position as usize - position;
             let len = len + usize::from(next.literal_len) + usize::from(next.match_len);
-            let Loan {
-                detached: [_, detached],
-                out,
-            } = destination.lend(len, LOAN_MAX.min(len + 4 * block_len))?;
+            let Loan { detached, out } =
+                destination.lend(len, LOAN_MAX.min(len + 4 * block_len))?;
 
-            let goes_on = large.is_none() && reader.left != 0 && out.len() >= OVERSHOOT;
+            if position + len + OVERSHOOT > out.len() {
+                if !destination.grows() {
+                    return self.run_rest_carefully(reader, large, literals, destination);
+                }
+                self.run_pending_carefully(literals, destination)?;
+                continue;
+            }
+
+            let goes_on = large.is_none() && reader.left != 0;
             let kept = if goes_on { AHEAD } else { 0 };
             if self.pending > kept && !self.run_pending_quickly(kept, literals, detached, out) {
                 self.run_pending_carefully(literals, destination)?;
-            } else if goes_on {
+            } else if goes_on && reader.is_quick() {
                 with_bmi2(
                     #[inline(always)]
                     || read_and_run::<AHEAD>(reader, self, literals, detached, out),
@@ -738,7 +730,7 @@ impl Queue<'_> {
 
 /// Runs the `count` sequences in `block[start..]`. Returns how many bytes they wrote, and how many literals they took.
 pub(crate) fn run_sequences(
-    tables: &SequenceTables,
+    tables: [&SequenceTables; 3],
     block: &[u8],
     start: usize,
     count: usize,
@@ -747,12 +739,11 @@ pub(crate) fn run_sequences(
     destination: &mut Destination<'_, '_>,
 ) -> Result<(usize, usize)> {
     let bits = BackwardBits::new(block, start)?;
-    let padded_start = if bits.is_padded() {
-        &[0; _]
-    } else {
-        &bits.padded_start()
-    };
-    let mut reader = Reader::new(tables, bits, padded_start, count);
+    let mut padded_start = [0; _];
+    if !bits.is_padded() {
+        bits.pad_start(&mut padded_start);
+    }
+    let mut reader = Reader::new(tables, bits, &padded_start, count);
     let (mut few_slots, mut many_slots);
     let (slots, batch): (&mut [Slot], _) = if count <= FEW_SEQUENCES {
         few_slots = [Slot::default(); REPEATS + FEW_SEQUENCES + 1];
@@ -771,17 +762,16 @@ pub(crate) fn run_sequences(
         pending: 0,
     };
 
-    let result = if count > BATCH && destination.reach() > 1 << 24 && tables.has_many_far_offsets()
-    {
-        queue.run_all::<AHEAD_MAX>(&mut reader, literals, destination)
-    } else {
-        queue.run_all::<1>(&mut reader, literals, destination)
-    };
-    // What fails is made of garbage then.
-    if reader.bits.left() < 0 || (result.is_ok() && reader.bits.left() != 0) {
+    let result =
+        if count > BATCH && destination.reach() > 1 << 24 && tables[1].has_many_far_offsets() {
+            queue.run_all::<AHEAD_MAX>(&mut reader, literals, destination)
+        } else {
+            queue.run_all::<1>(&mut reader, literals, destination)
+        };
+    result?;
+    if reader.bits.left() != 0 {
         return Err(Error::CorruptionDetected);
     }
-    result?;
     let slots = queue
         .slots
         .get(queue.start..)

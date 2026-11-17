@@ -200,6 +200,12 @@ impl Frame {
         self.history.extend(literals);
     }
 
+    fn state_size(&mut self) {
+        let size = (self.history.len() - self.dictionary.len()) as u32;
+        self.bytes[4] = 0x80;
+        self.bytes.splice(6..6, size.to_le_bytes());
+    }
+
     /// In all ways there are.
     fn check(mut self) -> Result<()> {
         self.bytes.extend([1, 0, 0]);
@@ -331,6 +337,46 @@ fn matches_at_the_end_of_the_dictionary() -> Result<()> {
             frame.compressed(&raw(noise.bytes(6)), &[sequence; 3]);
             frame.check()?;
         }
+    }
+    Ok(())
+}
+
+#[test]
+fn the_end_of_the_output_is_not_passed() -> Result<()> {
+    let mut noise = Noise(7);
+    for len in [0, 900, 990, 1000, 1030, 3000] {
+        for (distance, match_len) in [(5, 3), (5, 30), (40, 3), (40, 39), (40, 41), (150, 20)] {
+            for is_size_known in [false, true] {
+                let mut frame = Frame::new(12, noise.bytes(200));
+                let first = Sequence {
+                    literal_len: len,
+                    offset_value: 20,
+                    match_len: 4,
+                };
+                let then = Sequence {
+                    literal_len: 0,
+                    offset_value: len + 4 + distance + 3,
+                    match_len,
+                };
+                frame.compressed(&raw(noise.bytes(len)), &[first]);
+                frame.compressed(&raw(noise.bytes(1)), &[then]);
+                if is_size_known {
+                    frame.state_size();
+                }
+                frame.check()?;
+            }
+        }
+    }
+    for len in 985..1030 {
+        let mut frame = Frame::new(12, noise.bytes(200));
+        let sequence = Sequence {
+            literal_len: 1,
+            offset_value: 100,
+            match_len: 9,
+        };
+        frame.compressed(&raw(noise.bytes(len - 810)), &[sequence; 90]);
+        frame.state_size();
+        frame.check()?;
     }
     Ok(())
 }

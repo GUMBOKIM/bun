@@ -5,7 +5,7 @@ use crate::destination::Destination;
 use crate::dictionary::Dictionary;
 use crate::error::{Error, Result};
 use crate::format::BlockType;
-use crate::frame::{BlockHeader, FrameHeader, Header, skippable_len};
+use crate::frame::{BlockHeader, FrameHeader, Header, can_hold_headers, skippable_len};
 use crate::output::Output;
 use crate::xxhash::XxHash64;
 
@@ -27,17 +27,18 @@ fn decompress_frames(
     let mut blocks = BlockDecoder::default();
     let mut is_first = true;
     while !src.is_empty() {
-        src = match Header::read_whole(src) {
+        src = match &Header::read(src) {
+            &Ok(Header::Skippable { content_len }) => {
+                (src.get(skippable_len(content_len)?..)).ok_or(Error::SrcSizeWrong)?
+            }
+            _ if !can_hold_headers(src) => return Err(Error::SrcSizeWrong),
             Ok(Header::Frame(header)) => {
                 is_first = false;
-                decompress_frame(&mut blocks, &header, src, out, dictionary)?
-            }
-            Ok(Header::Skippable { content_len }) => {
-                (src.get(skippable_len(content_len)?..)).ok_or(Error::SrcSizeWrong)?
+                decompress_frame(&mut blocks, header, src, out, dictionary)?
             }
             Ok(Header::Incomplete(_)) => return Err(Error::SrcSizeWrong),
             Err(Error::PrefixUnknown) if !is_first => return Err(Error::SrcSizeWrong),
-            Err(error) => return Err(error),
+            &Err(error) => return Err(error),
         };
     }
     Ok(())

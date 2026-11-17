@@ -46,7 +46,7 @@ struct Fixture {
     hash: u64,
 }
 
-const FIXTURES: [Fixture; 4] = [
+const FIXTURES: [Fixture; 5] = [
     Fixture {
         frames: include_bytes!("fixtures/generated.zst"),
         dictionary: &[],
@@ -64,6 +64,12 @@ const FIXTURES: [Fixture; 4] = [
         dictionary: &[],
         len: 24000,
         hash: 0x1677_E591_A46B_0D8F,
+    },
+    Fixture {
+        frames: include_bytes!("fixtures/some-predefined-tables.zst"),
+        dictionary: DICTIONARY,
+        len: 150,
+        hash: 0xE8A3_6C1D_A92C_DF01,
     },
     Fixture {
         frames: include_bytes!("fixtures/with-dictionary.zst"),

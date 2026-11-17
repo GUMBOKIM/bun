@@ -103,13 +103,11 @@ impl<'a> BackwardBits<'a> {
         self.start >= 8
     }
 
-    pub(crate) fn padded_start(&self) -> PaddedStart {
-        let mut padded = [0; _];
+    pub(crate) fn pad_start(&self, padded: &mut PaddedStart) {
         (padded.iter_mut().skip(8).zip(self.src)).for_each(|(to, from)| *to = *from);
-        padded
     }
 
-    /// Goes on in what [`Self::padded_start`] returned, once that has all that is left.
+    /// Goes on in what [`Self::pad_start`] filled, once that has all that is left.
     #[inline(always)]
     pub(crate) fn move_to(&mut self, padded: &'a PaddedStart) {
         if !self.is_padded() && self.position + 16 <= padded.len() {

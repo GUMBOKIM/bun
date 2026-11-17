@@ -56,6 +56,11 @@ fn header_len(descriptor: u8) -> usize {
     HEADER_PREFIX_LEN + field_lens(descriptor).into_iter().sum::<usize>()
 }
 
+/// Whether `src` is long enough for the header that it would start with if it were a frame, and that of a block.
+pub(crate) fn can_hold_headers(src: &[u8]) -> bool {
+    (src.get(MAGIC_LEN)).is_some_and(|&it| header_len(it) + BLOCK_HEADER_LEN <= src.len())
+}
+
 /// Whether `bytes` start with a magic number, or with as much of one as they hold. There has to be at least one.
 pub fn may_start_frame(bytes: &[u8]) -> bool {
     let missing = u32::MAX.unbounded_shl(8 * bytes.len().min(MAGIC_LEN) as u32);
@@ -116,18 +121,6 @@ impl Header {
             dictionary_id: field(window_len, id_len) as u32,
             has_checksum: descriptor & 0x04 != 0,
         }))
-    }
-
-    /// For input that has to be all there.
-    pub(crate) fn read_whole(src: &[u8]) -> Result<Self> {
-        let header = Self::read(src);
-        let len = src
-            .get(MAGIC_LEN)
-            .map_or(HEADER_PREFIX_LEN, |&it| header_len(it));
-        if src.len() < len + BLOCK_HEADER_LEN && !matches!(header, Ok(Self::Skippable { .. })) {
-            return Err(Error::SrcSizeWrong);
-        }
-        header
     }
 }
 
