@@ -2,6 +2,8 @@
 
 use core::hint::select_unpredictable;
 
+use core::convert::identity;
+
 use bun_highway::with_bmi2;
 use bun_zstd_decoder::array::{At, grow};
 use bun_zstd_decoder::format::CodeKind::{self, LiteralLength, MatchLength, Offset};
@@ -11,7 +13,7 @@ use bun_zstd_decoder::format::{
 };
 use bun_zstd_decoder::{Error, Result};
 
-use crate::bytes::{chunk_at, chunk_at_mut, highest_bit, likely, put};
+use crate::bytes::{chunk_at, chunk_at_mut, highest_bit, likely};
 use crate::entropy::first_symbol;
 use crate::entropy::fse::SYMBOLS;
 use crate::vec;
@@ -128,6 +130,12 @@ impl LengthCode {
         }
     }
 
+    /// For less than 16, which have a code each.
+    #[inline(always)]
+    fn of_few_literals(len: u32) -> Self {
+        Self::new(LiteralLength, len % 16, 0)
+    }
+
     /// `base` is the length less [`MIN_MATCH`].
     #[inline(always)]
     pub(crate) fn of_match(base: u32) -> Self {
@@ -172,7 +180,17 @@ pub(crate) struct Sequence {
 impl Sequence {
     #[inline(always)]
     fn new(literal_len: u32, offset: OffsetValue, match_base: u32) -> Self {
-        let literals = LengthCode::of_literals(literal_len);
+        let code = LengthCode::of_literals(literal_len);
+        Self::with_code(code, literal_len, offset, match_base)
+    }
+
+    #[inline(always)]
+    fn with_code(
+        literals: LengthCode,
+        literal_len: u32,
+        offset: OffsetValue,
+        match_base: u32,
+    ) -> Self {
         let matched = LengthCode::of_match(match_base);
         let length_bits = literals.bits() + matched.bits();
         let extra = low_bits(u64::from(literal_len), literals.bits())
@@ -262,21 +280,24 @@ const LITERALS_START: usize = 256;
 /// How far the copy of literals may go past their end.
 const OVERCOPY: usize = 16;
 
-/// Out of line, or the compiler would call `memcpy()` for the short ones as well.
+/// Also makes `literals` longer. Out of line, or the compiler would call `memcpy()` for the short ones as well.
 #[inline(never)]
-fn copy_literals(block: &[u8], from: u32, literals: &mut [u8], to: u32, len: u32) -> Option<()> {
-    let (block, literals) = (
-        block.get(from as usize..)?,
-        literals.get_mut(to as usize..)?,
-    );
-    if len <= 64
-        && let Some(chunk) = block.first_chunk::<64>()
-        && let Some(room) = literals.first_chunk_mut()
+fn copy_literals(block: &[u8], from: u32, literals: &mut Vec<u8>, to: u32, len: u32) -> Option<()> {
+    const SHORT_LEN: usize = 64;
+    let (block, to, len) = (block.get(from as usize..)?, to as usize, len as usize);
+    if len <= SHORT_LEN
+        && let Some(chunk) = block.first_chunk::<SHORT_LEN>()
     {
-        *room = *chunk;
-        return Some(());
+        if literals.len() < to + SHORT_LEN {
+            literals.resize(literals.capacity().min(2 * to), 0);
+        }
+        if let Some(room) = literals.get_mut(to..)?.first_chunk_mut() {
+            *room = *chunk;
+            return Some(());
+        }
     }
-    put(literals, block.get(..len as usize)?)
+    vec::write_at(literals, to, block.get(..len)?);
+    Some(())
 }
 
 pub(crate) struct Sequences {
@@ -328,9 +349,9 @@ impl Sequences {
 
     /// `block` is what was searched, and `end` where the last match ends.
     pub(crate) fn finish(&mut self, block: &[u8], end: u32) -> Result<()> {
-        let room = self.literal_count(block).unwrap_or(block.len());
-        grow(&mut self.literals, 0, LITERALS_START + room + OVERCOPY)?;
-        let (list, literals) = (self.list.as_mut_slice(), self.literals.as_mut_slice());
+        vec::make_room(&mut self.literals, LITERALS_START + block.len() + OVERCOPY)?;
+        grow(&mut self.literals, 0, LITERALS_START)?;
+        let (list, literals) = (self.list.as_mut_slice(), &mut self.literals);
         let counts = &mut self.counts;
         *counts = [0; _];
         let literals_end = with_bmi2(
@@ -340,22 +361,30 @@ impl Sequences {
                 for sequence in list {
                     let (literal_len, match_base) =
                         (sequence.extra as u32, (sequence.extra >> 32) as u32);
-                    match chunk_at::<OVERCOPY>(block, from) {
-                        Some(chunk) if literal_len as usize <= OVERCOPY => {
-                            *likely(chunk_at_mut(literals, to))? = *chunk;
-                        }
-                        _ => copy_literals(block, from, literals, to, literal_len)?,
+                    let offset = OffsetValue(u32::from_le_bytes(sequence.symbols));
+                    let mut finish = identity(
+                        #[inline(always)]
+                        |code| {
+                            let coded = Sequence::with_code(code, literal_len, offset, match_base);
+                            count(counts, coded);
+                            *sequence = coded;
+                        },
+                    );
+                    if literal_len < OVERCOPY as u32
+                        && let Some(chunk) = likely(chunk_at::<OVERCOPY>(block, from))
+                        && let Some(room) = likely(chunk_at_mut(literals, to))
+                    {
+                        *room = *chunk;
+                        finish(LengthCode::of_few_literals(literal_len));
+                    } else {
+                        copy_literals(block, from, literals, to, literal_len)?;
+                        finish(LengthCode::of_literals(literal_len));
                     }
                     let len = literal_len.wrapping_add(match_base).wrapping_add(MIN_MATCH);
                     (from, to) = (from.wrapping_add(len), to.wrapping_add(literal_len));
-
-                    let offset = OffsetValue(u32::from_le_bytes(sequence.symbols));
-                    let coded = Sequence::new(literal_len, offset, match_base);
-                    count(counts, coded);
-                    *sequence = coded;
                 }
                 let last = block.get(from as usize..).filter(|_| from == end)?;
-                put(literals.get_mut(to as usize..)?, last)?;
+                copy_literals(block, from, literals, to, last.len() as u32)?;
                 Some(to as usize + last.len())
             },
         );

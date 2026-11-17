@@ -1,6 +1,7 @@
 //! For each hash a binary tree, sorted by the bytes that follow a position. The most recent position is the root.
 
 use core::cell::Cell;
+use core::hint::{black_box, cold_path};
 
 use super::hash::Hasher;
 use super::{Attached, Bounds, MatchState, Reach, WORD, cells, prefetch};
@@ -41,7 +42,7 @@ impl<'a> Nodes<'a> {
 struct Side<'a> {
     /// Where the next such node goes.
     slot: &'a Cell<u32>,
-    /// How many bytes it had in common with the root.
+    /// Up to which position the bytes of the root are the same as its.
     common: u32,
 }
 
@@ -58,32 +59,31 @@ impl<'a> Side<'a> {
 pub(super) struct Descent<'a> {
     smaller: Side<'a>,
     larger: Side<'a>,
+    /// Up to which position the bytes of the root are the same as those of the next node, at least.
+    pub(super) known: u32,
 }
 
 impl<'a> Descent<'a> {
     #[inline(always)]
-    pub(super) fn new([smaller, larger]: &'a Node) -> Self {
-        let side = |slot| Side { slot, common: 0 };
+    pub(super) fn new([smaller, larger]: &'a Node, at: u32) -> Self {
+        let side = |slot| Side { slot, common: at };
         Self {
             smaller: side(smaller),
             larger: side(larger),
+            known: at,
         }
-    }
-
-    /// How many bytes the next node has in common with the root, at least.
-    #[inline(always)]
-    pub(super) fn known(&self) -> u32 {
-        self.smaller.common.min(self.larger.common)
     }
 
     /// Returns the next index. `node` is that of `index`, or a spare one that leads nowhere.
     #[inline(always)]
-    pub(super) fn step(&mut self, index: u32, node: &'a Node, len: u32, is_smaller: bool) -> u32 {
+    pub(super) fn step(&mut self, index: u32, node: &'a Node, end: u32, is_smaller: bool) -> u32 {
         let [smaller, larger] = node;
         if is_smaller {
-            self.smaller.extend(index, larger, len)
+            self.known = end.min(self.larger.common);
+            self.smaller.extend(index, larger, end)
         } else {
-            self.larger.extend(index, smaller, len)
+            self.known = end.min(self.smaller.common);
+            self.larger.extend(index, smaller, end)
         }
     }
 
@@ -94,7 +94,7 @@ impl<'a> Descent<'a> {
     }
 }
 
-/// The length of the match at `index`, and whether what follows it is smaller there.
+/// Where the match of `at` at `index` ends, which is not before `known`, and whether what follows it is smaller there.
 #[inline(always)]
 pub(super) fn compare<const REACH: Reach>(
     history: &History<'_>,
@@ -102,12 +102,10 @@ pub(super) fn compare<const REACH: Reach>(
     index: u32,
     known: u32,
 ) -> (u32, bool) {
-    let index = index.wrapping_add(known);
-    let (len, is_smaller) = match REACH {
-        Reach::Older => history.compare_index(at + known, index),
-        _ => history.compare(at + known, history.position(index)),
-    };
-    (known + len, is_smaller)
+    match REACH {
+        Reach::Older => history.compare_index(known, index.wrapping_add(known - at)),
+        _ => history.compare(known, index.wrapping_sub(history.index(at))),
+    }
 }
 
 /// Goes down the tree of a dictionary until `visit`, which gets an index of the history and a length, returns true.
@@ -123,7 +121,7 @@ pub(super) fn descend_attached(
     let (nodes, _) = attached.chain.as_chunks::<2>();
     let mask = nodes.len().wrapping_sub(1);
     let overwritten = attached.end.saturating_sub(mask as u32).max(FIRST_INDEX);
-    let (mut smaller_common, mut larger_common) = (0, 0);
+    let (mut smaller_common, mut larger_common) = (at, at);
     let mut index = *attached.hash.get(hash)?;
     for _ in 0..attempts {
         if index <= FIRST_INDEX {
@@ -131,15 +129,15 @@ pub(super) fn descend_attached(
         }
         let in_history = index.wrapping_add(attached.delta);
         let known = smaller_common.min(larger_common);
-        let (len, is_smaller) = compare::<{ Reach::Older }>(history, at, in_history, known);
-        if visit(in_history, len) || index <= overwritten {
+        let (end, is_smaller) = compare::<{ Reach::Older }>(history, at, in_history, known);
+        if visit(in_history, end - at) || index <= overwritten {
             break;
         }
         let &[smaller, larger] = nodes.get(index as usize & mask)?;
         if is_smaller {
-            (smaller_common, index) = (len, larger);
+            (smaller_common, index) = (end, larger);
         } else {
-            (larger_common, index) = (len, smaller);
+            (larger_common, index) = (end, smaller);
         }
     }
     Some(())
@@ -222,33 +220,41 @@ impl<'a> Tree<'a> {
             .get_mut(self.hasher.hash(u64_at(history.prefix, at)?))?;
         let mut index = core::mem::replace(root, current);
         let nodes = self.nodes.checked()?;
-        let overwritten = nodes.overwritten(current);
+        let last = nodes.overwritten(current).max(lowest - 1);
         let spare = Node::default();
-        let mut descent = Descent::new(nodes.get(current)?);
-        let mut matched_end = current + WORD + 1;
-        let mut longest = WORD;
+        let mut descent = Descent::new(nodes.get(current)?, at);
+        // Left in memory, as the registers are better used for the rest.
+        let mut rare = [current + WORD + 1, at + WORD, lowest, self.attempts, at];
+        black_box(&mut rare);
+        let [matched_end, longest_end, lowest, attempts, start] = &mut rare;
 
-        for _ in 0..self.attempts {
-            if index < lowest {
-                break;
-            }
-            let node = nodes.get(index)?;
-            let (len, is_smaller) = compare::<REACH>(history, at, index, descent.known());
-            if len > longest {
-                longest = len;
-                matched_end = matched_end.max(index + len);
+        while *attempts > 0 {
+            let node = if index > last {
+                nodes.get(index)?
+            } else {
+                cold_path();
+                if index < *lowest {
+                    break;
+                }
+                &spare
+            };
+            let (end, is_smaller) = compare::<REACH>(history, at, index, descent.known);
+            if end > *longest_end {
+                cold_path();
+                *longest_end = end;
+                *matched_end = (index + (end - *start)).max(*matched_end);
             }
             // There is no telling which is smaller.
-            if at + len == history.end() {
+            if end == history.end() {
                 break;
             }
-            let node = if index <= overwritten { &spare } else { node };
-            index = descent.step(index, node, len, is_smaller);
+            index = descent.step(index, node, end, is_smaller);
+            *attempts -= 1;
         }
         descent.finish();
 
-        let skipped = longest.saturating_sub(384).min(192);
-        Some(skipped.max(matched_end - (current + WORD)))
+        let skipped = (*longest_end - *start).saturating_sub(384).min(192);
+        Some(skipped.max(*matched_end - (current + WORD)))
     }
 
     #[inline(always)]

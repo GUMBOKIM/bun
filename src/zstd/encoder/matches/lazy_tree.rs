@@ -1,5 +1,7 @@
 //! A [tree](super::tree) into which positions are only sorted once a search comes across them.
 
+use core::hint::cold_path;
+
 use super::hash::Hasher;
 use super::lazy::{Finder, Match};
 use super::tree::{self, Descent, Node, Tree};
@@ -66,27 +68,32 @@ impl<'a> LazyTree<'a> {
         let spare = Node::default();
         let node @ [link, _] = nodes.get(current)?;
         let mut index = link.get();
-        let mut descent = Descent::new(node);
+        let mut descent = Descent::new(node, at);
 
-        for _ in 0..attempts {
-            if index <= lowest {
-                break;
-            }
-            let node = nodes.get(index)?;
-            let known = descent.known();
-            let (len, is_smaller) = if REACH == Reach::Older && current < history.prefix_index {
-                let from = |at: u32| run.get(at as usize + known as usize..);
-                let earlier = history.older_position(index);
-                let (len, is_smaller) = bytes::compare(from(at)?, from(earlier)?);
+        let last = last.max(lowest);
+        for _ in (0..attempts).rev() {
+            let node = if index > last {
+                nodes.get(index)?
+            } else {
+                cold_path();
+                if index <= lowest {
+                    break;
+                }
+                &spare
+            };
+            let known = descent.known;
+            let (end, is_smaller) = if REACH == Reach::Older && current < history.prefix_index {
+                let earlier = history.older_position(index) + (known - at);
+                let from = |at: u32| run.get(at as usize..);
+                let (len, is_smaller) = bytes::compare(from(known)?, from(earlier)?);
                 (known + len as u32, is_smaller)
             } else {
                 tree::compare::<REACH>(history, at, index, known)
             };
-            if (at + len) as usize == run.len() {
+            if end as usize == run.len() {
                 break;
             }
-            let node = if index <= last { &spare } else { node };
-            index = descent.step(index, node, len, is_smaller);
+            index = descent.step(index, node, end, is_smaller);
         }
         descent.finish();
         Some(())
@@ -169,12 +176,13 @@ impl Finder for LazyTree<'_> {
         self.sort_chain::<REACH>(history, index, overwritten.max(lowest))?;
 
         let spare = Node::default();
-        let mut descent = Descent::new(nodes.get(current)?);
+        let mut descent = Descent::new(nodes.get(current)?, at);
         let mut matched_end = current + WORD + 1;
         let mut attempts = self.tree.attempts;
         while attempts > 0 && index > lowest {
             let node = nodes.get(index)?;
-            let (len, is_smaller) = tree::compare::<REACH>(history, at, index, descent.known());
+            let (end, is_smaller) = tree::compare::<REACH>(history, at, index, descent.known);
+            let len = end - at;
             if len > best.len {
                 matched_end = matched_end.max(index + len);
                 let extra_bits =
@@ -183,16 +191,16 @@ impl Finder for LazyTree<'_> {
                     let offset = OffsetValue::new(current - index);
                     best = Match { len, offset };
                 }
-                if at + len == history.end() {
+                if end == history.end() {
                     attempts = 0;
                     break;
                 }
             }
             if index <= overwritten {
-                descent.step(index, &spare, len, is_smaller);
+                descent.step(index, &spare, end, is_smaller);
                 break;
             }
-            index = descent.step(index, node, len, is_smaller);
+            index = descent.step(index, node, end, is_smaller);
             attempts -= 1;
         }
         descent.finish();

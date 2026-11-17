@@ -266,16 +266,6 @@ pub(crate) enum Owner {
     Dictionary,
 }
 
-impl Owner {
-    /// In the tables of the fast strategies.
-    const fn tag_bits(self) -> u32 {
-        match self {
-            Self::Frame => 0,
-            Self::Dictionary => TAG_BITS,
-        }
-    }
-}
-
 pub(crate) struct MatchState {
     pub(crate) tuning: Tuning,
     pub(crate) uses_rows: bool,

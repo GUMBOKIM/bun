@@ -1,6 +1,6 @@
 //! From bytes to entries of tables.
 
-use core::hint::select_unpredictable;
+use core::hint::{cold_path, select_unpredictable};
 
 use super::Owner;
 use crate::bytes::likely;
@@ -52,6 +52,12 @@ impl Hasher {
     pub(super) fn hash(self, word: u64) -> usize {
         word.wrapping_mul(self.multiplier).wrapping_shr(self.shift) as usize
     }
+
+    #[inline(always)]
+    fn tagged(self, word: u64, index: u32) -> u32 {
+        let shift = self.shift - TAG_BITS;
+        Tagged::new(index, Self { shift, ..self }.hash(word)).0
+    }
 }
 
 /// An entry in the table of a dictionary: an index, and some more bits of the hash.
@@ -84,19 +90,35 @@ impl Tagged {
     }
 }
 
-/// Puts `index` into the table of `OWNER`, unless it only `fills_gaps` and there is none.
+/// Puts `index` into the table of `OWNER`.
 #[inline(always)]
 pub(super) fn insert<const OWNER: Owner>(
     table: &mut [u32],
-    hash: usize,
+    hasher: Hasher,
+    word: u64,
     index: u32,
-    fills_gaps: bool,
 ) -> Option<()> {
-    let entry = likely(table.get_mut(hash >> OWNER.tag_bits()))?;
-    let new = match OWNER {
+    *likely(table.get_mut(hasher.hash(word)))? = match OWNER {
         Owner::Frame => index,
-        Owner::Dictionary => Tagged::new(index, hash).0,
+        Owner::Dictionary => hasher.tagged(word, index),
     };
-    *entry = select_unpredictable(fills_gaps && *entry != 0, *entry, new);
+    Some(())
+}
+
+/// The same for a dictionary, if the entry is free. That is hard to predict while the table `HAS_MANY` such.
+#[inline(always)]
+pub(super) fn fill_gap<const HAS_MANY: bool>(
+    table: &mut [u32],
+    hasher: Hasher,
+    word: u64,
+    index: u32,
+) -> Option<()> {
+    let entry = likely(table.get_mut(hasher.hash(word)))?;
+    if HAS_MANY {
+        *entry = select_unpredictable(*entry != 0, *entry, hasher.tagged(word, index));
+    } else if *entry == 0 {
+        cold_path();
+        *entry = hasher.tagged(word, index);
+    }
     Some(())
 }

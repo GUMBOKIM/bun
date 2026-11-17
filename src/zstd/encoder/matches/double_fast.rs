@@ -5,7 +5,7 @@ use core::convert::{Infallible, identity};
 
 use bun_highway::with_bmi2;
 
-use super::hash::{Hasher, Tagged, insert};
+use super::hash::{Hasher, Tagged, fill_gap, insert};
 use super::near::{Entries, Near};
 use super::{
     Attached, MatchState, Owner, Progress, Reach, SKIP_LOG, TablesMut, apart, cells, prefetch,
@@ -17,25 +17,41 @@ use crate::window::{History, WORD_LEN};
 
 /// Indexes the history up to its end.
 pub(super) fn fill<const OWNER: Owner>(state: &mut MatchState, history: &History<'_>) {
+    #[inline(always)]
+    fn fill_from<const OWNER: Owner, const HAS_MANY_GAPS: bool>(
+        TablesMut { hash, chain, .. }: &mut TablesMut<'_>,
+        [long, short]: [Hasher; 2],
+        history: History<'_>,
+        position: &mut u32,
+    ) -> Option<Infallible> {
+        loop {
+            let chunk = likely(chunk_at::<{ WORD_LEN + 2 }>(history.prefix, *position))?;
+            let (index, word) = (history.index(*position), word_in::<0, _>(chunk));
+            insert::<OWNER>(chain, short, word, index)?;
+            insert::<OWNER>(hash, long, word, index)?;
+            if OWNER == Owner::Dictionary {
+                fill_gap::<HAS_MANY_GAPS>(hash, long, word_in::<1, _>(chunk), index + 1)?;
+                fill_gap::<HAS_MANY_GAPS>(hash, long, word_in::<2, _>(chunk), index + 2)?;
+            }
+            *position += 3;
+        }
+    }
+
     let tuning = state.tuning;
-    let long = Hasher::new(8, tuning.hash_log + OWNER.tag_bits());
-    let short = Hasher::new(tuning.min_match, tuning.chain_log + OWNER.tag_bits());
+    let hashers = [
+        Hasher::new(8, tuning.hash_log),
+        Hasher::new(tuning.min_match, tuning.chain_log),
+    ];
     let (history, mut position) = (*history, history.position(state.next_to_index));
-    let TablesMut { hash, chain, .. } = state.tables.split_mut();
+    let mut tables = state.tables.split_mut();
     with_bmi2(
         #[inline(always)]
-        move || -> Option<Infallible> {
-            loop {
-                let chunk = likely(chunk_at::<{ WORD_LEN + 2 }>(history.prefix, position))?;
-                let (index, word) = (history.index(position), word_in::<0, _>(chunk));
-                insert::<OWNER>(chain, short.hash(word), index, false)?;
-                insert::<OWNER>(hash, long.hash(word), index, false)?;
-                if OWNER == Owner::Dictionary {
-                    insert::<OWNER>(hash, long.hash(word_in::<1, _>(chunk)), index + 1, true)?;
-                    insert::<OWNER>(hash, long.hash(word_in::<2, _>(chunk)), index + 2, true)?;
-                }
-                position += 3;
+        move || {
+            if OWNER == Owner::Dictionary {
+                let first = history.part(0, position + tables.hash.len() as u32);
+                fill_from::<OWNER, true>(&mut tables, hashers, first, &mut position);
             }
+            fill_from::<OWNER, false>(&mut tables, hashers, history, &mut position)
         },
     );
 }
@@ -362,11 +378,11 @@ impl<'a> Searcher<'a> {
             let found =
                 if history.u32_at_index(back) == Some(next_word as u32) && progress.recent != 0 {
                     Match::repeat(at + 1, back)
-                } else if history.u64_at_index(long) == Some(word) && long != lowest {
+                } else if history.u64_at_any_index(long) == Some(word) && long != lowest {
                     Match::new(at, long, 8)
-                } else if history.u32_at_index(short) == Some(word as u32) && short != lowest {
+                } else if history.u32_at_any_index(short) == Some(word as u32) && short != lowest {
                     let long = self.long_entry(next_word)?.replace(current + 1);
-                    if history.u64_at_index(long) == Some(next_word) && long != lowest {
+                    if history.u64_at_any_index(long) == Some(next_word) && long != lowest {
                         Match::new(at + 1, long, 8)
                     } else {
                         Match::new(at, short, 4)

@@ -218,9 +218,9 @@ impl<'a> History<'a> {
     }
 
     #[inline(always)]
-    pub(crate) fn u64_at_index(&self, index: u32) -> Option<u64> {
-        u64_at(self.prefix, self.position(index))
-            .or_else(|| u64_at(self.older, self.older_position(index)))
+    pub(crate) fn u64_at_any_index(&self, index: u32) -> Option<u64> {
+        let (run, at) = self.locate(index);
+        likely(u64_at(run, at))
     }
 
     /// For the ends of runs. After the older one, the prefix follows.
@@ -239,41 +239,42 @@ impl<'a> History<'a> {
         ((len + more) as u32, is_below)
     }
 
-    /// How many bytes from `position` on equal those from `at` of `run` on, and whether the next one is lower there.
+    /// Up to where the bytes from `position` on equal those `distance` further in `run`, and whether the next one is
+    /// lower there.
     #[inline(always)]
-    fn compare_in(&self, position: u32, run: &[u8], at: u32) -> (u32, bool) {
-        let mut len = 0;
+    fn compare_in(&self, position: u32, run: &[u8], distance: u32) -> (u32, bool) {
+        let mut end = position;
         if let Some(a) = likely(u64_at(self.prefix, position))
-            && let Some(b) = likely(u64_at(run, at))
+            && let Some(b) = likely(u64_at(run, position.wrapping_add(distance)))
         {
             if a != b {
                 let len = (a ^ b).trailing_zeros() / 8;
-                return (len, b.swap_bytes() < a.swap_bytes());
+                return (position + len, b.swap_bytes() < a.swap_bytes());
             }
-            len = WORD_LEN as u32;
+            end += WORD_LEN as u32;
         }
-        while let Some(a) = likely(chunk_at(self.prefix, position.wrapping_add(len)))
-            && let Some(b) = likely(chunk_at(run, at.wrapping_add(len)))
+        while let Some(a) = likely(chunk_at(self.prefix, end))
+            && let Some(b) = likely(chunk_at(run, end.wrapping_add(distance)))
         {
             if let Some(index) = first_difference(a, b) {
-                return (len + index, b.at(index as usize) < a.at(index as usize));
+                return (end + index, b.at(index as usize) < a.at(index as usize));
             }
-            len += a.len() as u32;
+            end += a.len() as u32;
         }
-        let (position, at) = (position.wrapping_add(len), at.wrapping_add(len));
-        let (more, is_below) = Self::compare_bytes(self.prefix, position, run, at);
-        (len + more, is_below)
+        let at = end.wrapping_add(distance);
+        let (more, is_below) = Self::compare_bytes(self.prefix, end, run, at);
+        (end + more, is_below)
     }
 
     #[inline(always)]
-    pub(crate) fn compare(&self, position: u32, earlier: u32) -> (u32, bool) {
-        self.compare_in(position, self.prefix, earlier)
+    pub(crate) fn compare(&self, position: u32, distance: u32) -> (u32, bool) {
+        self.compare_in(position, self.prefix, distance)
     }
 
     #[inline(always)]
     pub(crate) fn compare_index(&self, position: u32, index: u32) -> (u32, bool) {
         let (run, at) = self.locate(index);
-        self.compare_in(position, run, at)
+        self.compare_in(position, run, at.wrapping_sub(position))
     }
 
     /// How many bytes from `position` on equal those from `at` of `run` on.

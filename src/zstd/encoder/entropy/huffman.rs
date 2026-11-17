@@ -8,7 +8,7 @@ use bun_zstd_decoder::{Error, Result};
 use super::bit_writer::WordWriter;
 use super::fse::{self, Normalized};
 use super::histogram::Histogram;
-use crate::bytes::{highest_bit, put};
+use crate::bytes::{highest_bit, likely, put};
 
 const DESCRIPTION_LEN_MAX: usize = 128;
 const CODE_LEN_MAX: u32 = 11;
@@ -303,11 +303,18 @@ impl Pending {
         self.count = self.count.wrapping_add(other.count);
     }
 
+    /// A word, and how many of its bytes are complete.
     #[inline(always)]
-    fn flush(&mut self, writer: &mut WordWriter<'_>) -> Option<()> {
+    fn take(&mut self) -> (u64, u32) {
         let count = u32::from(self.count as u8);
         self.count &= 7;
-        writer.put(self.bits.wrapping_shr(count.wrapping_neg()), count / 8)
+        (self.bits.wrapping_shr(count.wrapping_neg()), count / 8)
+    }
+
+    #[inline(always)]
+    fn flush(&mut self, writer: &mut WordWriter<'_>) -> Option<()> {
+        let (word, len) = self.take();
+        writer.put(word, len)
     }
 }
 
@@ -481,18 +488,29 @@ impl Table {
             }
             pending.flush(writer)?;
         }
-        let (pairs, single) = groups.as_chunks::<2>();
+        let (mut pairs, single) = groups.as_chunks::<2>();
         if let [group] = single {
             add_group(&mut pending, group);
             pending.flush(writer)?;
         }
-        for [first, second] in pairs.iter().rev() {
+        // With a check in the middle, the compiler would load all codes first, and run out of registers.
+        while let [before @ .., [first, second]] = pairs
+            && let Some(room) = likely(writer.two_words())
+        {
             add_group(&mut pending, second);
-            pending.flush(writer)?;
+            let (word, len) = pending.take();
+            *room.first_chunk_mut()? = word.to_le_bytes();
             // Does not wait for the bits above.
             let mut more = Pending::default();
             add_group(&mut more, first);
             pending.append(more);
+            let (word, more_len) = pending.take();
+            *room.get_mut(len as usize % 8..)?.first_chunk_mut()? = word.to_le_bytes();
+            writer.advance(len + more_len);
+            pairs = before;
+        }
+        for &symbol in pairs.as_flattened().as_flattened().iter().rev() {
+            pending.add(code(symbol));
             pending.flush(writer)?;
         }
         Some(pending)

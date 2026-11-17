@@ -5,7 +5,7 @@ use core::convert::Infallible;
 
 use bun_highway::with_bmi2;
 
-use super::hash::{Hasher, Tagged, insert};
+use super::hash::{Hasher, Tagged, fill_gap, insert};
 use super::near::{Entries, Near};
 use super::{Attached, MatchState, Owner, Progress, Reach, SKIP_LOG, apart, cells, prefetch};
 use crate::bytes::{AtLeast, chunk_at, likely, u32_at, u64_at, word_in};
@@ -15,23 +15,36 @@ use crate::window::{History, WORD_LEN};
 
 /// Indexes the history up to its end.
 pub(super) fn fill<const OWNER: Owner>(state: &mut MatchState, history: &History<'_>) {
-    let bits = state.tuning.hash_log + OWNER.tag_bits();
-    let hasher = Hasher::new(state.tuning.min_match, bits);
+    #[inline(always)]
+    fn fill_from<const OWNER: Owner, const HAS_MANY_GAPS: bool>(
+        table: &mut [u32],
+        hasher: Hasher,
+        history: History<'_>,
+        position: &mut u32,
+    ) -> Option<Infallible> {
+        loop {
+            let chunk = likely(chunk_at::<{ WORD_LEN + 2 }>(history.prefix, *position))?;
+            let index = history.index(*position);
+            insert::<OWNER>(table, hasher, word_in::<0, _>(chunk), index)?;
+            if OWNER == Owner::Dictionary {
+                fill_gap::<HAS_MANY_GAPS>(table, hasher, word_in::<1, _>(chunk), index + 1)?;
+                fill_gap::<HAS_MANY_GAPS>(table, hasher, word_in::<2, _>(chunk), index + 2)?;
+            }
+            *position += 3;
+        }
+    }
+
+    let hasher = Hasher::new(state.tuning.min_match, state.tuning.hash_log);
     let (history, mut position) = (*history, history.position(state.next_to_index));
     let table = state.tables.split_mut().hash;
     with_bmi2(
         #[inline(always)]
-        move || -> Option<Infallible> {
-            loop {
-                let chunk = likely(chunk_at::<{ WORD_LEN + 2 }>(history.prefix, position))?;
-                let index = history.index(position);
-                insert::<OWNER>(table, hasher.hash(word_in::<0, _>(chunk)), index, false)?;
-                if OWNER == Owner::Dictionary {
-                    insert::<OWNER>(table, hasher.hash(word_in::<1, _>(chunk)), index + 1, true)?;
-                    insert::<OWNER>(table, hasher.hash(word_in::<2, _>(chunk)), index + 2, true)?;
-                }
-                position += 3;
+        move || {
+            if OWNER == Owner::Dictionary {
+                let first = history.part(0, position + table.len() as u32);
+                fill_from::<OWNER, true>(table, hasher, first, &mut position);
             }
+            fill_from::<OWNER, false>(table, hasher, history, &mut position)
         },
     );
 }
@@ -44,7 +57,6 @@ pub(super) fn search<const REACH: Reach>(
     repeats: &mut Repeats,
 ) -> u32 {
     let (tuning, bounds) = (state.tuning, state.bounds());
-    let has_dictionary = state.dictionary_end != 0;
     let mut searcher = Searcher {
         history: *history,
         table: cells(state.tables.split_mut().hash),
@@ -68,18 +80,10 @@ pub(super) fn search<const REACH: Reach>(
         let max_offset = history.index(history.start) - lowest - 1;
         let mut progress = Progress::new(sequences, history.start, *repeats, max_offset);
         let progress_mut = &mut progress;
-        // Most matches in earlier input are recent, unlike those in a dictionary.
-        if has_dictionary {
-            with_bmi2(
-                #[inline(always)]
-                move || searcher.search_with_older::<true>(progress_mut),
-            );
-        } else {
-            searcher.run_on_long_input(
-                #[inline(always)]
-                move |searcher| searcher.search_with_older::<false>(progress_mut),
-            );
-        }
+        searcher.run_on_long_input(
+            #[inline(always)]
+            move |searcher| searcher.search_with_older(progress_mut),
+        );
         return progress.finish(repeats, max_offset);
     }
 
@@ -322,25 +326,18 @@ impl<'a> Searcher<'a> {
     }
 
     #[inline(always)]
-    fn search_with_older<const IS_DICTIONARY: bool>(
-        mut self,
-        progress: &mut Progress<'_>,
-    ) -> Option<Infallible> {
+    fn search_with_older(mut self, progress: &mut Progress<'_>) -> Option<Infallible> {
         const STEP_GROWS_AFTER: usize = 1 << (SKIP_LOG - 1);
         let chunks = AtLeast::<PAIR_LEN>::new(self.history.prefix)?;
         self.history.prefix = chunks.bytes;
         let history = &self.history;
         let index = |at: usize| history.index(at as u32);
-        // Positions wrap around for what is in the older run.
-        let position = |entry: &Cell<u32>| history.position(entry.get());
-        let has_at = |at: u32, value: u32| {
-            if IS_DICTIONARY {
-                return history.u32_at_any_index(history.index(at)) == Some(value);
-            }
-            let in_older = at.wrapping_add(history.older.len() as u32);
-            match chunks.chunk(at as usize) {
-                Some(chunk) => word_in::<0, _>(chunk) as u32 == value,
-                None => u32_at(history.older, in_older) == Some(value),
+        let has_at = |index: u32, value: u32| history.u32_at_any_index(index) == Some(value);
+        // The position wraps around if it is in the older run, which is rare.
+        let repeats_at = |at: u32, value: u32| match chunks.chunk(at as usize) {
+            Some(chunk) => word_in::<0, _>(chunk) as u32 == value,
+            None => {
+                u32_at(history.older, at.wrapping_add(history.older.len() as u32)) == Some(value)
             }
         };
         let mut at = history.start as usize;
@@ -354,7 +351,7 @@ impl<'a> Searcher<'a> {
             let mut word = word_in::<0, _>(pair);
             let mut entry = self.entry(word)?;
             let mut next_entry = self.entry(word_in::<1, _>(pair))?;
-            let mut candidate = position(entry);
+            let mut candidate = entry.get();
 
             // Also the position that is hashed but not yet in the table.
             let (searched, repeats, pending, pending_entry) = loop {
@@ -363,21 +360,21 @@ impl<'a> Searcher<'a> {
                 let back = (ahead as u32).wrapping_sub(recent);
 
                 entry.set(index(at));
-                if has_at(back, ahead_word as u32) && recent != 0 && back != 0 {
+                if repeats_at(back, ahead_word as u32) && recent != 0 && back != 0 {
                     break (at, true, at + 1, next_entry);
                 }
                 if has_at(candidate, word as u32) {
                     break (at, false, at + 1, next_entry);
                 }
 
-                candidate = position(next_entry);
+                candidate = next_entry.get();
                 entry = self.entry(ahead_word)?;
                 next_entry.set(index(at + 1));
                 if has_at(candidate, (word >> 8) as u32) {
                     break (at + 1, false, ahead, entry);
                 }
 
-                candidate = position(entry);
+                candidate = entry.get();
                 next_entry = self.entry(word_in::<1, _>(ahead_pair))?;
                 (at, word) = (ahead, ahead_word);
                 ahead += step;
@@ -395,8 +392,8 @@ impl<'a> Searcher<'a> {
                 earlier = history.index(found.wrapping_sub(recent));
                 (offset, max_before) = (OffsetValue::FIRST_REPEAT, 1);
             } else {
-                (found, earlier) = (searched as u32, history.index(candidate));
-                progress.note_offset(found.wrapping_sub(candidate));
+                (found, earlier) = (searched as u32, candidate);
+                progress.note_offset(index(searched).wrapping_sub(candidate));
                 offset = OffsetValue::new(progress.recent);
                 max_before = found - progress.anchor;
             }

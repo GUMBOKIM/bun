@@ -32,6 +32,17 @@ impl<'a> WordWriter<'a> {
         Some(())
     }
 
+    /// Room for two words, which count as far as it [`advance`](Self::advance)s.
+    #[inline(always)]
+    pub(super) fn two_words(&mut self) -> Option<&mut [u8; 2 * WORD_LEN]> {
+        self.out.get_mut(self.position..)?.first_chunk_mut()
+    }
+
+    #[inline(always)]
+    pub(super) fn advance(&mut self, len: u32) {
+        self.position += len as usize;
+    }
+
     /// The length of what was written.
     #[inline(always)]
     pub(super) fn finish(self, has_partial_byte: bool) -> Option<usize> {

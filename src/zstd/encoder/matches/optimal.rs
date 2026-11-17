@@ -400,7 +400,7 @@ impl Finder<'_> {
         self.tree.next_to_index = if REACH == Reach::Attached || index >= lowest {
             self.descend::<REACH>(at, index, lowest, longest, matches)?
         } else {
-            Descent::new(nodes.get(current)?).finish();
+            Descent::new(nodes.get(current)?, at).finish();
             current + 1
         };
         Some(())
@@ -421,7 +421,7 @@ impl Finder<'_> {
         let (current, left) = (history.index(at), history.end() - at);
         let overwritten = nodes.overwritten(current);
         let spare = Node::default();
-        let mut descent = Descent::new(nodes.get(current)?);
+        let mut descent = Descent::new(nodes.get(current)?, at);
         let mut matched_end = current + WORD + 1;
         let mut attempts = self.tree.attempts;
         let mut note = identity(
@@ -439,16 +439,16 @@ impl Finder<'_> {
 
         while attempts > 0 && index >= lowest {
             let node = nodes.get(index)?;
-            let (len, is_smaller) = tree::compare::<REACH>(&history, at, index, descent.known());
-            if note(index, len) {
+            let (end, is_smaller) = tree::compare::<REACH>(&history, at, index, descent.known);
+            if note(index, end - at) {
                 attempts = 0;
                 break;
             }
             if index <= overwritten {
-                descent.step(index, &spare, len, is_smaller);
+                descent.step(index, &spare, end, is_smaller);
                 break;
             }
-            index = descent.step(index, node, len, is_smaller);
+            index = descent.step(index, node, end, is_smaller);
             attempts -= 1;
         }
         descent.finish();
