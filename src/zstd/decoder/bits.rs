@@ -2,6 +2,29 @@
 
 use crate::error::{Error, Result};
 
+/// A number of bits. The compiler knows that it can shift by it.
+#[derive(Clone, Copy)]
+#[repr(u8)]
+#[rustfmt::skip]
+pub(crate) enum Width {
+    W0, W1, W2, W3, W4, W5, W6, W7, W8, W9, W10, W11, W12, W13, W14, W15,
+    W16, W17, W18, W19, W20, W21, W22, W23, W24, W25, W26, W27, W28, W29, W30, W31,
+}
+
+impl Width {
+    #[inline(always)]
+    #[rustfmt::skip]
+    pub(crate) const fn new(bits: u32) -> Self {
+        use Width::*;
+        match bits % 32 {
+            0 => W0, 1 => W1, 2 => W2, 3 => W3, 4 => W4, 5 => W5, 6 => W6, 7 => W7,
+            8 => W8, 9 => W9, 10 => W10, 11 => W11, 12 => W12, 13 => W13, 14 => W14, 15 => W15,
+            16 => W16, 17 => W17, 18 => W18, 19 => W19, 20 => W20, 21 => W21, 22 => W22, 23 => W23,
+            24 => W24, 25 => W25, 26 => W26, 27 => W27, 28 => W28, 29 => W29, 30 => W30, _ => W31,
+        }
+    }
+}
+
 /// The 8 bytes of `src` from `start` on. Zeros follow its end.
 #[inline(always)]
 pub(crate) fn load_from(src: &[u8], start: usize) -> u64 {
@@ -30,13 +53,14 @@ pub(crate) fn bits_below_mark(src: &[u8], start: usize) -> Result<usize> {
 /// Reads a stream from its last bit to its first. What it reads beyond the first is garbage.
 #[derive(Clone, Copy)]
 pub(crate) struct BackwardBits<'a> {
-    /// Ends with the bytes in `container`.
-    src: &'a [u8],
-    container: u64,
+    pub(crate) src: &'a [u8],
+    /// Where in `src` the bytes in `container` start.
+    pub(crate) position: usize,
+    pub(crate) container: u64,
     /// The low bits of `container` that are yet to be read.
-    available: isize,
-    /// How many bits of `src` are below the stream.
-    floor: usize,
+    pub(crate) available: isize,
+    /// Where in `src` the stream starts.
+    pub(crate) start: usize,
 }
 
 impl<'a> BackwardBits<'a> {
@@ -46,12 +70,13 @@ impl<'a> BackwardBits<'a> {
     /// For the stream in `src[start..]`.
     #[inline(always)]
     pub(crate) fn new(src: &'a [u8], start: usize) -> Result<Self> {
-        let below = src.len().saturating_sub(8);
+        let position = src.len().saturating_sub(8);
         Ok(Self {
             src,
-            container: load_from(src, below),
-            available: (bits_below_mark(src, start)? - 8 * below) as isize,
-            floor: 8 * start,
+            position,
+            container: load_from(src, position),
+            available: (bits_below_mark(src, start)? - 8 * position) as isize,
+            start,
         })
     }
 
@@ -63,36 +88,15 @@ impl<'a> BackwardBits<'a> {
 
     #[inline(always)]
     pub(crate) fn refill(&mut self) {
-        let below = self.src.len().saturating_sub(8);
-        let bytes = below.min((63 - self.available) as usize / 8);
-        self.src = self.src.get(..self.src.len() - bytes).unwrap_or_default();
+        let bytes = self.position.min((63 - self.available) as usize / 8);
+        self.position -= bytes;
         self.available += 8 * bytes as isize;
-        if let Some(last) = self.src.last_chunk() {
-            self.container = u64::from_le_bytes(*last);
-        }
+        self.container = load_from(self.src, self.position);
     }
 
     /// How many bits of the stream are yet to be read. Negative once more were read than it has.
     #[inline(always)]
     pub(crate) fn left(&self) -> isize {
-        8 * self.src.len().saturating_sub(8) as isize + self.available - self.floor as isize
-    }
-
-    /// Whether `count` bits, at most [`Self::IN_REFILL`], and a refill after them need no care.
-    #[inline(always)]
-    pub(crate) fn can_take(&self, count: u32) -> bool {
-        self.available >= count as isize && self.src.len() >= 15
-    }
-
-    /// If [`Self::can_take`]: the low `count` bits of the result are the next, and it refills.
-    #[inline(always)]
-    pub(crate) fn take(&mut self, count: u32) -> u64 {
-        let available = (self.available - count as isize) as usize % 64;
-        let taken = self.container >> available;
-        let bytes = (63 - available) / 8;
-        self.src = (self.src.get(..self.src.len().wrapping_sub(bytes))).unwrap_or_default();
-        self.available = (available | 56) as isize;
-        self.container = u64::from_le_bytes(self.src.last_chunk().copied().unwrap_or_default());
-        taken
+        8 * (self.position as isize - self.start as isize) + self.available
     }
 }

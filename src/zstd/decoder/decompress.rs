@@ -1,12 +1,12 @@
 //! Frames that are all there, into an output that has room for all of their content.
 
 use crate::block::BlockDecoder;
+use crate::destination::Destination;
 use crate::dictionary::Dictionary;
 use crate::error::{Error, Result};
 use crate::format::BlockType;
 use crate::frame::{BlockHeader, FrameHeader, HEADER_PREFIX_LEN, Header, skippable_len};
 use crate::output::Output;
-use crate::sequences::Destination;
 use crate::xxhash::XxHash64;
 
 /// `src` consists of any number of frames. An error takes back what it wrote.

@@ -9,12 +9,15 @@
     clippy::unreachable
 )]
 #![warn(unused_must_use)]
+#![feature(hint_prefetch)]
+#![cfg_attr(all(target_arch = "x86_64", not(miri)), feature(fn_align))]
 
 mod array;
 mod bits;
 mod block;
 mod cpu;
 mod decompress;
+mod destination;
 mod dictionary;
 mod error;
 pub mod format;

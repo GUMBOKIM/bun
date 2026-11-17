@@ -1,6 +1,7 @@
+use crate::array::only_item;
 use crate::error::{Error, Result};
-use crate::format::DICTIONARY_MAGIC;
-use crate::huffman::{HuffmanTable, read_huffman_weights};
+use crate::format::{BLOCK_LEN_MAX, DICTIONARY_MAGIC};
+use crate::huffman::HuffmanTable;
 use crate::sequence_tables::{Kind, SequenceTables};
 
 /// What frames can refer to besides their own content.
@@ -59,12 +60,11 @@ impl<'a> Dictionary<'a> {
             return Ok(self);
         }
         let mut entropy = Vec::new();
-        entropy.try_reserve_exact(1)?;
-        let empty = entropy.push_mut(Entropy {
+        let empty = only_item(&mut entropy, || Entropy {
             huffman: HuffmanTable::default(),
             sequences: SequenceTables::EMPTY,
             repeat_offsets: [0; _],
-        });
+        })?;
         empty.read(rest).map_err(|error| match error {
             Error::CorruptionDetected => Error::DictionaryCorrupted,
             other => other,
@@ -94,9 +94,8 @@ impl<'a> Dictionary<'a> {
 
 impl Entropy {
     fn read(&mut self, src: &[u8]) -> Result<()> {
-        let tree = read_huffman_weights(src)?;
-        self.huffman.fill(&tree, true)?;
-        let mut src = src.get(tree.len..).ok_or(Error::Internal)?;
+        let len = self.huffman.read(src, BLOCK_LEN_MAX)?;
+        let mut src = src.get(len..).ok_or(Error::Internal)?;
         for kind in [Kind::Offset, Kind::MatchLength, Kind::LiteralLength] {
             let len = self.sequences.read(kind, src)?;
             src = src.get(len..).ok_or(Error::Internal)?;

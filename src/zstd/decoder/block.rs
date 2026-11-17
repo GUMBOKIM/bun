@@ -1,13 +1,14 @@
 //! Compressed blocks, and what one leaves for the next.
 
-use crate::cpu::with_bmi2;
+use crate::array::{fill_up, only_item};
+use crate::destination::Destination;
 use crate::dictionary::{Dictionary, Entropy};
 use crate::error::{Error, Result};
 use crate::format::{Encoding, INITIAL_REPEAT_OFFSETS, LONG_SEQUENCE_COUNT};
 use crate::huffman::HuffmanTable;
 use crate::literals::{LITERALS_PADDING, LiteralsHeader};
 use crate::sequence_tables::{Kind, PREDEFINED_TABLES, SequenceTables};
-use crate::sequences::{Destination, run_sequences};
+use crate::sequences::run_sequences;
 
 /// Where the table is that a block can repeat.
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
@@ -72,30 +73,22 @@ impl BlockDecoder {
         let literals = match header.in_place(block) {
             Some(literals) => literals,
             None => {
-                let padded = if has_only_literals {
-                    let written = destination.out.written();
-                    (destination.out).lend_with_slack(written, header.count, header.count)
+                let len = header.room_worth_clearing();
+                let out = if has_only_literals {
+                    destination.lend_room(len)
                 } else {
-                    header.room_in(&mut self.literals)?
+                    fill_up(&mut self.literals, len, 0)?;
+                    &mut self.literals
                 };
-                let out = padded.get_mut(..header.count).ok_or(Error::Internal)?;
-                let (own, source) = (&mut self.huffman, self.huffman_source);
-                with_bmi2(
-                    #[inline(always)]
-                    || {
-                        let start = header.read_tree(block, own)?;
-                        let table = match entropy {
-                            Some(entropy) if source == Source::Dictionary && !header.has_tree() => {
-                                &entropy.huffman
-                            }
-                            _ => own,
-                        };
-                        header.decode(block, start, table, out)
-                    },
-                )?;
+                let start = header.read_tree(block, &mut self.huffman)?;
                 if header.has_tree() {
                     self.huffman_source = Source::Own;
                 }
+                let table = match entropy {
+                    Some(entropy) if self.huffman_source == Source::Dictionary => &entropy.huffman,
+                    _ => &self.huffman,
+                };
+                header.decode(block, start, table, out)?;
                 if has_only_literals {
                     destination.out.commit(header.count);
                     return Ok(header.count);
@@ -106,7 +99,7 @@ impl BlockDecoder {
 
         let (count, count_len) = read_sequence_count(section)?;
         let descriptions = section.get(count_len..).ok_or(Error::Internal)?;
-        let (mut len, mut last_literals) = (0, literals);
+        let (mut len, mut used_literals) = (0, 0);
         if count != 0 {
             let (own, sources) = (&mut self.sequence_tables, &mut self.sequence_sources);
             let (tables, stream) = select_tables(descriptions, own, sources, entropy)?;
@@ -115,7 +108,7 @@ impl BlockDecoder {
             }
             let start = block.len() - stream.len();
             let offsets = &mut self.repeat_offsets;
-            (len, last_literals) = run_sequences(
+            (len, used_literals) = run_sequences(
                 tables,
                 block,
                 start,
@@ -127,8 +120,8 @@ impl BlockDecoder {
         } else if !descriptions.is_empty() {
             return Err(Error::CorruptionDetected);
         }
-        let padding = last_literals.split_last_chunk::<LITERALS_PADDING>();
-        let (last_literals, _) = padding.ok_or(Error::Internal)?;
+        let last_literals = literals.get(used_literals..header.count);
+        let last_literals = last_literals.ok_or(Error::Internal)?;
         destination.check_block_len(len + last_literals.len())?;
         destination.out.commit(len);
         destination.out.append(last_literals);
@@ -166,17 +159,10 @@ fn select_tables<'t, 's>(
         return Ok((tables, src));
     }
 
-    if own.is_empty() {
-        own.try_reserve_exact(1)?;
-        own.push(SequenceTables::EMPTY);
-    }
-    let own = own.first_mut().ok_or(Error::Internal)?;
+    let own = only_item(own, || SequenceTables::EMPTY)?;
     for ((kind, encoding), source) in Kind::ALL.into_iter().zip(encodings).zip(sources) {
         let len = match encoding {
-            Encoding::Compressed => with_bmi2(
-                #[inline(always)]
-                || own.read(kind, src),
-            )?,
+            Encoding::Compressed => own.read(kind, src)?,
             Encoding::Rle => {
                 own.set_rle(kind, *src.first().ok_or(Error::CorruptionDetected)?)?;
                 1

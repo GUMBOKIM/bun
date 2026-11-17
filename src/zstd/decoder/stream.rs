@@ -2,6 +2,7 @@
 
 use crate::block::BlockDecoder;
 use crate::decompress::{check_content_size, check_dictionary, decompress_frame};
+use crate::destination::{Destination, OVERSHOOT};
 use crate::dictionary::Dictionary;
 use crate::error::{Error, Result};
 use crate::format::{
@@ -10,7 +11,6 @@ use crate::format::{
 };
 use crate::frame::{BlockHeader, FrameHeader, FrameLen, Header, frame_len};
 use crate::output::Output;
-use crate::sequences::{Destination, OVERSHOOT};
 use crate::xxhash::XxHash64;
 
 /// `ZSTD_d_windowLogMax`

@@ -1,10 +1,9 @@
 //! The literals section of a compressed block.
 
-use crate::array::fill_up;
 use crate::bits::load_from;
 use crate::error::{Error, Result};
 use crate::format::{Encoding, MIN_LITERALS_FOR_4_STREAMS};
-use crate::huffman::{HuffmanTable, read_huffman_weights};
+use crate::huffman::{AMPLE_ROOM, HuffmanTable};
 
 /// How many bytes behind the literals can be read too.
 pub(crate) const LITERALS_PADDING: usize = 32;
@@ -89,17 +88,12 @@ impl LiteralsHeader {
     }
 
     /// Fills `table` if [`Self::has_tree`]. Returns where the streams start.
-    #[inline(always)]
     pub(crate) fn read_tree(&self, block: &[u8], table: &mut HuffmanTable) -> Result<usize> {
         if !self.has_tree() {
             return Ok(self.header_len);
         }
         let content = block.get(self.header_len..self.section_len);
-        let content = content.ok_or(Error::Internal)?;
-        let tree = read_huffman_weights(content)?;
-        let with_pairs = self.has_4_streams && are_pairs_quicker(self.count, content.len());
-        table.fill(&tree, with_pairs)?;
-        Ok(self.header_len + tree.len)
+        Ok(self.header_len + table.read(content.ok_or(Error::Internal)?, self.count)?)
     }
 
     /// The literals and the padding, if they are in `block` as they are.
@@ -108,48 +102,33 @@ impl LiteralsHeader {
         padded.filter(|_| self.encoding == Encoding::Basic)
     }
 
-    /// `out` has room for `count`. `start` is from [`Self::read_tree`].
-    #[inline(always)]
+    /// `room` is enough for `count`. `start` is from [`Self::read_tree`].
     pub(crate) fn decode(
         &self,
         block: &[u8],
         start: usize,
         table: &HuffmanTable,
-        out: &mut [u8],
+        room: &mut [u8],
     ) -> Result<()> {
         let section = block.get(..self.section_len).ok_or(Error::Internal)?;
+        if self.has_4_streams {
+            return table.decode_4_streams(section, start, room, self.count);
+        }
+        let out = room.get_mut(..self.count).ok_or(Error::Internal)?;
         match self.encoding {
             Encoding::Basic => {
                 let literals = section.get(start..).filter(|it| it.len() == out.len());
                 out.copy_from_slice(literals.ok_or(Error::Internal)?);
             }
             Encoding::Rle => out.fill(*section.last().ok_or(Error::Internal)?),
-            _ if self.has_4_streams => table.decode_4_streams(section, start, out)?,
             _ => table.decode_stream(section, start, out)?,
         }
         Ok(())
     }
 
-    /// Room in `buffer` for the literals and the padding.
-    pub(crate) fn room_in<'a>(&self, buffer: &'a mut Vec<u8>) -> Result<&'a mut [u8]> {
-        let len = self.count + LITERALS_PADDING;
-        fill_up(buffer, len, 0)?;
-        buffer.get_mut(..len).ok_or(Error::Internal)
+    /// How much room to offer to [`Self::decode`], if it has to be cleared first.
+    pub(crate) fn room_worth_clearing(&self) -> usize {
+        let is_large = self.has_4_streams && self.count > AMPLE_ROOM / 2;
+        (self.count + LITERALS_PADDING).max(if is_large { AMPLE_ROOM } else { 0 })
     }
-}
-
-/// Whether looking up two literals at a time saves more than filling the table for it takes.
-fn are_pairs_quicker(count: usize, compressed_len: usize) -> bool {
-    #[rustfmt::skip]
-    const TIMES: [[[u32; 2]; 2]; 16] = [
-        [[0, 0], [1, 1]], [[0, 0], [1, 1]],
-        [[150, 216], [381, 119]], [[170, 205], [514, 112]], [[177, 199], [539, 110]], [[197, 194], [644, 107]],
-        [[221, 192], [735, 107]], [[256, 189], [881, 106]], [[359, 188], [1167, 109]], [[582, 187], [1570, 114]],
-        [[688, 187], [1712, 122]], [[825, 186], [1965, 136]], [[976, 185], [2131, 150]], [[1180, 186], [2070, 175]],
-        [[1377, 185], [1731, 202]], [[1412, 185], [1695, 202]],
-    ];
-    let ratio = (compressed_len * 16 / count.max(1)).min(15);
-    let [single, pair] = crate::array::wrapped(&TIMES, ratio)
-        .map(|[fill, per_256]| fill + per_256 * (count >> 8) as u32);
-    pair + (pair >> 5) < single
 }
