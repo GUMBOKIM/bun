@@ -1,4 +1,4 @@
-use crate::bytes::{chunk_at_mut, likely};
+use crate::bytes::likely;
 
 const WORD_LEN: usize = 8;
 
@@ -6,16 +6,16 @@ const WORD_LEN: usize = 8;
 pub(super) struct WordWriter<'a> {
     /// The compiler sees its length as `last + WORD_LEN`, and compares the position with `last`.
     out: &'a mut [u8],
-    last: u32,
-    position: u32,
+    last: usize,
+    position: usize,
 }
 
 impl<'a> WordWriter<'a> {
     #[inline(always)]
     pub(super) fn new(out: &'a mut [u8]) -> Option<Self> {
-        let last = out.len().checked_sub(WORD_LEN)? as u32;
+        let last = out.len().checked_sub(WORD_LEN)? as u32 as usize;
         Some(Self {
-            out: out.get_mut(..last as usize + WORD_LEN)?,
+            out: out.get_mut(..last + WORD_LEN)?,
             last,
             position: 0,
         })
@@ -23,15 +23,17 @@ impl<'a> WordWriter<'a> {
 
     #[inline(always)]
     pub(super) fn put(&mut self, word: u64, len: u32) -> Option<()> {
-        *likely(chunk_at_mut(self.out, self.position))? = word.to_le_bytes();
-        self.position += len;
+        let position = likely(Some(self.position).filter(|&it| it <= self.last))?;
+        let bytes = self.out.get_mut(position..position + WORD_LEN)?;
+        *bytes.as_mut_array()? = word.to_le_bytes();
+        self.position = position + len as usize;
         Some(())
     }
 
     /// The length of what was written.
     #[inline(always)]
     pub(super) fn finish(self, has_partial_byte: bool) -> Option<usize> {
-        (self.position < self.last).then(|| self.position as usize + usize::from(has_partial_byte))
+        (self.position < self.last).then(|| self.position + usize::from(has_partial_byte))
     }
 }
 

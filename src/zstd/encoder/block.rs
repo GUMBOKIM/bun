@@ -53,6 +53,14 @@ pub(crate) struct Content<'a> {
     pub(crate) repeats: Repeats,
 }
 
+impl Content<'_> {
+    /// An attempt at compressing it that takes more is not worth it.
+    fn len_max(&self) -> usize {
+        let for_parts = self.literals.len() + 12 * self.sequences.len() + 512;
+        for_parts.min(worst_case_len(self.bytes.len()))
+    }
+}
+
 /// What blocks take over from one another.
 pub(crate) struct BlockWriter {
     pub(crate) entropy: Box<Entropy>,
@@ -96,7 +104,7 @@ impl BlockWriter {
         out: &mut Output<'_>,
     ) -> Result<()> {
         const REPEATED_LEN_MAX: usize = 25;
-        let (start, rest) = room_for_block(out, worst_case_len(content.bytes.len()))?;
+        let (start, rest) = room_for_block(out, content.len_max())?;
         match self.entropy.compress(content, tuning, rest)? {
             compressed
                 if compressed.is_none_or(|(len, _)| len < REPEATED_LEN_MAX)

@@ -145,6 +145,15 @@ impl<'a> History<'a> {
         }
     }
 
+    /// Without what precedes `index`, which is in the older run.
+    pub(crate) fn from_older(self, index: u32) -> Self {
+        let older = self.older.get(self.older_position(index) as usize..);
+        Self {
+            older: older.unwrap_or_default(),
+            ..self
+        }
+    }
+
     /// See [`AtLeast`].
     #[inline(always)]
     pub(crate) fn with_prefix_of<const N: usize>(self) -> Option<Self> {
@@ -195,14 +204,14 @@ impl<'a> History<'a> {
     /// `None` unless the bytes are in one run.
     #[inline(always)]
     pub(crate) fn u32_at_index(&self, index: u32) -> Option<u32> {
-        let (run, at) = self.locate(index);
-        u32_at(run, at)
+        u32_at(self.prefix, self.position(index))
+            .or_else(|| u32_at(self.older, self.older_position(index)))
     }
 
     #[inline(always)]
     pub(crate) fn u64_at_index(&self, index: u32) -> Option<u64> {
-        let (run, at) = self.locate(index);
-        u64_at(run, at)
+        u64_at(self.prefix, self.position(index))
+            .or_else(|| u64_at(self.older, self.older_position(index)))
     }
 
     /// For the ends of runs. After the older one, the prefix follows.
@@ -297,12 +306,9 @@ impl<'a> History<'a> {
     /// How many bytes before `position` equal those before `at` of `run`, up to `max`.
     #[inline(always)]
     fn match_len_before_in(&self, position: u32, run: &[u8], at: u32, max: u32) -> u32 {
-        if max == 0 {
-            return 0;
-        }
         let word_before = |run, end: u32| u64_at(run, end.wrapping_sub(WORD_LEN as u32));
-        if let Some(a) = word_before(self.prefix, position)
-            && let Some(b) = word_before(run, at)
+        if let Some(a) = likely(word_before(self.prefix, position))
+            && let Some(b) = likely(word_before(run, at))
             && (a != b || max <= WORD_LEN as u32)
         {
             return max.min((a ^ b).leading_zeros() / 8);

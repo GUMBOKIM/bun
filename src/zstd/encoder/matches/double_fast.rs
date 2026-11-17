@@ -60,7 +60,7 @@ pub(super) fn search<const REACH: Reach>(
     let (tuning, bounds) = (state.tuning, state.bounds());
     let end = history.index(history.end());
     let tables = state.tables.split_mut();
-    let searcher = Searcher {
+    let mut searcher = Searcher {
         history: *history,
         long_table: cells(tables.hash),
         short_table: cells(tables.chain),
@@ -76,11 +76,12 @@ pub(super) fn search<const REACH: Reach>(
 
     let lowest = bounds.lowest(end);
     if REACH == Reach::Older && lowest < history.prefix_index {
+        searcher.history = history.from_older(lowest);
         let mut progress = Progress::new(sequences, history.start, *repeats, u32::MAX);
         let progress_mut = &mut progress;
         with_bmi2(
             #[inline(always)]
-            move || searcher.search_with_older(lowest, progress_mut),
+            move || searcher.search_with_older(progress_mut),
         );
         return progress.finish(repeats, u32::MAX);
     }
@@ -239,19 +240,13 @@ impl<'a> Searcher<'a> {
 
     /// Stores a match that the search at `searched` found, and what repeats after it.
     #[inline(always)]
-    fn take_match(
-        &self,
-        searched: u32,
-        found: Match,
-        lowest: u32,
-        progress: &mut Progress<'_>,
-    ) -> Option<()> {
+    fn take_match(&self, searched: u32, found: Match, progress: &mut Progress<'_>) -> Option<()> {
         let history = &self.history;
         let (offset, before) = if found.repeats {
             (OffsetValue::FIRST_REPEAT, 0)
         } else {
             progress.note_offset(history.index(found.at).wrapping_sub(found.earlier));
-            let max = (found.at - progress.anchor).min(found.earlier - lowest);
+            let max = found.at - progress.anchor;
             let before = history.match_len_before_index(found.at, found.earlier, max);
             (OffsetValue::new(progress.recent), before)
         };
@@ -264,9 +259,7 @@ impl<'a> Searcher<'a> {
             let word = likely(u64_at(history.prefix, at))?;
             let current = history.index(at);
             let earlier = current.wrapping_sub(progress.second);
-            if progress.second.wrapping_sub(1) >= current - lowest
-                || history.u32_at_index(earlier) != Some(word as u32)
-            {
+            if history.u32_at_index(earlier) != Some(word as u32) || progress.second == 0 {
                 return Some(());
             }
             let len = history.match_len_at_index(at, earlier, 4);
@@ -278,10 +271,10 @@ impl<'a> Searcher<'a> {
     }
 
     #[inline(always)]
-    fn search_with_older(mut self, lowest: u32, progress: &mut Progress<'_>) -> Option<Infallible> {
+    fn search_with_older(mut self, progress: &mut Progress<'_>) -> Option<Infallible> {
         self.history = self.history.with_prefix_of::<WORD_LEN>()?;
         let history = &self.history;
-        let mut at = history.start;
+        let (lowest, mut at) = (history.older_index(), history.start);
         loop {
             let (word, next_word) = adjacent_words(history.prefix, at)?;
             let (short_entry, long_entry) = (self.short_entry(word)?, self.long_entry(word)?);
@@ -289,24 +282,23 @@ impl<'a> Searcher<'a> {
             let (short, long) = (short_entry.replace(current), long_entry.replace(current));
             let back = (current + 1).wrapping_sub(progress.recent);
 
-            let found = if progress.recent.wrapping_sub(1) <= current - lowest
-                && history.u32_at_index(back) == Some(next_word as u32)
-            {
-                Match::repeat(at + 1, back)
-            } else if long > lowest && history.u64_at_index(long) == Some(word) {
-                Match::new(at, long, 8)
-            } else if short > lowest && history.u32_at_index(short) == Some(word as u32) {
-                let long = self.long_entry(next_word)?.replace(current + 1);
-                if long > lowest && history.u64_at_index(long) == Some(next_word) {
-                    Match::new(at + 1, long, 8)
+            let found =
+                if history.u32_at_index(back) == Some(next_word as u32) && progress.recent != 0 {
+                    Match::repeat(at + 1, back)
+                } else if history.u64_at_index(long) == Some(word) && long != lowest {
+                    Match::new(at, long, 8)
+                } else if history.u32_at_index(short) == Some(word as u32) && short != lowest {
+                    let long = self.long_entry(next_word)?.replace(current + 1);
+                    if history.u64_at_index(long) == Some(next_word) && long != lowest {
+                        Match::new(at + 1, long, 8)
+                    } else {
+                        Match::new(at, short, 4)
+                    }
                 } else {
-                    Match::new(at, short, 4)
-                }
-            } else {
-                at += ((at - progress.anchor) >> SKIP_LOG) + 1;
-                continue;
-            };
-            self.take_match(at, found, lowest, progress)?;
+                    at += ((at - progress.anchor) >> SKIP_LOG) + 1;
+                    continue;
+                };
+            self.take_match(at, found, progress)?;
             at = progress.anchor;
         }
     }
@@ -349,23 +341,24 @@ impl<'a> Searcher<'a> {
             let (short, long) = (short_entry.replace(current), long_entry.replace(current));
             let back = (current + 1).wrapping_sub(progress.recent);
 
-            let found = if history.u32_at_index(back) == Some(next_word as u32) {
-                Match::repeat(at + 1, back)
-            } else if let Some(long) = find_long(long, word) {
-                Match::new(at, long, 8)
-            } else if let Some(short) = find_short(short, word) {
-                let long = self.long_entry(next_word)?.replace(current + 1);
-                match find_long(long, next_word) {
-                    Some(long) => Match::new(at + 1, long, 8),
-                    None => Match::new(at, short, 4),
-                }
-            } else {
-                at += ((at - progress.anchor) >> SKIP_LOG) + 1;
-                #[cfg(target_arch = "aarch64")]
-                prefetch(history.prefix, at as usize + 256);
-                continue;
-            };
-            self.take_match(at, found, history.older_index(), progress)?;
+            let found =
+                if history.u32_at_index(back) == Some(next_word as u32) && progress.recent != 0 {
+                    Match::repeat(at + 1, back)
+                } else if let Some(long) = find_long(long, word) {
+                    Match::new(at, long, 8)
+                } else if let Some(short) = find_short(short, word) {
+                    let long = self.long_entry(next_word)?.replace(current + 1);
+                    match find_long(long, next_word) {
+                        Some(long) => Match::new(at + 1, long, 8),
+                        None => Match::new(at, short, 4),
+                    }
+                } else {
+                    at += ((at - progress.anchor) >> SKIP_LOG) + 1;
+                    #[cfg(target_arch = "aarch64")]
+                    prefetch(history.prefix, at as usize + 256);
+                    continue;
+                };
+            self.take_match(at, found, progress)?;
             at = progress.anchor;
         }
     }

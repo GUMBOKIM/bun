@@ -9,19 +9,22 @@ pub(crate) struct Histogram<const N: usize> {
     pub(crate) largest_count: usize,
 }
 
-impl<const N: usize> Histogram<N> {
+impl Histogram<256> {
     #[inline]
     pub(crate) fn of(symbols: &[u8]) -> Self {
-        let counts = if symbols.len() < 1500 {
-            let mut counts = [0; N];
-            add(&mut counts, symbols);
-            counts
-        } else {
-            count_interleaved(symbols)
-        };
-        Self::new(counts)
+        Self::new(match symbols.len() {
+            ..1500 => {
+                let mut counts = [0; 256];
+                add(&mut counts, symbols);
+                counts
+            }
+            1500..16_384 => count_interleaved::<1>(symbols),
+            _ => count_interleaved::<2>(symbols),
+        })
     }
+}
 
+impl<const N: usize> Histogram<N> {
     #[inline]
     pub(crate) fn new(counts: [u32; N]) -> Self {
         Self {
@@ -38,28 +41,31 @@ impl<const N: usize> Histogram<N> {
 }
 
 #[inline(always)]
-pub(crate) fn add<const N: usize>(counts: &mut [u32; N], symbols: &[u8]) {
+pub(crate) fn add(counts: &mut [u32; 256], symbols: &[u8]) {
     for &symbol in symbols {
         *counts.at_mut(usize::from(symbol)) += 1;
     }
 }
 
-/// With four tables, a symbol that repeats does not wait for its last count to be stored.
+/// With several tables, a symbol that repeats does not wait for its last count to be stored.
 #[inline(never)]
-fn count_interleaved<const N: usize>(symbols: &[u8]) -> [u32; N] {
-    let mut tables = [[0u32; N]; 4];
-    let (words, rest) = symbols.as_chunks();
-    for word in words {
-        let word = u64::from_le_bytes(*word);
-        for byte in 0..8 {
-            let symbol = usize::from((word >> (8 * byte)) as u8);
-            *tables.at_mut(byte % 4).at_mut(symbol) += 1;
+fn count_interleaved<const SETS: usize>(symbols: &[u8]) -> [u32; 256] {
+    let mut sets = [[[0u32; 256]; 4]; SETS];
+    let (stripes, rest) = symbols.as_chunks::<16>();
+    for stripe in stripes {
+        for (index, word) in stripe.as_chunks().0.iter().enumerate() {
+            let word = u32::from_le_bytes(*word);
+            for (byte, table) in sets.at_mut(index % SETS).iter_mut().enumerate() {
+                *table.at_mut(usize::from((word >> (8 * byte)) as u8)) += 1;
+            }
         }
     }
-    let [mut a, b, c, d] = tables;
-    add(&mut a, rest);
-    for (((a, b), c), d) in a.iter_mut().zip(b).zip(c).zip(d) {
-        *a += b + c + d;
+    let mut counts = [0; 256];
+    add(&mut counts, rest);
+    for table in sets.as_flattened() {
+        for (count, more) in counts.iter_mut().zip(table) {
+            *count += more;
+        }
     }
-    a
+    counts
 }

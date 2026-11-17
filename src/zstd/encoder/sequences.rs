@@ -298,8 +298,7 @@ impl Sequences {
 
     pub(crate) fn clear_for(&mut self, block_len: usize, min_match: u32) -> Result<()> {
         let shortest = if min_match == 3 { 3 } else { 4 };
-        vec::clear_for(&mut self.list, block_len / shortest)?;
-        vec::grow(&mut self.literals, 0, block_len + OVERCOPY)
+        vec::clear_for(&mut self.list, block_len / shortest)
     }
 
     pub(crate) fn literals(&self) -> &[u8] {
@@ -322,6 +321,13 @@ impl Sequences {
 
     /// `block` is what was searched, and `end` where the last match ends.
     pub(crate) fn finish(&mut self, block: &[u8], end: u32) -> Result<()> {
+        let mut room = block.len();
+        // Where adding up is faster than making room for all.
+        if self.list.len() < room / 64 {
+            let lens = self.list.iter().map(|it| (it.extra >> 32) as usize);
+            room = room.saturating_sub(lens.sum());
+        }
+        vec::grow(&mut self.literals, 0, room + OVERCOPY)?;
         let (list, literals) = (self.list.as_mut_slice(), self.literals.as_mut_slice());
         let counts = &mut self.counts;
         *counts = [0; _];

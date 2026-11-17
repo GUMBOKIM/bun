@@ -71,7 +71,7 @@ pub(crate) fn looks_random(literals: &[u8]) -> bool {
         return false;
     }
     let samples = [literals.first_chunk::<SAMPLE_LEN>(), literals.last_chunk()];
-    let largest = |sample: &[u8; SAMPLE_LEN]| Histogram::<256>::of(sample).largest_count;
+    let largest = |sample: &[u8; SAMPLE_LEN]| Histogram::of(sample).largest_count;
     is_too_even(
         samples.into_iter().flatten().map(largest).sum(),
         2 * SAMPLE_LEN,
@@ -217,7 +217,7 @@ impl LiteralTables {
         if has_few_matches && looks_random(literals) {
             return None;
         }
-        let histogram = Histogram::<256>::of(literals);
+        let histogram = Histogram::of(literals);
         if histogram.largest_count == len {
             return Some((1, Encoding::Rle));
         }
@@ -257,7 +257,7 @@ impl LiteralTables {
         if !tuning.compresses_literals() || len <= too_few {
             return Some(LiteralsPlan::plain(Encoding::Basic));
         }
-        let histogram = Histogram::<256>::of(literals);
+        let histogram = Histogram::of(literals);
         if histogram.largest_count == len {
             return Some(LiteralsPlan::plain(Encoding::Rle));
         }

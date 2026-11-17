@@ -71,7 +71,7 @@ impl Entropy {
     ) -> Result<Option<(usize, Changes)>> {
         let len = content.bytes.len();
         match self.write_sections(content, tuning, out) {
-            Err(Error::DstSizeTooSmall) if len <= out.len() => Ok(None),
+            Err(Error::DstSizeTooSmall) => Ok(None),
             result => {
                 let worth_it_below = len.wrapping_sub(tuning.strategy.min_gain(len));
                 Ok(result?.filter(|&(written, _)| written < worth_it_below))

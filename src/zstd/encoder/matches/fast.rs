@@ -66,7 +66,7 @@ pub(super) fn search<const REACH: Reach>(
 ) -> u32 {
     let (tuning, bounds) = (state.tuning, state.bounds());
     let end = history.index(history.end());
-    let searcher = Searcher {
+    let mut searcher = Searcher {
         history: *history,
         table: cells(state.tables.split_mut().hash),
         hasher: Hasher::new(tuning.min_match, tuning.hash_log),
@@ -81,12 +81,13 @@ pub(super) fn search<const REACH: Reach>(
 
     let lowest = bounds.lowest(end);
     if REACH == Reach::Older && lowest < history.prefix_index {
+        searcher.history = history.from_older(lowest);
         let max_offset = history.index(history.start) - lowest - 1;
         let mut progress = Progress::new(sequences, history.start, *repeats, max_offset);
         let progress_mut = &mut progress;
         with_bmi2(
             #[inline(always)]
-            move || searcher.search_with_older(lowest, progress_mut),
+            move || searcher.search_with_older(progress_mut),
         );
         return progress.finish(repeats, max_offset);
     }
@@ -259,14 +260,12 @@ impl<'a> Searcher<'a> {
     }
 
     #[inline(always)]
-    fn search_with_older(mut self, lowest: u32, progress: &mut Progress<'_>) -> Option<Infallible> {
+    fn search_with_older(mut self, progress: &mut Progress<'_>) -> Option<Infallible> {
         const STEP_GROWS_AFTER: u32 = 1 << (SKIP_LOG - 1);
         self.history = self.history.with_prefix_of::<PAIR_LEN>()?;
         let history = &self.history;
         let bytes = history.prefix;
-        let is_at = |index: u32, word: u64| {
-            index >= lowest && history.u32_at_index(index) == Some(word as u32)
-        };
+        let is_at = |index: u32, word: u64| history.u32_at_index(index) == Some(word as u32);
 
         loop {
             let mut at = progress.anchor;
@@ -287,9 +286,9 @@ impl<'a> Searcher<'a> {
                 let repeated = history.u32_at_index(back);
 
                 entry.set(history.index(at));
-                if (repeated == Some(ahead_word as u32))
-                    & (progress.recent > 0)
-                    & (back != history.prefix_index)
+                if repeated == Some(ahead_word as u32)
+                    && progress.recent > 0
+                    && back != history.prefix_index
                 {
                     break (at, true, at + 1, next_entry);
                 }
@@ -325,7 +324,7 @@ impl<'a> Searcher<'a> {
                 (found, earlier) = (searched, candidate);
                 progress.note_offset(history.index(found).wrapping_sub(earlier));
                 offset = OffsetValue::new(progress.recent);
-                max_before = (found - progress.anchor).min(earlier - lowest);
+                max_before = found - progress.anchor;
             }
             let before = history.match_len_before_index(found, earlier, max_before);
             let len = before + history.match_len_at_index(found, earlier, 4);
