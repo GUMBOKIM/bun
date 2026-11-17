@@ -998,10 +998,11 @@ CRYPTO_rdrand_multiple8_buf  [RDRAND]
 
 
 # ----------------------------------------------------------------------------
-# src/zstd BMI2. Gate: is_x86_feature_detected! in with_bmi2(), its only caller.
+# Bun zstd (src/zstd).
+# Gate: is_x86_feature_detected! in with_bmi2() (src/highway/lib.rs), its only caller.
 # (1 generic function)
 # ----------------------------------------------------------------------------
-_RINvNvNt<rust-hash>16bun_zstd_decoder3cpu9with_bmi24bmi2<generic-args>  [BMI1, BMI2, LZCNT]
+_RINvNv<rust-hash>11bun_highway9with_bmi24bmi2<generic-args>  [BMI1, BMI2, LZCNT]
 
 
 # ----------------------------------------------------------------------------

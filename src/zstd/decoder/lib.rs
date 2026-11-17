@@ -1,5 +1,5 @@
 //! The zstd format (RFC 8878) and its decoder. Derived from zstd 1.5.7 (LICENSE.md).
-#![deny(unsafe_code)]
+#![forbid(unsafe_code)]
 // Frames come from anywhere and a panic aborts the process.
 #![deny(
     clippy::indexing_slicing,
@@ -9,12 +9,11 @@
     clippy::unreachable
 )]
 #![warn(unused_must_use)]
-#![feature(allocator_ext, fn_align, hint_prefetch)]
+#![feature(allocator_ext, hint_prefetch)]
 
 pub mod array;
 mod bits;
 mod block;
-mod cpu;
 mod decompress;
 mod destination;
 mod dictionary;
@@ -30,7 +29,6 @@ mod sequences;
 mod stream;
 mod xxhash;
 
-pub use cpu::with_bmi2;
 pub use decompress::decompress;
 pub use dictionary::Dictionary;
 pub use error::{Error, Result};

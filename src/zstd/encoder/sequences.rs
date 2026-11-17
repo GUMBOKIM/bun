@@ -2,15 +2,17 @@
 
 use core::hint::select_unpredictable;
 
+use bun_highway::with_bmi2;
+use bun_zstd_decoder::array::{At, grow};
+use bun_zstd_decoder::format::CodeKind::{self, LiteralLength, MatchLength, Offset};
 use bun_zstd_decoder::format::{
-    INITIAL_REPEAT_OFFSETS, LITERAL_LENGTH_BITS, MATCH_LENGTH_BITS, MAX_LITERAL_LENGTH_CODE,
-    MAX_MATCH_LENGTH_CODE, MIN_MATCH,
+    INITIAL_REPEAT_OFFSETS, LITERAL_LENGTH_BASES, LITERAL_LENGTH_BITS, MATCH_LENGTH_BASES,
+    MATCH_LENGTH_BITS, MIN_MATCH,
 };
-use bun_zstd_decoder::{Error, Result, with_bmi2};
+use bun_zstd_decoder::{Error, Result};
 
-use crate::array::At;
 use crate::bytes::{chunk_at, chunk_at_mut, highest_bit, likely, put};
-use crate::entropy::CodeKind::{self, LiteralLength, MatchLength, Offset};
+use crate::entropy::first_symbol;
 use crate::entropy::fse::SYMBOLS;
 use crate::vec;
 
@@ -38,10 +40,10 @@ impl OffsetValue {
         highest_bit(self.0)
     }
 
-    /// See [`CodeKind::first_symbol`].
+    /// See [`first_symbol`].
     #[inline(always)]
     pub(crate) fn symbol(self) -> u8 {
-        (Offset.first_symbol() as u32 + self.code()) as u8
+        (first_symbol(Offset) as u32 + self.code()) as u8
     }
 }
 
@@ -90,7 +92,7 @@ impl Repeats {
     }
 }
 
-/// A length as the format has it: a code, and how many bits follow. See [`CodeKind::first_symbol`].
+/// A length as the format has it: a code, and how many bits follow. See [`first_symbol`].
 #[derive(Clone, Copy)]
 pub(crate) struct LengthCode(u32);
 
@@ -98,7 +100,7 @@ impl LengthCode {
     const BITS_SHIFT: u32 = 27;
 
     const fn new(kind: CodeKind, code: u32, bits: u32) -> Self {
-        Self((kind.first_symbol() as u32 + code) | (bits << Self::BITS_SHIFT))
+        Self((first_symbol(kind) as u32 + code) | (bits << Self::BITS_SHIFT))
     }
 
     /// For the lengths from 0 on, given the bits of each code.
@@ -150,17 +152,6 @@ impl LengthCode {
     pub(crate) fn bits(self) -> u32 {
         self.0 >> Self::BITS_SHIFT
     }
-}
-
-#[expect(clippy::indexing_slicing, reason = "evaluated at compile time")]
-const fn first_lengths<const N: usize>(bits: &[u8; N]) -> [u32; N] {
-    let mut first = [0; N];
-    let mut code = 1;
-    while code < N {
-        first[code] = first[code - 1] + (1 << bits[code - 1]);
-        code += 1;
-    }
-    first
 }
 
 #[inline(always)]
@@ -216,18 +207,16 @@ impl Sequence {
     }
 
     pub(crate) fn literal_len(self) -> u32 {
-        static FIRST: [u32; MAX_LITERAL_LENGTH_CODE + 1] = first_lengths(&LITERAL_LENGTH_BITS);
         let code = self.code(LiteralLength);
         let bits = u32::from(*LITERAL_LENGTH_BITS.at(code));
-        FIRST.at(code) + low_bits(self.extra_bits().0, bits) as u32
+        LITERAL_LENGTH_BASES.at(code) + low_bits(self.extra_bits().0, bits) as u32
     }
 
     /// The length less [`MIN_MATCH`].
     pub(crate) fn match_base(self) -> u32 {
-        static FIRST: [u32; MAX_MATCH_LENGTH_CODE + 1] = first_lengths(&MATCH_LENGTH_BITS);
         let (literals, code) = (self.code(LiteralLength), self.code(MatchLength));
         let extra = self.extra_bits().0 >> LITERAL_LENGTH_BITS.at(literals);
-        FIRST.at(code) + low_bits(extra, u32::from(*MATCH_LENGTH_BITS.at(code))) as u32
+        MATCH_LENGTH_BASES.at(code) + low_bits(extra, u32::from(*MATCH_LENGTH_BITS.at(code))) as u32
     }
 
     pub(crate) fn offset(self) -> OffsetValue {
@@ -337,7 +326,7 @@ impl Sequences {
     /// `block` is what was searched, and `end` where the last match ends.
     pub(crate) fn finish(&mut self, block: &[u8], end: u32) -> Result<()> {
         let room = self.literal_count(block).unwrap_or(block.len());
-        vec::grow(&mut self.literals, 0, room + OVERCOPY)?;
+        grow(&mut self.literals, 0, room + OVERCOPY)?;
         let (list, literals) = (self.list.as_mut_slice(), self.literals.as_mut_slice());
         let counts = &mut self.counts;
         *counts = [0; _];

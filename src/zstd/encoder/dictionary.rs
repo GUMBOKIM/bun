@@ -2,16 +2,17 @@
 
 use core::ops::Range;
 
+use bun_zstd_decoder::array::At;
 use bun_zstd_decoder::format::{
-    BLOCK_LEN_MAX, DICTIONARY_MAGIC, LITERAL_LENGTH_TABLE_LOG_MAX, MATCH_LENGTH_TABLE_LOG_MAX,
-    MAX_LITERAL_LENGTH_CODE, MAX_MATCH_LENGTH_CODE, MAX_OFFSET_CODE, OFFSET_TABLE_LOG_MAX,
+    BLOCK_LEN_MAX, CodeKind, DICTIONARY_MAGIC, LITERAL_LENGTH_TABLE_LOG_MAX,
+    MATCH_LENGTH_TABLE_LOG_MAX, MAX_LITERAL_LENGTH_CODE, MAX_MATCH_LENGTH_CODE, MAX_OFFSET_CODE,
+    OFFSET_TABLE_LOG_MAX,
 };
 use bun_zstd_decoder::{Error, Result, read_huffman_weights, read_normalized_counts};
 
-use crate::array::At;
 use crate::bytes::{highest_bit, u32_at};
 use crate::entropy::fse::{Normalized, SYMBOLS};
-use crate::entropy::{CodeKind, Entropy, Reuse};
+use crate::entropy::{Entropy, Reuse};
 use crate::matches::{MatchState, Owner};
 use crate::parameters::{Purpose, Request};
 use crate::sequences::Repeats;

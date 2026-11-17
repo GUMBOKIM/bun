@@ -11,7 +11,6 @@
 #![warn(unused_must_use)]
 #![feature(adt_const_params, allocator_ext, hint_prefetch, mpmc_channel)]
 
-mod array;
 mod block;
 mod bytes;
 mod dictionary;
@@ -50,7 +49,9 @@ pub fn compress_bound(len: usize) -> Option<usize> {
 }
 
 /// Writes `bytes` as one frame.
+#[inline(never)]
 pub fn compress(bytes: &[u8], out: &mut Output<'_>, level: i32) -> Result<()> {
+    bun_removable_features::removable_definition!(ZstdCompressor, compress);
     let (request, len) = (Request::new(level), Some(bytes.len() as u64));
     let tuning = request.tuning(len, Purpose::Frame { dictionary_len: 0 });
     let plan = request.plan(tuning);

@@ -3,8 +3,9 @@
 use super::QUICK_LOG;
 use super::ranks::Ranks;
 use super::streams::{LOOKUPS, Lane, ROUNDS_MAX, Stream, Windows, interleave, unload};
+use bun_highway::with_bmi2;
+
 use crate::array::At;
-use crate::cpu::with_bmi2;
 use crate::error::{Error, Result};
 use crate::format::BLOCK_LEN_MAX;
 

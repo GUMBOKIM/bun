@@ -12,6 +12,5 @@ workspace = true
 [dependencies]
 strum.workspace = true
 bun_core.workspace = true
-bun_removable_features.workspace = true
 bun_zstd_decoder.workspace = true
 bun_zstd_encoder.workspace = true

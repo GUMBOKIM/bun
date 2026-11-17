@@ -2,7 +2,8 @@
 
 use core::hint::select_unpredictable;
 
-use crate::array::At;
+use bun_zstd_decoder::array::At;
+
 use crate::bytes::{
     AtLeast, chunk_at, common_suffix, compare, first_difference, likely, u32_at, u64_at,
 };

@@ -1,10 +1,10 @@
 //! Writes the blocks for a part of the input whose sequences are known.
 
-use bun_zstd_decoder::format::{BLOCK_HEADER_LEN, BlockType};
+use bun_zstd_decoder::format::{BLOCK_HEADER_LEN, BlockType, CodeKind};
 use bun_zstd_decoder::{Error, Output, Result};
 
 use crate::bytes::is_one_byte_repeated;
-use crate::entropy::{Changes, CodeKind, Entropy, Reuse};
+use crate::entropy::{Changes, Entropy, Reuse};
 use crate::parameters::Tuning;
 use crate::sequences::{CodeCounts, Repeats, Sequence};
 use crate::worst_case_len;

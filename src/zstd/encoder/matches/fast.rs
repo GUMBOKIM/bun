@@ -3,7 +3,7 @@
 use core::cell::Cell;
 use core::convert::Infallible;
 
-use bun_zstd_decoder::with_bmi2;
+use bun_highway::with_bmi2;
 
 use super::hash::{Hasher, look_up_tagged, tagged};
 use super::near::Near;
@@ -111,7 +111,6 @@ impl<'a> Searcher<'a> {
         Some(())
     }
 
-    #[inline(never)]
     fn search_prefix<const IS_BRANCHLESS: bool>(
         self,
         near: &Near<'a>,

@@ -48,16 +48,13 @@ pub fn grow<T: Clone>(vec: &mut Vec<T>, value: T, len: usize) -> Result<()> {
 /// Out of line, so that no other function has room for a `T` on its stack.
 #[cold]
 #[inline(never)]
-pub(crate) fn allocate<T>(value: impl FnOnce() -> T) -> Result<Box<T>> {
+pub fn allocate<T>(value: impl FnOnce() -> T) -> Result<Box<T>> {
     Box::try_new(value()).map_err(|_| Error::MemoryAllocation)
 }
 
 /// What is in `slot`, which is `empty()` at first.
 #[inline(always)]
-pub(crate) fn get_or_allocate<T>(
-    slot: &mut Option<Box<T>>,
-    empty: impl FnOnce() -> T,
-) -> Result<&mut T> {
+pub fn get_or_allocate<T>(slot: &mut Option<Box<T>>, empty: impl FnOnce() -> T) -> Result<&mut T> {
     Ok(match slot {
         Some(item) => item,
         None => slot.insert(allocate(empty)?),

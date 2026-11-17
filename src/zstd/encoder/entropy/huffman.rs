@@ -1,12 +1,13 @@
 //! Huffman codes for literals.
 
+use bun_highway::with_bmi2;
+use bun_zstd_decoder::array::At;
 use bun_zstd_decoder::format::HUFFMAN_TABLE_LOG_MAX;
-use bun_zstd_decoder::{Error, Result, with_bmi2};
+use bun_zstd_decoder::{Error, Result};
 
 use super::bit_writer::WordWriter;
 use super::fse::{self, Normalized};
 use super::histogram::Histogram;
-use crate::array::At;
 use crate::bytes::{highest_bit, put};
 
 const DESCRIPTION_LEN_MAX: usize = 128;
@@ -514,7 +515,6 @@ impl Table {
         writer.finish(pending.count > 0)
     }
 
-    #[inline(never)]
     fn compress_1_stream(&self, symbols: &[u8], out: &mut [u8]) -> Option<usize> {
         with_bmi2(
             #[inline(always)]

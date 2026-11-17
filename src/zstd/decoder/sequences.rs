@@ -3,9 +3,10 @@
 use core::cell::Cell;
 use core::hint::{Locality, black_box, cold_path, prefetch_read, select_unpredictable};
 
+use bun_highway::with_bmi2;
+
 use crate::array::At;
 use crate::bits::{BackwardBits, PaddedStart, Width};
-use crate::cpu::with_bmi2;
 use crate::destination::{Destination, Loan, OVERSHOOT};
 use crate::error::{Error, Result};
 use crate::format::CodeKind;

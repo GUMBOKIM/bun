@@ -1,69 +1,22 @@
 //! zstd as Bun uses it. The codec is in `decoder/` and `encoder/`.
+#![forbid(unsafe_code)]
 #![warn(unused_must_use)]
 
 mod embed;
 mod streaming_decoder;
 
-use bun_removable_features::removable_definition;
 use bun_zstd_decoder::{ContentSize, Dictionary};
 
 pub use bun_zstd_decoder::{Decoder, Error, Output, Status, may_start_frame};
-pub use bun_zstd_encoder::{DEFAULT_LEVEL, EndDirective, compress_bound};
+pub use bun_zstd_encoder::{DEFAULT_LEVEL, Encoder, EndDirective, compress, compress_bound};
 pub use embed::{inflate_embedded, inflate_embedded_nul};
 pub use streaming_decoder::StreamingDecoder;
-
-/// Writes `bytes` as one frame. [`compress_bound`] says how much room is always enough.
-#[inline(never)]
-pub fn compress(bytes: &[u8], out: &mut Output<'_>, level: i32) -> Result<(), Error> {
-    removable_definition!(ZstdCompressor, compress);
-    bun_zstd_encoder::compress(bytes, out, level)
-}
 
 /// [`compress`] to the end of `out`.
 pub fn compress_append(out: &mut Vec<u8>, bytes: &[u8], level: i32) -> Result<(), Error> {
     let bound = compress_bound(bytes.len()).ok_or(Error::SrcSizeWrong)?;
     out.try_reserve_exact(bound)?;
     compress(bytes, &mut Output::spare_capacity(out, bound), level)
-}
-
-pub struct Encoder(bun_zstd_encoder::Encoder);
-
-impl Encoder {
-    pub fn new(level: i32) -> Self {
-        Self(bun_zstd_encoder::Encoder::new(level))
-    }
-
-    pub fn load_dictionary(&mut self, dictionary: &[u8]) -> Result<(), Error> {
-        self.0.load_dictionary(dictionary)
-    }
-
-    pub fn set_pledged_len(&mut self, len: Option<u64>) -> Result<(), Error> {
-        self.0.set_pledged_len(len)
-    }
-
-    /// `key` is a `ZSTD_cParameter`.
-    #[inline(never)]
-    pub fn set_parameter(&mut self, key: u32, value: i32) -> Result<(), Error> {
-        removable_definition!(ZstdCompressor, Encoder::set_parameter);
-        self.0.set_parameter(key, value)
-    }
-
-    /// Forgets the frame in progress and an error, but not the parameters and the dictionary.
-    pub fn reset_session(&mut self) {
-        self.0.reset_session();
-    }
-
-    /// See [`bun_zstd_encoder::Encoder::step`].
-    #[inline(never)]
-    pub fn step(
-        &mut self,
-        input: &[u8],
-        out: &mut Output<'_>,
-        directive: EndDirective,
-    ) -> (usize, Result<Status, Error>) {
-        removable_definition!(ZstdCompressor, Encoder::step);
-        self.0.step(input, out, directive)
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, strum::IntoStaticStr)]

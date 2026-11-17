@@ -2,8 +2,9 @@
 
 use super::streams::{LOOKUPS, Lane, ROUNDS_MAX, Stream, Windows, interleave, unload};
 use super::{QUICK_LEN, QUICK_LOG};
+use bun_highway::with_bmi2;
+
 use crate::array::At;
-use crate::cpu::with_bmi2;
 use crate::error::Result;
 
 /// By the next `log` bits: the code that they start with.

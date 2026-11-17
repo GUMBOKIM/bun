@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpmc;
 use std::sync::mpsc::{self, TryRecvError};
 
+use bun_zstd_decoder::array::{allocate, grow};
 use bun_zstd_decoder::format::{BLOCK_LEN_MAX, CHECKSUM_LEN, FRAME_HEADER_LEN_MAX};
 use bun_zstd_decoder::{Error, Output, Result, Status, XxHash64};
 
@@ -128,7 +129,7 @@ impl Worker {
         let [for_chunk, for_block] =
             [CHUNK_LEN, BLOCK_LEN_MAX].map(|len| worst_case_len(len.min(section.len())));
         let room = FRAME_HEADER_LEN_MAX + for_chunk + 2 * for_block + CHECKSUM_LEN;
-        vec::grow(&mut self.out, 0, room)?;
+        grow(&mut self.out, 0, room)?;
 
         let mut start = job.start;
         loop {
@@ -270,7 +271,7 @@ impl Workers {
             None => None,
         };
         let (sender, relay) = mpsc::sync_channel(1);
-        let first = vec::boxed(Relay {
+        let first = allocate(|| Relay {
             hash: plan.header.has_checksum.then(XxHash64::new),
             long_matcher,
         })?;

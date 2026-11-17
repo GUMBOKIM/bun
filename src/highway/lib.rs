@@ -1,5 +1,6 @@
 // Direct `extern "C"` re-exports of the Google Highway SIMD C++ helpers.
 // Per crate map: `bun.highway.*` → `bun_highway::*` (same C++ backing).
+#![feature(fn_align)]
 
 pub mod webp;
 
@@ -1777,6 +1778,34 @@ macro_rules! with_bmi2 {
             baseline($($arg),*)
         }
     };
+}
+
+/// The same for generic code, and with BMI1 and LZCNT. `run` and what it calls have to be `#[inline(always)]`.
+///
+/// Either way it becomes a function of its own, which is aligned: how fast its loops are does not depend on what is
+/// linked before it.
+#[inline(always)]
+pub fn with_bmi2<R>(run: impl FnOnce() -> R) -> R {
+    #[inline(never)]
+    #[rustc_align(64)]
+    fn baseline<R>(run: impl FnOnce() -> R) -> R {
+        run()
+    }
+
+    #[cfg(all(target_arch = "x86_64", not(miri)))]
+    if is_x86_feature_detected!("bmi1")
+        && is_x86_feature_detected!("bmi2")
+        && is_x86_feature_detected!("lzcnt")
+    {
+        #[target_feature(enable = "bmi1,bmi2,lzcnt")]
+        #[rustc_align(64)]
+        fn bmi2<R>(run: impl FnOnce() -> R) -> R {
+            run()
+        }
+        // SAFETY: the CPU has the three features.
+        return unsafe { bmi2(run) };
+    }
+    baseline(run)
 }
 
 #[cfg(test)]

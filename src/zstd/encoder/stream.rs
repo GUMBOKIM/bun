@@ -2,6 +2,8 @@
 
 use core::ops::Range;
 
+use bun_removable_features::removable_definition;
+use bun_zstd_decoder::array::{allocate, grow};
 use bun_zstd_decoder::{Error, Output, Result, Status};
 
 use crate::dictionary::Dictionary;
@@ -45,7 +47,7 @@ impl Backlog {
         room: usize,
         write: impl FnOnce(&mut Output<'_>) -> Result<()>,
     ) -> Result<()> {
-        vec::grow(&mut self.bytes, 0, room)?;
+        grow(&mut self.bytes, 0, room)?;
         let mut out = Output::slice(self.bytes.get_mut(..room).unwrap_or_default());
         write(&mut out)?;
         self.left = 0..out.written();
@@ -88,7 +90,7 @@ impl Buffered {
     ) -> Result<Box<Self>> {
         let mut frame = match earlier {
             Some(frame) => frame,
-            None => vec::boxed(Self {
+            None => allocate(|| Self {
                 writer: FrameWriter::new(plan),
                 buffer: Vec::new(),
                 capacity: 0,
@@ -273,7 +275,9 @@ impl Encoder {
     }
 
     /// `key` is a `ZSTD_cParameter`.
+    #[inline(never)]
     pub fn set_parameter(&mut self, key: u32, value: i32) -> Result<()> {
+        removable_definition!(ZstdCompressor, Self::set_parameter);
         self.ensure_idle()?;
         self.request.set(key, value)
     }
@@ -297,7 +301,7 @@ impl Encoder {
 
         if self.request.workers > 0 && input_len.is_none_or(|len| len > JOB_LEN_MIN as u64) {
             let workers = Workers::new(plan, &self.request, input_len, self.dictionary.as_ref())?;
-            return Ok(Frame::Parallel(vec::boxed(workers)?));
+            return Ok(Frame::Parallel(allocate(|| workers)?));
         }
         Buffered::new(plan, input_len, dictionary, self.finished.take()).map(Frame::Buffered)
     }
@@ -340,12 +344,14 @@ impl Encoder {
 
     /// Takes all of `input` unless `out` fills up. Returns how much it took, and whether there is output left that
     /// `directive` asks for. After an error, every call returns that error until [`reset_session`](Self::reset_session).
+    #[inline(never)]
     pub fn step(
         &mut self,
         input: &[u8],
         out: &mut Output<'_>,
         directive: EndDirective,
     ) -> (usize, Result<Status>) {
+        removable_definition!(ZstdCompressor, Self::step);
         if let Some(error) = self.error {
             return (0, Err(error));
         }

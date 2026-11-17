@@ -1,12 +1,13 @@
 //! What literals and matches are expected to cost, in 1/256 of a bit.
 
+use bun_zstd_decoder::array::At;
 use bun_zstd_decoder::format::{
-    BLOCK_LEN_MAX, MAX_LITERAL_LENGTH_CODE, MAX_MATCH_LENGTH_CODE, MAX_OFFSET_CODE, MIN_MATCH,
+    BLOCK_LEN_MAX, CodeKind, MAX_LITERAL_LENGTH_CODE, MAX_MATCH_LENGTH_CODE, MAX_OFFSET_CODE,
+    MIN_MATCH,
 };
 
-use crate::array::At;
 use crate::bytes::highest_bit;
-use crate::entropy::{CodeKind, Entropy, histogram};
+use crate::entropy::{Entropy, histogram};
 use crate::sequences::{LengthCode, OffsetValue};
 
 const ACCURACY_LOG: u32 = 8;

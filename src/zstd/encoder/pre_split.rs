@@ -1,8 +1,8 @@
 //! Ends a block early where the input seems to change, before anything is known about matches.
 
+use bun_zstd_decoder::array::At;
 use bun_zstd_decoder::format::BLOCK_LEN_MAX;
 
-use crate::array::At;
 use crate::bytes::chunk_at;
 use crate::entropy::histogram;
 use crate::parameters::Strategy;

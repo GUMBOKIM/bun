@@ -1,5 +1,6 @@
 //! The literals section.
 
+use bun_zstd_decoder::array::get_or_allocate;
 use bun_zstd_decoder::format::Encoding;
 use bun_zstd_decoder::{Error, Result};
 
@@ -8,7 +9,6 @@ use super::histogram::Histogram;
 use super::huffman::{Description, Table};
 use crate::bytes::{is_one_byte_repeated, put};
 use crate::parameters::{Strategy, Tuning};
-use crate::vec::boxed_in;
 
 /// `content` is all `len` literals, or the one that they repeat.
 fn write_plain(encoding: Encoding, len: usize, content: &[u8], out: &mut [u8]) -> Result<usize> {
@@ -137,7 +137,7 @@ impl LiteralTables {
     }
 
     pub(crate) fn load(&mut self, weights: &[u8], log: u32, reuse: Reuse) -> Result<()> {
-        boxed_in(&mut self.current, || Table::EMPTY)?.build_from_weights(weights, log);
+        get_or_allocate(&mut self.current, || Table::EMPTY)?.build_from_weights(weights, log);
         self.reuse = reuse;
         Ok(())
     }
@@ -149,7 +149,7 @@ impl LiteralTables {
 
     pub(super) fn copy_from(&mut self, other: &Self) -> Result<()> {
         if let Some(table) = &other.current {
-            *boxed_in(&mut self.current, || Table::EMPTY)? = **table;
+            *get_or_allocate(&mut self.current, || Table::EMPTY)? = **table;
         }
         self.reuse = other.reuse;
         Ok(())
@@ -230,7 +230,7 @@ impl LiteralTables {
             return repeat(current, out);
         }
 
-        let candidate = boxed_in(&mut self.candidate, || Table::EMPTY)?;
+        let candidate = get_or_allocate(&mut self.candidate, || Table::EMPTY)?;
         candidate.build(counts, len, strategy >= Strategy::Ultra);
         let Ok(description_len) = candidate.describe(out) else {
             return Ok(None);
@@ -271,7 +271,7 @@ impl LiteralTables {
         }
 
         let counts = histogram.used();
-        let candidate = boxed_in(&mut self.candidate, || Table::EMPTY)?;
+        let candidate = get_or_allocate(&mut self.candidate, || Table::EMPTY)?;
         candidate.build(counts, len, tuning.strategy >= Strategy::Ultra);
         let estimated_len = candidate.compressed_len(counts);
         let description = Description::of(candidate).ok();

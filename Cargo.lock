@@ -1843,7 +1843,6 @@ dependencies = [
  "bun_sema_parser",
  "bun_sys",
  "bun_threading",
- "bun_zstd",
  "libc",
 ]
 
@@ -2294,7 +2293,6 @@ name = "bun_zstd"
 version = "0.0.0"
 dependencies = [
  "bun_core",
- "bun_removable_features",
  "bun_zstd_decoder",
  "bun_zstd_encoder",
  "strum",
@@ -2303,12 +2301,17 @@ dependencies = [
 [[package]]
 name = "bun_zstd_decoder"
 version = "0.0.0"
+dependencies = [
+ "bun_highway",
+]
 
 [[package]]
 name = "bun_zstd_encoder"
 version = "0.0.0"
 dependencies = [
+ "bun_highway",
  "bun_pod",
+ "bun_removable_features",
  "bun_zstd_decoder",
 ]
 

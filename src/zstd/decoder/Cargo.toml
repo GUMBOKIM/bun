@@ -9,8 +9,9 @@ path = "lib.rs"
 [lints]
 workspace = true
 
-# None: JavaScriptCore's test programs link this crate without the rest of Bun.
+# Nothing of Bun's C++ is called: JavaScriptCore's programs link this crate without it.
 [dependencies]
+bun_highway.workspace = true
 
 [[test]]
 name = "decode"

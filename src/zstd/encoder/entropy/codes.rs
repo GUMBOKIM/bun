@@ -1,20 +1,20 @@
 //! The sequences section.
 
+use bun_highway::with_bmi2;
+use bun_zstd_decoder::array::{At, get_or_allocate};
 use bun_zstd_decoder::format::{
-    DEFAULT_LITERAL_LENGTHS, DEFAULT_MATCH_LENGTHS, DEFAULT_OFFSETS, Distribution, Encoding,
-    LITERAL_LENGTH_BITS, LITERAL_LENGTH_TABLE_LOG_MAX, LONG_SEQUENCE_COUNT, MATCH_LENGTH_BITS,
-    MATCH_LENGTH_TABLE_LOG_MAX, MAX_OFFSET_CODE, OFFSET_TABLE_LOG_MAX,
+    CodeKind, DEFAULT_LITERAL_LENGTHS, DEFAULT_MATCH_LENGTHS, DEFAULT_OFFSETS, Distribution,
+    Encoding, LITERAL_LENGTH_BITS, LITERAL_LENGTH_TABLE_LOG_MAX, LONG_SEQUENCE_COUNT,
+    MATCH_LENGTH_BITS, MATCH_LENGTH_TABLE_LOG_MAX, MAX_OFFSET_CODE, OFFSET_TABLE_LOG_MAX,
 };
-use bun_zstd_decoder::{Error, Result, with_bmi2};
+use bun_zstd_decoder::{Error, Result};
 
 use super::Reuse;
 use super::bit_writer::BitWriter;
 use super::fse::{self, Normalized, SYMBOLS, Shape};
-use crate::array::At;
 use crate::bytes::put;
 use crate::parameters::Strategy;
 use crate::sequences::{CodeCounts, Sequence};
-use crate::vec::boxed_in;
 
 type Histogram = super::histogram::Histogram<SYMBOLS>;
 
@@ -51,26 +51,14 @@ const fn padded(bits: &[u8]) -> [u8; SYMBOLS] {
     padded
 }
 
-/// In the order of their tables in a block.
-#[derive(Clone, Copy)]
-pub(crate) enum CodeKind {
-    LiteralLength,
-    Offset,
-    MatchLength,
+/// Added to a code, makes it a symbol, which fits in a byte and which no other kind has.
+pub(crate) const fn first_symbol(kind: CodeKind) -> usize {
+    kind as usize * SYMBOLS
 }
 
-impl CodeKind {
-    const ALL: [Self; 3] = [Self::LiteralLength, Self::Offset, Self::MatchLength];
-
-    /// Added to a code, makes it a symbol, which fits in a byte and which no other kind has.
-    pub(crate) const fn first_symbol(self) -> usize {
-        self as usize * SYMBOLS
-    }
-
-    fn histogram(self, counts: &CodeCounts) -> Histogram {
-        let by_kind = counts.as_chunks().0.get(self as usize);
-        Histogram::new(by_kind.copied().unwrap_or([0; _]))
-    }
+fn histogram(kind: CodeKind, counts: &CodeCounts) -> Histogram {
+    let by_kind = counts.as_chunks().0.get(kind as usize);
+    Histogram::new(by_kind.copied().unwrap_or([0; _]))
 }
 
 type Tables = fse::Tables<2048, 256>;
@@ -313,7 +301,7 @@ impl CodeTables {
         normalized: &Normalized,
         reuse: Reuse,
     ) -> Result<()> {
-        boxed_in(&mut self.current, || TableSet::EMPTY)?.build(kind, normalized);
+        get_or_allocate(&mut self.current, || TableSet::EMPTY)?.build(kind, normalized);
         *self.reuse_mut(kind) = reuse;
         Ok(())
     }
@@ -326,7 +314,7 @@ impl CodeTables {
 
     pub(super) fn copy_from(&mut self, other: &Self) -> Result<()> {
         if let Some(from) = &other.current {
-            let to = boxed_in(&mut self.current, || TableSet::EMPTY)?;
+            let to = get_or_allocate(&mut self.current, || TableSet::EMPTY)?;
             for kind in CodeKind::ALL {
                 to.copy_from(from, kind);
             }
@@ -364,7 +352,7 @@ impl CodeTables {
     ) -> Result<Chosen> {
         let mut chosen = Chosen::PREDEFINED;
         let current = self.current.as_deref().unwrap_or(&PREDEFINED);
-        let histograms = CodeKind::ALL.map(|kind| kind.histogram(counts));
+        let histograms = CodeKind::ALL.map(|kind| histogram(kind, counts));
         for (kind, histogram) in CodeKind::ALL.into_iter().zip(&histograms) {
             let (alphabet, reuse) = (ALPHABETS.at(kind as usize), *self.reuse.at(kind as usize));
             let repeated_cost = |counts: &[u32]| current.cost(kind, counts);
@@ -376,7 +364,7 @@ impl CodeTables {
             return Ok(chosen);
         }
 
-        let next = boxed_in(&mut self.next, || TableSet::EMPTY)?;
+        let next = get_or_allocate(&mut self.next, || TableSet::EMPTY)?;
         let last = sequences.last().ok_or(Error::Internal)?;
         let kinds = CodeKind::ALL.into_iter().zip(chosen.choice.0);
         for ((kind, encoding), mut histogram) in kinds.zip(histograms) {
@@ -433,7 +421,7 @@ impl CodeTables {
     /// Of the descriptions and the stream.
     pub(crate) fn estimated_len(&self, plan: &CodesPlan, counts: &CodeCounts) -> usize {
         let lens = CodeKind::ALL.into_iter().map(|kind| {
-            let (alphabet, histogram) = (ALPHABETS.at(kind as usize), kind.histogram(counts));
+            let (alphabet, histogram) = (ALPHABETS.at(kind as usize), histogram(kind, counts));
             let bits = match plan.choice().0.at(kind as usize) {
                 Encoding::Basic => alphabet.predefined_cost(histogram.used()),
                 Encoding::Rle => Some(0),

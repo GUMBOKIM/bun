@@ -2,10 +2,11 @@
 
 use core::ops::Range;
 
+use bun_zstd_decoder::array::At;
+
 use super::hash::Hasher;
 use super::lazy::{Finder, Longest, Match};
 use super::{Attached, Bounds, MatchState, Reach, WORD, prefetch};
-use crate::array::At;
 use crate::bytes::{equal_bytes, likely, u64_at};
 use crate::parameters::TAG_BITS;
 use crate::window::{FIRST_INDEX, History, WORD_LEN};
@@ -22,7 +23,7 @@ pub(super) fn fill(state: &mut MatchState, history: &History<'_>, end: u32) {
     };
 }
 
-/// The head of a row, and from there on one bit for each of its `tags` that equals `tag`.
+/// The head of a row, and from there on one bit for each entry that has `tag`.
 #[inline(always)]
 fn matching<const N: usize>(tags: &[u8; N], tag: u8) -> (u32, u64) {
     let mut all = 0;
@@ -37,18 +38,19 @@ fn matching<const N: usize>(tags: &[u8; N], tag: u8) -> (u32, u64) {
         32 => u64::from((all as u32).rotate_right(head)),
         _ => all.rotate_right(head),
     };
-    (head, rotated)
+    (head, rotated & !(1 << (head.wrapping_neg() % N as u32)))
 }
 
-/// Where the row for `hash` starts.
+/// The entries for `hash`. `last` is where the last row starts, which has all bits set that the others can have.
 #[inline(always)]
-fn first_entry<const N: usize>(hash: u32) -> usize {
-    (hash >> TAG_BITS) as usize * N
+fn row<const N: usize>(hash: u32, last: u32) -> Range<usize> {
+    let first = ((hash >> (TAG_BITS - N.ilog2())) & last) as usize;
+    first..first + N
 }
 
 #[inline(always)]
 fn prefetch_row<const N: usize>(indices: &[u32], tags: &[u8], hash: u32) {
-    let first = first_entry::<N>(hash);
+    let first = (hash >> TAG_BITS) as usize * N;
     prefetch(indices, first);
     if N >= 32 {
         prefetch(indices, first + 16);
@@ -59,26 +61,20 @@ fn prefetch_row<const N: usize>(indices: &[u32], tags: &[u8], hash: u32) {
 /// Fills `candidates` with what `note` makes of the indices from `lowest` on, and returns those that it filled.
 #[inline(always)]
 fn collect<'a, const N: usize>(
-    indices: &[u32],
-    tags: &[u8],
-    hash: u32,
+    indices: &[u32; N],
+    tags: &[u8; N],
+    tag: u8,
     lowest: u32,
     candidates: &'a mut [u32],
     note: impl Fn(u32) -> u32,
 ) -> Option<&'a [u32]> {
-    let row = first_entry::<N>(hash)..first_entry::<N>(hash) + N;
-    let indices = likely(indices.get(row.clone()))?.as_array::<N>()?;
-    let tags = likely(tags.get(row))?.as_array::<N>()?;
-    let (head, mut matching) = matching(tags, hash as u8);
+    let (head, mut matching) = matching(tags, tag);
     let mut count = 0;
     while matching != 0
         && let Some(candidate) = candidates.get_mut(count)
     {
         let slot = (head + matching.trailing_zeros()) as usize % N;
         matching &= matching - 1;
-        if slot == 0 {
-            continue;
-        }
         let index = *indices.at(slot);
         if index < lowest {
             break;
@@ -110,6 +106,7 @@ pub(super) struct Rows<'a, const N: usize> {
     indices: &'a mut [u32],
     /// In place of the first one of a row is its head: where the most recent entry is. They are added backwards.
     tags: &'a mut [u8],
+    last: u32,
     hasher: Hasher,
     attached: Attached<'a>,
     attached_hasher: Hasher,
@@ -138,6 +135,7 @@ impl<'a, const N: usize> Rows<'a, N> {
             bounds,
             indices: tables.hash,
             tags: tables.tags,
+            last: (1 << tuning.hash_log) - N as u32,
             hasher: hasher(tuning.hash_log),
             attached: *attached,
             attached_hasher: hasher(attached.tuning.hash_log),
@@ -148,13 +146,14 @@ impl<'a, const N: usize> Rows<'a, N> {
 
     #[inline(always)]
     fn add(&mut self, hash: u32, index: u32) -> Option<()> {
-        let first = first_entry::<N>(hash);
-        let tags = likely(self.tags.get_mut(first..first + N))?.as_mut_array::<N>()?;
+        let tags = self.tags.get_mut(row::<N>(hash, self.last))?;
+        let indices = self.indices.get_mut(row::<N>(hash, self.last))?;
+        let (tags, indices) = (tags.as_mut_array::<N>()?, indices.as_mut_array::<N>()?);
         let head = *Self::NEXT_HEADS.at(usize::from(*tags.at(0)));
+        let slot = usize::from(head) % N;
         *tags.at_mut(0) = head;
-        let entry = first + usize::from(head) % N;
-        *self.tags.get_mut(entry)? = hash as u8;
-        *self.indices.get_mut(entry)? = index;
+        *tags.at_mut(slot) = hash as u8;
+        *indices.at_mut(slot) = index;
         Some(())
     }
 
@@ -227,10 +226,10 @@ impl<const N: usize> Finder for Rows<'_, N> {
 
     #[inline(always)]
     fn prepare(&mut self) -> Option<()> {
-        // The compiler sees that both have the same length, and compares the start of a row with `last`.
-        let last = self.tags.len().checked_sub(N)? as u32 as usize;
-        self.tags = core::mem::take(&mut self.tags).get_mut(..last + N)?;
-        self.indices = core::mem::take(&mut self.indices).get_mut(..last + N)?;
+        // The compiler sees that all rows are within this length.
+        let len = self.last as usize + N;
+        self.tags = core::mem::take(&mut self.tags).get_mut(..len)?;
+        self.indices = core::mem::take(&mut self.indices).get_mut(..len)?;
         Some(())
     }
 
@@ -258,9 +257,9 @@ impl<const N: usize> Finder for Rows<'_, N> {
         };
         let attempts = self.attempts.min(N);
         let found = collect::<N>(
-            self.indices,
-            self.tags,
-            hash,
+            self.indices.get(row::<N>(hash, self.last))?.as_array()?,
+            self.tags.get(row::<N>(hash, self.last))?.as_array()?,
+            hash as u8,
             self.bounds.lowest(current),
             candidates.get_mut(..attempts)?,
             |index| {
@@ -288,10 +287,11 @@ impl<const N: usize> Finder for Rows<'_, N> {
 
         if REACH == Reach::Attached {
             let attempts = attempts - found.len();
+            let row = (attached_hash >> TAG_BITS) as usize;
             let found = collect::<N>(
-                attached.hash,
-                attached.tags,
-                attached_hash,
+                likely(attached.hash.as_chunks().0.get(row))?,
+                likely(attached.tags.as_chunks().0.get(row))?,
+                attached_hash as u8,
                 FIRST_INDEX,
                 candidates.get_mut(..attempts)?,
                 |index| {

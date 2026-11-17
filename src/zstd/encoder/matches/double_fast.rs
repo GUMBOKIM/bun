@@ -3,7 +3,7 @@
 use core::cell::Cell;
 use core::convert::{Infallible, identity};
 
-use bun_zstd_decoder::with_bmi2;
+use bun_highway::with_bmi2;
 
 use super::hash::{Hasher, look_up_tagged, tagged};
 use super::near::Near;
@@ -129,7 +129,6 @@ impl<'a> Searcher<'a> {
         Some(())
     }
 
-    #[inline(never)]
     fn search_prefix(self, near: &Near<'a>, progress: &mut Progress<'_>) -> Option<u32> {
         let mut at = near.history.start;
         if !Near::has_repeats(progress, at) {

@@ -2,12 +2,12 @@
 
 use core::ops::RangeInclusive;
 
+use bun_zstd_decoder::array::At;
 use bun_zstd_decoder::format::{
     BLOCK_LEN_MAX, WINDOW_LOG_LIMIT_DEFAULT, WINDOW_LOG_MAX, WINDOW_LOG_MIN,
 };
 use bun_zstd_decoder::{Error, Result};
 
-use crate::array::At;
 use crate::bytes::highest_bit;
 use crate::levels::{LEVELS, MAX_LEVEL};
 

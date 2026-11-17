@@ -15,15 +15,6 @@ pub(crate) fn zeroed<T: Zeroable>(len: usize) -> Result<Vec<T>> {
     bun_pod::try_zeroed_vec(len).ok_or(Error::MemoryAllocation)
 }
 
-/// Makes `vec` at least `len` long.
-pub(crate) fn grow<T: Clone>(vec: &mut Vec<T>, value: T, len: usize) -> Result<()> {
-    if let Some(more) = len.checked_sub(vec.len()) {
-        vec.try_reserve_exact(more)?;
-        vec.resize(len, value);
-    }
-    Ok(())
-}
-
 /// Replaces what is at `position`, and appends the rest, for which there is room.
 pub(crate) fn write_at(vec: &mut Vec<u8>, position: usize, mut bytes: &[u8]) {
     if let Some(used @ [_, ..]) = vec.get_mut(position..) {
@@ -53,19 +44,6 @@ pub(crate) fn copied<T: Copy>(from: &[T]) -> Result<Vec<T>> {
 pub(crate) fn clear_for<T>(vec: &mut Vec<T>, capacity: usize) -> Result<()> {
     vec.clear();
     Ok(vec.try_reserve_exact(capacity)?)
-}
-
-pub(crate) fn boxed<T>(value: T) -> Result<Box<T>> {
-    Box::try_new(value).map_err(|_| Error::MemoryAllocation)
-}
-
-/// What is in `slot`, which gets what `make` returns if it is empty.
-#[inline(always)]
-pub(crate) fn boxed_in<T>(slot: &mut Option<Box<T>>, make: impl FnOnce() -> T) -> Result<&mut T> {
-    match slot {
-        Some(boxed) => Ok(boxed),
-        None => Ok(slot.insert(boxed(make())?)),
-    }
 }
 
 pub(crate) type Shared<T> = std::sync::Arc<T>;

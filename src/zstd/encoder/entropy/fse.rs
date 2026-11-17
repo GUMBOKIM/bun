@@ -1,10 +1,10 @@
 //! Finite State Entropy.
 
+use bun_zstd_decoder::array::At;
 use bun_zstd_decoder::format::{Distribution, FSE_TABLE_LOG_MIN, fse_table_step};
 use bun_zstd_decoder::{Error, Result};
 
 use super::bit_writer::BitWriter;
-use crate::array::At;
 use crate::bytes::{chunk_at_mut, highest_bit};
 
 /// More than any alphabet has.

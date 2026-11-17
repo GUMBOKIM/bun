@@ -1,8 +1,9 @@
 //! The decoding tables for sequences.
 
+use bun_highway::with_bmi2;
+
 use crate::array::{At, in_range};
 use crate::bits::Width;
-use crate::cpu::with_bmi2;
 use crate::error::{Error, Result};
 use crate::format::{
     CodeKind, DEFAULT_LITERAL_LENGTHS, DEFAULT_MATCH_LENGTHS, DEFAULT_OFFSETS, Distribution,

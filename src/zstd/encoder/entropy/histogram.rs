@@ -1,6 +1,6 @@
 //! Counting symbols.
 
-use crate::array::At;
+use bun_zstd_decoder::array::At;
 
 /// How often each of `N` symbols occurs.
 #[derive(Clone, Copy)]

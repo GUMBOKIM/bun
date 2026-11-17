@@ -1,10 +1,10 @@
 //! Finds long matches at any distance, ahead of the regular search.
 
+use bun_zstd_decoder::array::At;
 use bun_zstd_decoder::{Result, XxHash64};
 
 use super::gear_table::GEAR_TABLE;
 use super::{MatchState, Search, WORD, prefetch};
-use crate::array::At;
 use crate::bytes::common_suffix;
 use crate::parameters::{LongDistance, Strategy};
 use crate::sequences::{OffsetValue, Repeats, Sequences};

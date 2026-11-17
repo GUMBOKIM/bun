@@ -4,13 +4,13 @@ use core::convert::identity;
 use core::ops::RangeInclusive;
 
 use bun_zstd_decoder::Result;
+use bun_zstd_decoder::array::{At, allocate, grow};
 
 use super::hash::Hasher;
 use super::long_distance::Cursor;
 use super::prices::{BIT, LANES, Prices};
 use super::tree::{self, Descent, Node, Tree};
 use super::{Attached, MatchState, Reach, Search, WORD};
-use crate::array::At;
 use crate::bytes::{likely, u32_at, u64_at};
 use crate::parameters::Strategy;
 use crate::sequences::{OffsetValue, Repeats, Sequences};
@@ -151,7 +151,7 @@ pub(super) struct State {
 impl State {
     #[inline(never)]
     pub(super) fn new() -> Result<Box<Self>> {
-        vec::boxed(Self {
+        allocate(|| Self {
             prices: Prices::EMPTY,
             matches: Vec::new(),
             way_prices: Vec::new(),
@@ -166,8 +166,8 @@ impl State {
     pub(super) fn reserve(&mut self, block_len: usize) -> Result<()> {
         let len = block_len.min(HORIZON as usize) + 3 + LANES;
         vec::clear_for(&mut self.matches, len)?;
-        vec::grow(&mut self.way_prices, 0, len)?;
-        vec::grow(&mut self.way_ends, End::default(), len)
+        grow(&mut self.way_prices, 0, len)?;
+        grow(&mut self.way_ends, End::default(), len)
     }
 }
 
