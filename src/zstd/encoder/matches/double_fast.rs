@@ -204,7 +204,7 @@ impl<'a> Searcher<'a> {
             let mut long_entry = self.long_entry(word)?;
             let mut long = position(long_entry);
 
-            'stored: {
+            let end = 'stored: {
                 let (found, earlier, len, ahead_entry) = loop {
                     let ahead_word = likely(chunks.word(ahead))?;
                     let short_entry = self.short_entry(word)?;
@@ -216,7 +216,7 @@ impl<'a> Searcher<'a> {
                         let found = at as u32 + 1;
                         let end = found + repeat_len(found, recent as u32);
                         progress.store(OffsetValue::FIRST_REPEAT, found..end);
-                        break 'stored;
+                        break 'stored end;
                     }
 
                     let ahead_entry = self.long_entry(ahead_word)?;
@@ -259,11 +259,12 @@ impl<'a> Searcher<'a> {
                 progress.note_offset(offset);
                 progress.store(OffsetValue::new(offset), found - before..found + len);
                 recent = offset as usize;
-            }
+                found + len
+            };
 
-            self.insert_match(at as u32, progress.anchor)?;
+            self.insert_match(at as u32, end)?;
+            at = end as usize;
             loop {
-                at = progress.anchor as usize;
                 let word = likely(chunks.word(at))?;
                 if progress.second == 0 || !has_before(at, progress.second as usize, word as u32)? {
                     break;
@@ -274,6 +275,7 @@ impl<'a> Searcher<'a> {
                 self.short_entry(word)?.set(index(at));
                 self.long_entry(word)?.set(index(at));
                 progress.store(OffsetValue::FIRST_REPEAT, at as u32..at as u32 + len);
+                at = progress.anchor as usize;
             }
             if !HAS_REPEATS && Near::has_repeats(progress, at as u32) {
                 return Some(at as u32);
@@ -281,9 +283,9 @@ impl<'a> Searcher<'a> {
         }
     }
 
-    /// Stores a match that the search at `searched` found, and what repeats after it.
+    /// Stores a match that the search at `searched` found, and what repeats after it. Returns where to go on.
     #[inline(always)]
-    fn take_match(&self, searched: u32, found: Match, progress: &mut Progress<'_>) -> Option<()> {
+    fn take_match(&self, searched: u32, found: Match, progress: &mut Progress<'_>) -> Option<u32> {
         let history = &self.history;
         let (offset, before) = if found.repeats {
             (OffsetValue::FIRST_REPEAT, 0)
@@ -296,20 +298,21 @@ impl<'a> Searcher<'a> {
         let end = found.at + history.match_len_at_index(found.at, found.earlier, found.known);
         progress.store(offset, found.at - before..end);
 
-        self.insert_match(searched, progress.anchor)?;
+        self.insert_match(searched, end)?;
+        let mut at = end;
         loop {
-            let at = progress.anchor;
             let word = likely(u64_at(history.prefix, at))?;
             let current = history.index(at);
             let earlier = current.wrapping_sub(progress.second);
             if history.u32_at_any_index(earlier) != Some(word as u32) || progress.second == 0 {
-                return Some(());
+                return Some(at);
             }
-            let len = history.match_len_at_index(at, earlier, 4);
+            let end = at + history.match_len_at_index(at, earlier, 4);
             progress.swap_offsets();
             self.short_entry(word)?.set(current);
             self.long_entry(word)?.set(current);
-            progress.store(OffsetValue::FIRST_REPEAT, at..at + len);
+            progress.store(OffsetValue::FIRST_REPEAT, at..end);
+            at = end;
         }
     }
 
@@ -341,8 +344,7 @@ impl<'a> Searcher<'a> {
                     at += ((at - progress.anchor) >> SKIP_LOG) + 1;
                     continue;
                 };
-            self.take_match(at, found, progress)?;
-            at = progress.anchor;
+            at = self.take_match(at, found, progress)?;
         }
     }
 
@@ -415,8 +417,7 @@ impl<'a> Searcher<'a> {
                 prefetch(history.prefix, at as usize + 256);
                 continue;
             };
-            self.take_match(at, found, progress)?;
-            at = progress.anchor;
+            at = self.take_match(at, found, progress)?;
         }
     }
 }

@@ -145,10 +145,21 @@ pub(super) fn descend_attached(
     Some(())
 }
 
-/// Indexes the history up to `end`.
-pub(super) fn fill(state: &mut MatchState, history: &History<'_>, end: u32) {
+/// Indexes the history up to `end`, which takes long, unless it `is_abandoned` on the way.
+pub(super) fn fill(
+    state: &mut MatchState,
+    history: &History<'_>,
+    end: u32,
+    is_abandoned: impl Fn() -> bool,
+) -> Option<()> {
     let min_match = state.tuning.min_match;
-    Tree::new(state, min_match).insert_up_to::<{ Reach::Prefix }>(history, end);
+    let mut tree = Tree::new(state, min_match);
+    let (mut index, end) = (tree.next_to_index, history.index(end));
+    let lowest = tree.bounds.lowest(end);
+    while index < end && !is_abandoned() {
+        index += tree.insert::<{ Reach::Prefix }>(*history, index, lowest)?;
+    }
+    Some(())
 }
 
 pub(super) struct Tree<'a> {

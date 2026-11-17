@@ -1,5 +1,6 @@
 //! Rows of the most recent positions with about the same hash. Tags have more bits of it.
 
+use core::hint::{black_box, cold_path};
 use core::ops::Range;
 
 use bun_highway::with_bmi2;
@@ -27,12 +28,21 @@ pub(super) fn fill(state: &mut MatchState, history: &History<'_>, end: u32) {
 /// The head of a row, and from there on one bit for each entry that has `tag`.
 #[inline(always)]
 fn matching<const N: usize>(tags: &[u8; N], tag: u8) -> (u32, u64) {
-    let mut all = 0;
-    for (index, chunk) in tags.as_chunks().0.iter().enumerate() {
-        all |= u64::from(equal_bytes(chunk, &[tag; 16])) << (16 * index);
+    let of_chunk = |index: usize| {
+        let chunk = tags.as_chunks().0.get(index);
+        chunk.map_or(0, |chunk| u32::from(equal_bytes(chunk, &[tag; 16])))
+    };
+    let (low, mut high) = (
+        of_chunk(0) | of_chunk(1) << 16,
+        of_chunk(2) | of_chunk(3) << 16,
+    );
+    if N == 64 {
+        // The compiler does not always find the vector instructions for all at once.
+        high = black_box(high);
     }
-    // Or else the compiler would put the first chunk together from the head and the rest.
-    core::hint::black_box(());
+    let all = u64::from(low) | u64::from(high) << 32;
+    // Or else it would put the first chunk together from the head and the rest.
+    black_box(());
     let head = u32::from(*tags.at(0));
     let rotated = match N {
         16 => u64::from((all as u16).rotate_right(head)),
@@ -224,7 +234,7 @@ impl<'a, const N: usize> Rows<'a, N> {
         const KEPT_AT_END: u32 = 32;
         let mut start = history.position(self.next_to_index);
         if end.wrapping_sub(start) > SKIPS_FROM {
-            core::hint::cold_path();
+            cold_path();
             self.insert(history, hashes, start..start + KEPT_AT_START)?;
             start = end - KEPT_AT_END;
             self.fill_cache(history, hashes, start);

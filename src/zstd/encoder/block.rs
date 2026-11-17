@@ -119,14 +119,15 @@ impl BlockWriter {
         const REPEATED_LEN_MAX: usize = 25;
         let (start, rest) = room_for_block(out, content.len_max())?;
         match self.entropy.compress(content, tuning, rest)? {
-            Some((len, changes))
-                if len >= REPEATED_LEN_MAX || !self.can_repeat_byte(content.bytes) =>
-            {
+            Some((..REPEATED_LEN_MAX, _)) if self.can_repeat_byte(content.bytes) => {
+                write_repeated(content.bytes, is_last, out)?;
+            }
+            Some((len, changes)) => {
                 *start = header(BlockType::Compressed, len, is_last);
                 out.commit(BLOCK_HEADER_LEN + len);
                 self.accept(changes, content.repeats);
             }
-            _ => self.write_uncompressed(content.bytes, is_last, out)?,
+            None => self.write_uncompressed(content.bytes, is_last, out)?,
         }
         self.distrust_offset_table();
         Ok(())

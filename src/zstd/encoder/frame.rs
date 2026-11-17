@@ -1,5 +1,7 @@
 //! Compresses input that is at hand into a frame, or a part of one.
 
+use core::sync::atomic::{AtomicBool, Ordering};
+
 use bun_zstd_decoder::format::{
     BLOCK_HEADER_LEN, BLOCK_LEN_MAX, BlockType, FRAME_HEADER_LEN_MAX, FRAME_MAGIC, WINDOW_LOG_MIN,
 };
@@ -12,6 +14,7 @@ use crate::matches::long_distance::{self, Candidates};
 use crate::matches::{MatchState, Owner, Search};
 use crate::parameters::{Plan, Purpose};
 use crate::sequences::{Repeats, Sequences};
+use crate::vec::{self, Shared};
 use crate::window::{Input, WORD_LEN};
 use crate::{post_split, pre_split, sub_blocks};
 
@@ -21,6 +24,32 @@ pub(crate) fn last_empty_block() -> [u8; BLOCK_HEADER_LEN] {
 
 pub(crate) fn checksum(hash: &XxHash64) -> [u8; 4] {
     (hash.digest() as u32).to_le_bytes()
+}
+
+/// Whether another thread still waits for the output.
+#[derive(Clone, Default)]
+pub(crate) struct Interest {
+    is_lost: Option<Shared<AtomicBool>>,
+}
+
+impl Interest {
+    pub(crate) fn new() -> Result<Self> {
+        let is_lost = Some(vec::shared(AtomicBool::new(false))?);
+        Ok(Self { is_lost })
+    }
+
+    pub(crate) fn lose(&self) {
+        if let Some(is_lost) = &self.is_lost {
+            is_lost.store(true, Ordering::SeqCst);
+        }
+    }
+
+    pub(crate) fn ensure(&self) -> Result<()> {
+        match &self.is_lost {
+            Some(is_lost) if is_lost.load(Ordering::SeqCst) => Err(Error::StageWrong),
+            _ => Ok(()),
+        }
+    }
 }
 
 /// What precedes the input.
@@ -54,6 +83,7 @@ pub(crate) struct FrameWriter {
     long_finder: Option<long_distance::Finder>,
     /// Without a finder, they can come from elsewhere.
     pub(crate) long_matches: Candidates,
+    pub(crate) interest: Interest,
 }
 
 impl FrameWriter {
@@ -74,6 +104,7 @@ impl FrameWriter {
             blocks: BlockWriter::new(),
             long_finder: None,
             long_matches: Candidates::default(),
+            interest: Interest::default(),
         }
     }
 
@@ -143,7 +174,8 @@ impl FrameWriter {
                 self.blocks.repeats = Repeats::default();
                 self.stage = Stage::InBlocks;
                 if earlier.len() >= WORD_LEN {
-                    self.state.load::<{ Owner::Frame }>(earlier);
+                    let is_lost = || self.interest.ensure().is_err();
+                    self.state.load::<{ Owner::Frame }>(earlier, is_lost);
                 }
             }
         }
@@ -153,6 +185,11 @@ impl FrameWriter {
     pub(crate) fn window_len(&self) -> usize {
         let len = 1u64 << self.plan.tuning.window_log;
         len.min(self.input_len.unwrap_or(u64::MAX)).max(1) as usize
+    }
+
+    /// See [`MatchState::tables_len`].
+    pub(crate) fn tables_len(&self) -> [usize; 2] {
+        self.state.tables_len()
     }
 
     pub(crate) fn block_len_max(&self) -> usize {
@@ -253,6 +290,7 @@ impl FrameWriter {
         let mut saved = self.consumed as i64 - self.produced as i64;
         let mut start = input.start();
         while let Some(left @ [_, ..]) = input.segment.get(start..) {
+            self.interest.ensure()?;
             let len = match left.first_chunk() {
                 // More block headers must not make the output larger than it could be without.
                 Some(block) if self.block_len_max == BLOCK_LEN_MAX && saved >= 3 => {

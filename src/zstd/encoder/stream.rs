@@ -78,6 +78,8 @@ struct Buffered {
     target: usize,
     backlog: Backlog,
     has_ended: bool,
+    /// How many in a row would have done with much less memory.
+    small_frames: u32,
 }
 
 impl Buffered {
@@ -100,6 +102,7 @@ impl Buffered {
                 target: 0,
                 backlog: Backlog::default(),
                 has_ended: false,
+                small_frames: 0,
             })?,
         };
         (frame.writer).start(plan, input_len, Start::Frame(dictionary))?;
@@ -110,6 +113,14 @@ impl Buffered {
         frame.target = block_len + usize::from(input_len == Some(block_len as u64));
         frame.has_ended = false;
         Ok(frame)
+    }
+
+    /// Whether the next frame should take over the memory.
+    fn is_worth_keeping(&mut self) -> bool {
+        let [held, needed] = self.writer.tables_len();
+        let is_small = held + self.buffer.capacity() >= 3 * (needed + self.capacity);
+        self.small_frames = if is_small { self.small_frames + 1 } else { 0 };
+        self.small_frames < 128
     }
 
     /// What is left of the older segment, if the buffer is overwritten up to `overwritten`.
@@ -335,7 +346,8 @@ impl Encoder {
         };
         if has_ended
             && status == Status::Complete
-            && let Some(Frame::Buffered(frame)) = self.frame.take()
+            && let Some(Frame::Buffered(mut frame)) = self.frame.take()
+            && frame.is_worth_keeping()
         {
             self.finished = Some(frame);
         }

@@ -332,6 +332,15 @@ impl MatchState {
         Ok(())
     }
 
+    /// How many bytes the tables take, and how many of them are needed.
+    pub(crate) fn tables_len(&self) -> [usize; 2] {
+        let Tables { indices, tags, .. } = &self.tables;
+        [
+            (indices.0.capacity() + tags.0.capacity()) * size_of::<CacheLine>(),
+            self.tables.indices_len() * size_of::<u32>() + self.tables.tags_len,
+        ]
+    }
+
     /// Makes room for searching `len` bytes.
     pub(crate) fn reserve(&mut self, len: usize) -> Result<()> {
         match &mut self.optimal {
@@ -398,7 +407,11 @@ impl MatchState {
     }
 
     /// Indexes `content`, which nothing precedes.
-    pub(crate) fn load<const OWNER: Owner>(&mut self, content: &[u8]) {
+    pub(crate) fn load<const OWNER: Owner>(
+        &mut self,
+        content: &[u8],
+        is_abandoned: impl Fn() -> bool,
+    ) {
         let tuning = self.tuning;
         let worth_log = (tuning.hash_log + 3).max(tuning.chain_log + 1).min(31);
         let start = content.len().saturating_sub(1 << worth_log);
@@ -423,7 +436,7 @@ impl MatchState {
             Strategy::Greedy | Strategy::Lazy | Strategy::Lazy2 => {
                 chain::fill(self, &history, last);
             }
-            _ => tree::fill(self, &history, last),
+            _ => drop(tree::fill(self, &history, last, is_abandoned)),
         }
         self.next_to_index = end;
     }

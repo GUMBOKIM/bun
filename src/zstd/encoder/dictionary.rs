@@ -113,7 +113,7 @@ impl Dictionary {
             return Err(Error::DictionaryCorrupted);
         }
         if !content.is_empty() {
-            state.load::<{ Owner::Dictionary }>(content);
+            state.load::<{ Owner::Dictionary }>(content, || false);
         }
         Ok(Self {
             content: bytes.len() - content.len()..bytes.len(),

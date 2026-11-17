@@ -7,21 +7,27 @@ use bun_zstd_decoder::{
     ContentSize, Dictionary, FrameLen, Output, decompress, frame_content_size, frame_len,
 };
 
+/// As much of the frame at `item` as it takes for `is_enough`, or all of it.
+///
 /// # Safety
-/// `item` starts with a whole zstd frame, or has `length` bytes if that is positive.
-unsafe fn frame<'a>(item: *const u8, length: i32) -> Option<&'a [u8]> {
-    let available = usize::try_from(length).ok().filter(|&len| len > 0);
-    let mut len = 0;
+/// `item` has `length` bytes if that is positive, or else starts with a whole zstd frame.
+unsafe fn frame<'a>(
+    item: *const u8,
+    length: i32,
+    is_enough: impl Fn(&[u8]) -> bool,
+) -> Option<&'a [u8]> {
+    let mut len = length.max(0) as usize;
     loop {
-        // SAFETY: the frame is at least as long, and within what is available.
+        // SAFETY: that is `length`, or the frame is at least as long.
         let prefix = unsafe { slice::from_raw_parts(item, len) };
+        if is_enough(prefix) {
+            return Some(prefix);
+        }
         len = match frame_len(prefix).ok()? {
             FrameLen::Complete(len) => return prefix.get(..len),
-            FrameLen::AtLeast(len) => len,
+            FrameLen::AtLeast(len) if length <= 0 => len,
+            FrameLen::AtLeast(_) => return None,
         };
-        if available.is_some_and(|available| len > available) {
-            return None;
-        }
     }
 }
 
@@ -31,8 +37,9 @@ unsafe fn frame<'a>(item: *const u8, length: i32) -> Option<&'a [u8]> {
 /// As for [`frame`].
 #[unsafe(no_mangle)]
 unsafe extern "C" fn Bun__ICUItem__size(item: *const u8, length: i32) -> i32 {
+    let has_header = |prefix: &[u8]| frame_content_size(prefix) != ContentSize::Invalid;
     // SAFETY: passed on.
-    match unsafe { frame(item, length) }.map(frame_content_size) {
+    match unsafe { frame(item, length, has_header) }.map(frame_content_size) {
         Some(ContentSize::Known(size)) => i32::try_from(size).unwrap_or(-1),
         _ => -1,
     }
@@ -60,7 +67,10 @@ unsafe extern "C" fn Bun__ICUItem__decompress(
     // SAFETY: passed on. The bytes of `out` are initialized before they are a slice.
     let (frame, out) = unsafe {
         out.write_bytes(0, size);
-        (frame(item, length), slice::from_raw_parts_mut(out, size))
+        (
+            frame(item, length, |_| false),
+            slice::from_raw_parts_mut(out, size),
+        )
     };
     frame.is_some_and(|frame| {
         decompress(frame, &mut Output::slice(out), dictionary.as_ref()).is_ok()

@@ -1,16 +1,16 @@
 //! Cuts the input into sections, which threads compress. Each job owns what it works on.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpmc;
 use std::sync::mpsc::{self, TryRecvError};
+use std::thread::JoinHandle;
 
 use bun_zstd_decoder::array::{allocate, grow};
 use bun_zstd_decoder::format::{BLOCK_LEN_MAX, CHECKSUM_LEN, FRAME_HEADER_LEN_MAX};
 use bun_zstd_decoder::{Error, Output, Result, Status, XxHash64};
 
 use crate::dictionary::Dictionary;
-use crate::frame::{self, FrameWriter, Start};
+use crate::frame::{self, FrameWriter, Interest, Start};
 use crate::matches::long_distance::{Candidates, Finder};
 use crate::parameters::{LongDistance, Plan, Request, Strategy};
 use crate::stream::{Backlog, EndDirective};
@@ -79,16 +79,7 @@ struct Job {
     is_last: bool,
     relay: (mpsc::Receiver<Box<Relay>>, mpsc::SyncSender<Box<Relay>>),
     reports: mpsc::Sender<Report>,
-    is_abandoned: Shared<AtomicBool>,
-}
-
-impl Job {
-    fn ensure_wanted(&self) -> Result<()> {
-        if self.is_abandoned.load(Ordering::SeqCst) {
-            return Err(Error::StageWrong);
-        }
-        Ok(())
-    }
+    interest: Interest,
 }
 
 #[derive(Default)]
@@ -100,7 +91,7 @@ struct Worker {
 
 impl Worker {
     fn compress(&mut self, job: &Job) -> Result<()> {
-        job.ensure_wanted()?;
+        job.interest.ensure()?;
         let (earlier, section) = job
             .input
             .split_at_checked(job.start)
@@ -114,7 +105,7 @@ impl Worker {
             hash.update(section);
         }
         job.relay.1.send(relay).map_err(|_| Error::Internal)?;
-        job.ensure_wanted()?;
+        job.interest.ensure()?;
 
         let (len, dictionary, start) = match &job.frame {
             Some((len, dictionary)) => {
@@ -124,6 +115,7 @@ impl Worker {
             None => (Some(section.len() as u64), None, Start::Part(earlier)),
         };
         let writer = (self.writer).get_or_insert_with(|| FrameWriter::new(job.plan));
+        writer.interest = job.interest.clone();
         writer.start(job.plan, len, start)?;
         core::mem::swap(&mut writer.long_matches, &mut self.long_matches);
         let [for_chunk, for_block] =
@@ -133,7 +125,6 @@ impl Worker {
 
         let mut start = job.start;
         loop {
-            job.ensure_wanted()?;
             let end = job.input.len().min(start + CHUNK_LEN);
             let input = Input {
                 segment: job.input.get(..end).ok_or(Error::Internal)?,
@@ -195,29 +186,39 @@ fn section_and_overlap_len(plan: &Plan, request: &Request) -> (usize, usize) {
     (section_len.max(overlap_len), overlap_len)
 }
 
-/// Threads, which end when it is dropped and they are out of jobs.
 #[derive(Default)]
 pub(crate) struct Pool {
     jobs: Option<(mpmc::Sender<Job>, mpmc::Receiver<Job>)>,
-    threads: usize,
+    threads: Vec<JoinHandle<()>>,
 }
 
 impl Pool {
     /// One thread is enough to go on.
     fn post(&mut self, job: Job, useful_threads: usize) -> Result<()> {
         let (sender, receiver) = self.jobs.get_or_insert_with(mpmc::channel);
-        if self.threads < useful_threads {
+        if self.threads.len() < useful_threads {
+            self.threads.try_reserve(1)?;
             let jobs = mpmc::Receiver::clone(receiver);
             let spawned = std::thread::Builder::new()
                 .name("Zstd Worker".into())
                 .stack_size(STACK_LEN)
                 .spawn(move || Worker::default().run(&jobs));
-            self.threads += usize::from(spawned.is_ok());
+            self.threads.extend(spawned);
         }
-        if self.threads == 0 {
+        if self.threads.is_empty() {
             return Err(Error::MemoryAllocation);
         }
         sender.send(job).map_err(|_| Error::Internal)
+    }
+}
+
+/// To be dropped after the frames whose jobs it has, so that they end soon.
+impl Drop for Pool {
+    fn drop(&mut self) {
+        self.jobs = None;
+        for thread in self.threads.drain(..) {
+            let _ = thread.join();
+        }
     }
 }
 
@@ -235,7 +236,7 @@ pub(crate) struct Workers {
     relay: mpsc::Receiver<Box<Relay>>,
     spare_inputs: Vec<Vec<u8>>,
     threads_max: usize,
-    is_abandoned: Shared<AtomicBool>,
+    interest: Interest,
     /// Of the jobs whose output is still to come, in order.
     reports: VecDeque<mpsc::Receiver<Report>>,
     backlog: Backlog,
@@ -291,7 +292,7 @@ impl Workers {
             relay,
             spare_inputs: vec::with_room(jobs_max)?,
             threads_max: request.workers,
-            is_abandoned: vec::shared(AtomicBool::new(false))?,
+            interest: Interest::new()?,
             reports,
             backlog: Backlog::default(),
             is_followed: false,
@@ -351,7 +352,7 @@ impl Workers {
                 relay_sender,
             ),
             reports,
-            is_abandoned: Shared::clone(&self.is_abandoned),
+            interest: self.interest.clone(),
         };
         pool.post(job, self.threads_max.min(self.reports.len() + 1))?;
         self.reports.push_back(receiver);
@@ -431,6 +432,6 @@ impl Workers {
 
 impl Drop for Workers {
     fn drop(&mut self) {
-        self.is_abandoned.store(true, Ordering::SeqCst);
+        self.interest.lose();
     }
 }
