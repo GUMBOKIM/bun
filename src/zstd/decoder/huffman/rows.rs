@@ -1,4 +1,4 @@
-//! Filling the rows of tables, many at a time. That goes up to `N - 1` rows beyond those that are asked for.
+//! Filling the rows of tables, many at a time. That goes up to `N` rows beyond those that are asked for.
 
 use core::hint::black_box;
 
@@ -16,8 +16,9 @@ pub(super) fn fill_rows<T: Copy, const N: usize>(
     value: T,
 ) -> Result<()> {
     let rows = (rows.get_mut(start..)).and_then(|rows| rows.get_mut(..count + N - 1));
-    for chunk in rows.ok_or(Error::Internal)?.as_chunks_mut().0 {
-        *chunk = [value; N];
+    let chunk = [value; N];
+    for to in rows.ok_or(Error::Internal)?.as_chunks_mut().0 {
+        *to = chunk;
         // Most are short: neither unrolling nor a call of `memset()` pays.
         black_box(());
     }
@@ -48,20 +49,36 @@ pub(super) fn repeat_each<T: Copy, const N: usize>(
     Ok(())
 }
 
-/// Sets `count` rows from `to` on to what `map` makes of those from `from` on, `N` at a time.
+/// Puts behind the `period` rows from `start` on what `map` makes of them for each of `symbols`.
 #[inline(always)]
-pub(super) fn copy_rows<T: Copy, const N: usize>(
+pub(super) fn repeat_rows_for<T: Copy, const N: usize>(
     rows: &mut [T],
-    [from, to]: [usize; 2],
-    count: usize,
-    map: impl Fn(T) -> T,
+    start: usize,
+    period: usize,
+    symbols: &[u8],
+    map: impl Fn(T, u8) -> T,
 ) -> Result<()> {
-    for done in (0..count).step_by(N) {
-        let from = rows.get(from + done..).and_then(<[T]>::first_chunk::<N>);
-        let mut chunk = *from.ok_or(Error::Internal)?;
-        chunk.iter_mut().for_each(|it| *it = map(*it));
-        let to = rows.get_mut(to + done..).and_then(<[T]>::first_chunk_mut);
-        *to.ok_or(Error::Internal)? = chunk;
+    let mapped = |mut chunk: [T; N], symbol| {
+        chunk.iter_mut().for_each(|it| *it = map(*it, symbol));
+        chunk
+    };
+    debug_assert!(period.is_power_of_two());
+    let mut rows = rows.get_mut(start..).ok_or(Error::Internal)?;
+    if period <= N {
+        let pattern = *rows.first_chunk().ok_or(Error::Internal)?;
+        for &symbol in symbols {
+            rows = rows.get_mut(period..).ok_or(Error::Internal)?;
+            *rows.first_chunk_mut().ok_or(Error::Internal)? = mapped(pattern, symbol);
+        }
+    } else {
+        let pattern = rows.split_off_mut(..period).ok_or(Error::Internal)?;
+        for &symbol in symbols {
+            let copy = rows.split_off_mut(..period).ok_or(Error::Internal)?;
+            for (to, from) in copy.as_chunks_mut().0.iter_mut().zip(pattern.as_chunks().0) {
+                *to = mapped(*from, symbol);
+                black_box(());
+            }
+        }
     }
     Ok(())
 }

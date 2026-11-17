@@ -14,7 +14,7 @@ pub(super) use layout::PairTable;
 /// Loads are cheaper than shifts.
 #[cfg(target_arch = "x86_64")]
 mod layout {
-    use super::super::rows::{FILL, copy_rows, fill_rows, repeat_each};
+    use super::super::rows::{FILL, fill_rows, repeat_each, repeat_rows_for};
     use super::super::{QUICK_LEN, QUICK_LOG};
     use crate::error::Result;
 
@@ -48,13 +48,16 @@ mod layout {
         pub(super) fn set_alone(
             &mut self,
             row: usize,
-            rows: usize,
-            symbol: u8,
+            repeats: usize,
+            symbols: &[u8],
             length: u32,
         ) -> Result<()> {
+            let rows = symbols.len() * repeats;
             fill_rows::<_, FILL>(&mut self.lengths, row, rows, length as u8)?;
             fill_rows::<_, FILL>(&mut self.counts, row, rows, Count::One)?;
-            fill_rows::<_, PAIRS_IN_FILL>(&mut self.symbols, row, rows, symbol.into())
+            // The second does not count. This one is the quickest to repeat.
+            let alone = |symbol| u16::from_le_bytes([symbol; 2]);
+            repeat_each::<_, PAIRS_IN_FILL>(&mut self.symbols, row, symbols, repeats, alone)
         }
 
         #[inline(always)]
@@ -66,28 +69,30 @@ mod layout {
             seconds: &[u8],
             length: u32,
         ) -> Result<()> {
-            fill_rows::<_, FILL>(
-                &mut self.lengths,
-                row,
-                seconds.len() * repeats,
-                length as u8,
-            )?;
-            fill_rows::<_, FILL>(&mut self.counts, row, seconds.len() * repeats, Count::Two)?;
+            let rows = seconds.len() * repeats;
+            fill_rows::<_, FILL>(&mut self.lengths, row, rows, length as u8)?;
+            fill_rows::<_, FILL>(&mut self.counts, row, rows, Count::Two)?;
             let pair = |second| u16::from_le_bytes([first, second]);
             repeat_each::<_, PAIRS_IN_FILL>(&mut self.symbols, row, seconds, repeats, pair)
         }
 
         #[inline(always)]
-        pub(super) fn copy_for(
+        pub(super) fn repeat_for(
             &mut self,
-            first: u8,
-            from_to: [usize; 2],
-            rows: usize,
+            others: &[u8],
+            start: usize,
+            period: usize,
         ) -> Result<()> {
-            copy_rows::<_, FILL>(&mut self.lengths, from_to, rows, |it| it)?;
-            copy_rows::<_, FILL>(&mut self.counts, from_to, rows, |it| it)?;
-            let with_first = |pair| pair & 0xFF00 | u16::from(first);
-            copy_rows::<_, PAIRS_IN_FILL>(&mut self.symbols, from_to, rows, with_first)
+            repeat_rows_for::<_, FILL>(&mut self.lengths, start, period, others, |it, _| it)?;
+            repeat_rows_for::<_, FILL>(&mut self.counts, start, period, others, |it, _| it)?;
+            let with_first = |pair, first| pair & 0xFF00 | u16::from(first);
+            repeat_rows_for::<_, PAIRS_IN_FILL>(
+                &mut self.symbols,
+                start,
+                period,
+                others,
+                with_first,
+            )
         }
 
         /// The row for what `bits` start with, and how many of them it takes.
@@ -112,7 +117,7 @@ mod layout {
 /// Shifts are cheaper than loads.
 #[cfg(not(target_arch = "x86_64"))]
 mod layout {
-    use super::super::rows::{FILL, copy_rows, fill_rows, repeat_each};
+    use super::super::rows::{FILL, repeat_each, repeat_rows_for};
     use super::super::{QUICK_LEN, QUICK_LOG};
     use crate::error::Result;
 
@@ -132,12 +137,12 @@ mod layout {
         pub(super) fn set_alone(
             &mut self,
             row: usize,
-            rows: usize,
-            symbol: u8,
+            repeats: usize,
+            symbols: &[u8],
             length: u32,
         ) -> Result<()> {
-            let value = length | u32::from(symbol) << SYMBOLS_SHIFT | 1 << COUNT_SHIFT;
-            fill_rows::<_, ROWS_IN_FILL>(&mut self.0, row, rows, value)
+            let alone = |symbol| length | u32::from(symbol) << SYMBOLS_SHIFT | 1 << COUNT_SHIFT;
+            repeat_each::<_, ROWS_IN_FILL>(&mut self.0, row, symbols, repeats, alone)
         }
 
         #[inline(always)]
@@ -155,15 +160,15 @@ mod layout {
         }
 
         #[inline(always)]
-        pub(super) fn copy_for(
+        pub(super) fn repeat_for(
             &mut self,
-            first: u8,
-            from_to: [usize; 2],
-            rows: usize,
+            others: &[u8],
+            start: usize,
+            period: usize,
         ) -> Result<()> {
             let with_first =
-                |value| value & !(0xFF << SYMBOLS_SHIFT) | u32::from(first) << SYMBOLS_SHIFT;
-            copy_rows::<_, ROWS_IN_FILL>(&mut self.0, from_to, rows, with_first)
+                |row, first| row & !(0xFF << SYMBOLS_SHIFT) | u32::from(first) << SYMBOLS_SHIFT;
+            repeat_rows_for::<_, ROWS_IN_FILL>(&mut self.0, start, period, others, with_first)
         }
 
         /// The row for what `bits` start with, and how many of them it takes.
@@ -201,8 +206,14 @@ impl PairTable {
                 continue;
             };
             let (start, room) = (row, QUICK_LOG - length);
+            let period = 1 << room;
             let alone = ranks.rows_beyond(room) >> length;
-            self.set_alone(row, alone, first, length)?;
+            if alone == period {
+                self.set_alone(row, alone, firsts, length)?;
+                row += firsts.len() * alone;
+                continue;
+            }
+            self.set_alone(row, alone, &[first], length)?;
             row += alone;
             for (second_length, seconds) in ranks.up_to(room) {
                 let repeats = 1 << (room - second_length);
@@ -210,9 +221,9 @@ impl PairTable {
                 row += seconds.len() * repeats;
             }
             // What can follow a code depends on nothing but its length.
-            for &other in others {
-                self.copy_for(other, [start, row], 1 << room)?;
-                row += 1 << room;
+            if !others.is_empty() {
+                self.repeat_for(others, start, period)?;
+                row += others.len() * period;
             }
         }
         Ok(())

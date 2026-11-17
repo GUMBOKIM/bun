@@ -255,6 +255,10 @@ fn literals_of_all_sizes() -> Result<()> {
         skewed_lengths(12),
         vec![4; 16],
         vec![6; 64],
+        [vec![1], vec![8; 128]].concat(),
+        [vec![2], vec![7; 96]].concat(),
+        [vec![5; 16], vec![6; 32]].concat(),
+        [vec![1, 2, 3, 4], vec![9; 16], vec![10; 24], vec![11; 16]].concat(),
     ];
     let sizes = [
         6,
