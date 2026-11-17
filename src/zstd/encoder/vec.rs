@@ -11,12 +11,6 @@ pub(crate) fn with_room<T>(capacity: usize) -> Result<Vec<T>> {
     Ok(vec)
 }
 
-pub(crate) fn filled<T: Clone>(value: T, len: usize) -> Result<Vec<T>> {
-    let mut vec = with_room(len)?;
-    vec.resize(len, value);
-    Ok(vec)
-}
-
 pub(crate) fn zeroed<T: Zeroable>(len: usize) -> Result<Vec<T>> {
     bun_pod::try_zeroed_vec(len).ok_or(Error::MemoryAllocation)
 }
