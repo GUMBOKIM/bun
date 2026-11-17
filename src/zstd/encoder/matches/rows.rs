@@ -148,14 +148,13 @@ impl<'a, const N: usize> Rows<'a, N> {
 
     #[inline(always)]
     fn add(&mut self, hash: u32, index: u32) -> Option<()> {
-        let row = first_entry::<N>(hash)..first_entry::<N>(hash) + N;
-        let tags = likely(self.tags.get_mut(row.clone()))?.as_mut_array::<N>()?;
-        let indices = likely(self.indices.get_mut(row))?.as_mut_array::<N>()?;
+        let first = first_entry::<N>(hash);
+        let tags = likely(self.tags.get_mut(first..first + N))?.as_mut_array::<N>()?;
         let head = *Self::NEXT_HEADS.at(usize::from(*tags.at(0)));
-        let slot = usize::from(head) % N;
         *tags.at_mut(0) = head;
-        *tags.at_mut(slot) = hash as u8;
-        *indices.at_mut(slot) = index;
+        let entry = first + usize::from(head) % N;
+        *self.tags.get_mut(entry)? = hash as u8;
+        *self.indices.get_mut(entry)? = index;
         Some(())
     }
 

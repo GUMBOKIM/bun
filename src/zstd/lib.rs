@@ -104,8 +104,7 @@ fn decompress_sized(
     size: usize,
     dictionary: Option<&Dictionary<'_>>,
 ) -> Result<Vec<u8>, ZstdError> {
-    // With some slack, the end of the output needs no special care.
-    let mut output = with_capacity(size + 32)?;
+    let mut output = with_capacity(size)?;
     bun_zstd_decoder::decompress(
         src,
         &mut Output::spare_capacity(&mut output, size),
