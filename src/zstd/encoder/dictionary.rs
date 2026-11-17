@@ -68,13 +68,6 @@ fn read_tables<'a>(mut bytes: &'a [u8], entropy: &mut Entropy) -> Option<(Repeat
     )?;
     let (repeats, content) = bytes.split_first_chunk::<12>()?;
     let repeats = [0, 4, 8].map(|at| u32_at(repeats, at).unwrap_or(0));
-    if !repeats
-        .iter()
-        .all(|&offset| (1..=content.len()).contains(&(offset as usize)))
-    {
-        return None;
-    }
-
     let max_offset = u32::try_from(content.len() + BLOCK_LEN_MAX).unwrap_or(u32::MAX);
     for (kind, counts, max_needed) in [
         (CodeKind::Offset, offsets, highest_bit(max_offset) as usize),
@@ -104,16 +97,21 @@ impl Dictionary {
         state.reset(tuning, tuning.prefers_rows(), &usage)?;
         let mut entropy = vec::boxed(Entropy::EMPTY)?;
 
-        let (id, repeats, content) = match bytes.split_first_chunk::<WORD_LEN>() {
+        let has_tables = bytes.len() >= WORD_LEN && u32_at(bytes, 0) == Some(DICTIONARY_MAGIC);
+        let (id, repeats, content) = match bytes.get(WORD_LEN..) {
             None => (0, Repeats::INITIAL, &[][..]),
-            Some((header, rest)) if u32_at(header, 0) == Some(DICTIONARY_MAGIC) => {
+            Some(rest) if has_tables => {
                 let (repeats, content) =
                     read_tables(rest, &mut entropy).ok_or(Error::DictionaryCorrupted)?;
-                (u32_at(header, 4).unwrap_or(0), repeats, content)
+                (u32_at(bytes, 4).unwrap_or(0), repeats, content)
             }
             Some(_) => (0, Repeats::INITIAL, bytes.as_slice()),
         };
         let content = state.loadable(content, Owner::Dictionary);
+        let is_in_content = |offset: u32| (1..=content.len()).contains(&(offset as usize));
+        if has_tables && !repeats.0.into_iter().all(is_in_content) {
+            return Err(Error::DictionaryCorrupted);
+        }
         if !content.is_empty() {
             state.load(content, Owner::Dictionary);
         }

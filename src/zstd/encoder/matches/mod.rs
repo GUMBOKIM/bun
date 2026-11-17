@@ -15,6 +15,7 @@ mod tree;
 
 use core::cell::Cell;
 use core::marker::ConstParamTy;
+use core::ops::Range;
 
 use bun_pod::Pod;
 use bun_zstd_decoder::Result;
@@ -216,12 +217,12 @@ impl<'a> Progress<'a> {
         }
     }
 
-    /// For a match that starts at `start`.
     #[inline(always)]
-    fn store(&mut self, start: u32, offset: OffsetValue, len: u32) {
+    fn store(&mut self, offset: OffsetValue, matched: Range<u32>) {
+        let literal_len = matched.start.wrapping_sub(self.anchor);
         self.sequences
-            .push(start.wrapping_sub(self.anchor), offset, len);
-        self.anchor = start.wrapping_add(len);
+            .push(literal_len, offset, matched.end.wrapping_sub(matched.start));
+        self.anchor = matched.end;
     }
 
     #[inline(always)]

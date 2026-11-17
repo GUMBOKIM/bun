@@ -2,7 +2,6 @@
 
 use core::cell::Cell;
 use core::convert::Infallible;
-use core::hint::select_unpredictable;
 
 use bun_zstd_decoder::with_bmi2;
 
@@ -136,20 +135,32 @@ impl<'a> Searcher<'a> {
         self,
         near: &Near<'a>,
         progress: &mut Progress<'_>,
-    ) -> Option<Infallible> {
+    ) -> Option<()> {
+        let mut at = near.history.start;
+        if !Near::has_repeats(progress, at) {
+            at = self.start_prefix(near, progress)?;
+        }
         with_bmi2(
             #[inline(always)]
-            move || self.scan_prefix::<IS_BRANCHLESS>(near, progress),
+            move || self.scan_prefix::<IS_BRANCHLESS, true>(near, at, progress),
         )
+        .map(drop)
     }
 
-    /// The steps for a position, which each wait for memory, overlap with those for the next ones.
+    #[inline(never)]
+    fn start_prefix(self, near: &Near<'a>, progress: &mut Progress<'_>) -> Option<u32> {
+        self.scan_prefix::<true, false>(near, near.history.start, progress)
+    }
+
+    /// The steps for a position, which each wait for memory, overlap with those for the next ones. Unless it
+    /// [`HAS_REPEATS`](Near::has_repeats) from the start, it returns where it does.
     #[inline(always)]
-    fn scan_prefix<const IS_BRANCHLESS: bool>(
+    fn scan_prefix<const IS_BRANCHLESS: bool, const HAS_REPEATS: bool>(
         mut self,
         near: &Near<'a>,
+        start: u32,
         progress: &mut Progress<'_>,
-    ) -> Option<Infallible> {
+    ) -> Option<u32> {
         const STEP_GROWS_AFTER: usize = 1 << (SKIP_LOG - 1);
         let chunks = AtLeast::<PAIR_LEN>::new(near.history.prefix)?;
         self.history = near.history;
@@ -158,8 +169,9 @@ impl<'a> Searcher<'a> {
         let index = |at: usize| history.index(at as u32);
         let position = |entry: &Cell<u32>| history.position(entry.get()) as usize;
         let has_at = |at, value| chunks.matches_at::<IS_BRANCHLESS>(at, |it| it as u32 == value);
-        let mut at = history.start as usize;
-        let mut recent = near.distance(progress.recent);
+        let has_before =
+            |at, offset, value| near.has_before::<HAS_REPEATS, _>(chunks, at, offset, value);
+        let (mut at, mut recent) = (start as usize, progress.recent as usize);
 
         loop {
             let mut step = self.step as usize + 1;
@@ -174,7 +186,7 @@ impl<'a> Searcher<'a> {
             let (searched, repeats) = loop {
                 let ahead_pair = likely(chunks.chunk(ahead))?;
                 let ahead_word = word_in::<0, _>(ahead_pair);
-                let repeats = near.has_before(chunks, ahead, recent, ahead_word as u32);
+                let repeats = has_before(ahead, recent, ahead_word as u32)?;
 
                 entry.set(index(at));
                 if repeats {
@@ -211,17 +223,18 @@ impl<'a> Searcher<'a> {
 
             if repeats {
                 let (found, offset) = (ahead as u32, recent as u32);
-                let before = near.repeat_len_before(found, offset);
-                let len = before + near.repeat_len(found, offset);
-                progress.store(found - before, OffsetValue::FIRST_REPEAT, len);
+                let (all, at) = near.for_repeats::<HAS_REPEATS>(history, found);
+                let before = all.match_len_before(at, at.wrapping_sub(offset), 1);
+                let end = found + near.repeat_len::<HAS_REPEATS>(history, found, offset);
+                progress.store(OffsetValue::FIRST_REPEAT, found - before..end);
             } else {
                 let (found, earlier) = (searched as u32, candidate as u32);
                 let max = earlier.min(found - progress.anchor);
                 let before = history.match_len_before(found, earlier, max);
-                let len = before + 4 + history.match_len(found + 4, earlier + 4);
+                let end = found + 4 + history.match_len(found + 4, earlier + 4);
                 let offset = found.wrapping_sub(earlier);
                 progress.note_offset(offset);
-                progress.store(found - before, OffsetValue::new(offset), len);
+                progress.store(OffsetValue::new(offset), found - before..end);
                 recent = offset as usize;
             }
 
@@ -230,13 +243,16 @@ impl<'a> Searcher<'a> {
             for inside in [searched + 2, at - 2] {
                 self.entry(likely(chunks.word(inside))?)?.set(index(inside));
             }
-            while near.has_before(chunks, at, near.distance(progress.second), word as u32) {
-                let len = near.repeat_len(at as u32, progress.second);
+            while progress.second != 0 && has_before(at, progress.second as usize, word as u32)? {
+                let len = near.repeat_len::<HAS_REPEATS>(history, at as u32, progress.second);
                 progress.swap_offsets();
                 self.entry(word)?.set(index(at));
-                progress.store(at as u32, OffsetValue::FIRST_REPEAT, len);
+                progress.store(OffsetValue::FIRST_REPEAT, at as u32..at as u32 + len);
                 (at, recent) = (progress.anchor as usize, progress.recent as usize);
                 word = likely(chunks.word(at))?;
+            }
+            if !HAS_REPEATS && Near::has_repeats(progress, at as u32) {
+                return Some(at as u32);
             }
         }
     }
@@ -255,7 +271,7 @@ impl<'a> Searcher<'a> {
             let len = history.match_len_at_index(at, earlier, 4);
             progress.swap_offsets();
             self.entry(word)?.set(history.index(at));
-            progress.store(at, OffsetValue::FIRST_REPEAT, len);
+            progress.store(OffsetValue::FIRST_REPEAT, at..at + len);
         }
     }
 
@@ -327,8 +343,8 @@ impl<'a> Searcher<'a> {
                 max_before = found - progress.anchor;
             }
             let before = history.match_len_before_index(found, earlier, max_before);
-            let len = before + history.match_len_at_index(found, earlier, 4);
-            progress.store(found - before, offset, len);
+            let end = found + history.match_len_at_index(found, earlier, 4);
+            progress.store(offset, found - before..end);
 
             if pending < progress.anchor {
                 pending_entry.set(history.index(pending));
@@ -405,8 +421,8 @@ impl<'a> Searcher<'a> {
                 let before = history.match_len_before_index(found, earlier, max);
                 (OffsetValue::new(progress.recent), before)
             };
-            let len = before + history.match_len_at_index(found, earlier, 4);
-            progress.store(found - before, offset, len);
+            let end = found + history.match_len_at_index(found, earlier, 4);
+            progress.store(offset, found - before..end);
 
             likely(u64_at(bytes, progress.anchor))?;
             self.insert(at + 2)?;
@@ -441,40 +457,50 @@ impl<'a> Near<'a> {
         }
     }
 
-    /// For [`has_before`](Self::has_before). Leads out of range if the offset is 0.
+    /// Whether the recent offsets lead to something near from `at` on. The second one may be missing.
     #[inline(always)]
-    pub(super) fn distance(&self, offset: u32) -> usize {
-        select_unpredictable(offset != 0, offset as usize, 1 << 32)
+    pub(super) fn has_repeats(progress: &Progress<'_>, at: u32) -> bool {
+        progress.recent.wrapping_sub(1) < at && progress.second <= at
     }
 
-    /// Whether `value` is `distance` bytes before `at` of the near `chunks`.
+    /// Whether `value` is `offset` bytes before `at` of the near `chunks`.
     #[inline(always)]
-    pub(super) fn has_before<const N: usize>(
+    pub(super) fn has_before<const HAS_REPEATS: bool, const N: usize>(
         &self,
         chunks: AtLeast<'_, N>,
         at: usize,
-        distance: usize,
+        offset: usize,
         value: u32,
-    ) -> bool {
-        let back = at.wrapping_sub(distance);
-        match likely(chunks.word(back)) {
-            Some(word) => word as u32 == value,
-            None => {
-                let far = u32::try_from(back.wrapping_add(self.start as usize));
-                far.is_ok_and(|far| u32_at(self.all.prefix, far) == Some(value))
-            }
+    ) -> Option<bool> {
+        if HAS_REPEATS {
+            return Some(likely(chunks.word(at.wrapping_sub(offset)))? as u32 == value);
+        }
+        let back = (at as u32 + self.start).wrapping_sub(offset as u32);
+        Some(offset != 0 && u32_at(self.all.prefix, back) == Some(value))
+    }
+
+    /// The history for matches at recent offsets, and where `at` of the near one is in it.
+    #[inline(always)]
+    fn for_repeats<const HAS_REPEATS: bool>(
+        &self,
+        near: &History<'a>,
+        at: u32,
+    ) -> (History<'a>, u32) {
+        if HAS_REPEATS {
+            (*near, at)
+        } else {
+            (self.all, at + self.start)
         }
     }
 
     #[inline(always)]
-    pub(super) fn repeat_len(&self, at: u32, offset: u32) -> u32 {
-        let after = at + self.start + 4;
-        4 + self.all.match_len(after, after.wrapping_sub(offset))
-    }
-
-    #[inline(always)]
-    fn repeat_len_before(&self, at: u32, offset: u32) -> u32 {
-        let at = at + self.start;
-        self.all.match_len_before(at, at.wrapping_sub(offset), 1)
+    pub(super) fn repeat_len<const HAS_REPEATS: bool>(
+        &self,
+        near: &History<'a>,
+        at: u32,
+        offset: u32,
+    ) -> u32 {
+        let (history, at) = self.for_repeats::<HAS_REPEATS>(near, at);
+        4 + history.match_len(at + 4, (at + 4).wrapping_sub(offset))
     }
 }

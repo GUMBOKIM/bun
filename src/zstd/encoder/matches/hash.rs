@@ -32,6 +32,14 @@ impl Hasher {
     }
 
     #[inline(always)]
+    pub(super) fn with_bits(self, bits: u32) -> Self {
+        Self {
+            shift: 64 - bits,
+            ..self
+        }
+    }
+
+    #[inline(always)]
     pub(super) fn hash(self, word: u64) -> usize {
         word.wrapping_mul(self.multiplier).wrapping_shr(self.shift) as usize
     }

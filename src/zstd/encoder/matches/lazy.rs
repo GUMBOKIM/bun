@@ -231,6 +231,8 @@ impl Parser<'_> {
                 offset: OffsetValue::FIRST_REPEAT,
             };
 
+            let mut end = start + best.len;
+
             if self.depth > 0 || repeat_len.is_none() {
                 // How many positions had nothing better, once there is a match.
                 let mut misses = None;
@@ -268,6 +270,7 @@ impl Parser<'_> {
                     }
                 }
 
+                end = start + best.len;
                 if let Some(offset) = best.offset.offset() {
                     let max = start - progress.anchor;
                     let before = if REACH == Reach::Prefix {
@@ -277,12 +280,11 @@ impl Parser<'_> {
                         history.match_len_before_index(start, earlier, max)
                     };
                     start -= before;
-                    best.len += before;
                     progress.note_offset(offset);
                 }
             }
 
-            progress.store(start, best.offset, best.len);
+            progress.store(best.offset, start..end);
             at = progress.anchor;
             if is_skipping {
                 finder.resume(history, &mut scratch);
@@ -293,7 +295,7 @@ impl Parser<'_> {
                 && let Some(len) = self.repeat_len::<REACH>(at, progress.second)
             {
                 progress.swap_offsets();
-                progress.store(at, OffsetValue::FIRST_REPEAT, len);
+                progress.store(OffsetValue::FIRST_REPEAT, at..at + len);
                 at = progress.anchor;
             }
         }
