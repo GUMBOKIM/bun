@@ -12,17 +12,15 @@ const CODE_LEN_MAX: u32 = 11;
 const RANKS: usize = 16;
 
 #[derive(Clone, Copy, Default)]
-struct Node {
+struct Leaf {
     count: u32,
-    parent: u16,
     symbol: u8,
     bits: u8,
 }
 
-/// Node 0 is a barrier. The leaves follow, from the most frequent on, and the parents start at [`FIRST_PARENT`].
-type Nodes = [Node; 512];
+/// From the most frequent on, after one that stands for none.
+type Leaves = [Leaf; 257];
 const FIRST_LEAF: usize = 1;
-const FIRST_PARENT: usize = 257;
 
 /// The code is in the highest bits, and its length in the lowest byte.
 #[derive(Clone, Copy)]
@@ -34,22 +32,21 @@ impl Code {
     const fn new(value: u16, bits: u8) -> Self {
         Self((value as u64).unbounded_shl(64 - bits as u32) | bits as u64)
     }
-
-    #[inline(always)]
-    fn bits(self) -> u32 {
-        u32::from(self.0 as u8)
-    }
 }
 
 #[derive(Clone, Copy)]
 pub(crate) struct Table {
     codes: [Code; 256],
+    /// 0 for symbols without a code.
+    lens: [u8; 256],
+    /// How many codes have that length.
+    per_len: [u16; RANKS],
     log: u32,
     max_symbol: usize,
 }
 
 /// The order that this leaves equal counts in decides which of them get the shorter codes.
-fn quicksort(mut nodes: &mut [Node]) {
+fn quicksort(mut nodes: &mut [Leaf]) {
     if nodes.len() <= 8 {
         for end in 1..nodes.len() {
             if let Some([sorted @ .., next]) = nodes.get(..=end) {
@@ -87,81 +84,109 @@ fn quicksort(mut nodes: &mut [Node]) {
     }
 }
 
-fn sort_leaves(nodes: &mut Nodes, counts: &[u32]) {
-    const LOG_BUCKETS_FROM: u32 = 158;
-    const DISTINCT_BELOW: u32 = LOG_BUCKETS_FROM + LOG_BUCKETS_FROM.ilog2();
-    const BUCKETS_END: usize = 191;
-    let bucket = |count: u32| {
-        if count < DISTINCT_BELOW {
-            count as usize
-        } else {
-            (highest_bit(count) + LOG_BUCKETS_FROM) as usize
-        }
-    };
-
-    // How many symbols are in this bucket or a later one.
-    let mut from_here_on = [0u16; 256];
-    for &count in counts {
-        *from_here_on.at_mut(bucket(count)) += 1;
-    }
-    let mut sum = 0;
-    for entry in from_here_on.iter_mut().take(BUCKETS_END).rev() {
-        sum += *entry;
-        *entry = sum;
-    }
-
-    let mut next = from_here_on;
-    for (symbol, &count) in counts.iter().enumerate() {
-        let position = next.at_mut(bucket(count) + 1);
-        let node = nodes.at_mut(FIRST_LEAF + usize::from(*position));
-        (node.count, node.symbol) = (count, symbol as u8);
-        *position += 1;
-    }
-
-    let buckets = from_here_on.iter().zip(next).take(BUCKETS_END);
-    for (&start, end) in buckets.skip(DISTINCT_BELOW as usize) {
-        if end - start > 1 {
-            let range = FIRST_LEAF + usize::from(start)..FIRST_LEAF + usize::from(end);
-            quicksort(nodes.get_mut(range).unwrap_or_default());
-        }
-    }
+/// The symbols that occur, with the lengths that their codes have without a limit.
+struct Tree {
+    leaves: Leaves,
+    last_leaf: usize,
 }
 
-/// Sets the bits of the leaves up to `last_leaf`, without a limit.
-fn build_tree(nodes: &mut Nodes, last_leaf: usize) {
-    let root = FIRST_PARENT + last_leaf - FIRST_LEAF - 1;
-    for parent in FIRST_PARENT..=root {
-        nodes.at_mut(parent).count = 1 << 30;
+impl Tree {
+    /// At least two of `counts` are not 0.
+    fn new(counts: &[u32]) -> Self {
+        let mut tree = Self {
+            leaves: [Leaf::default(); _],
+            last_leaf: 0,
+        };
+        tree.sort(counts);
+        tree.measure();
+        tree
     }
-    nodes.at_mut(0).count = 1 << 31;
 
-    let (mut leaf, mut child) = (last_leaf, FIRST_PARENT);
-    for parent in FIRST_PARENT..=root {
-        let mut sum = 0u32;
-        for _ in 0..2 {
-            let smallest = if nodes.at(leaf).count < nodes.at(child).count {
-                leaf -= 1;
-                nodes.at_mut(leaf + 1)
+    fn sort(&mut self, counts: &[u32]) {
+        const LOG_BUCKETS_FROM: u32 = 158;
+        const DISTINCT_BELOW: u32 = LOG_BUCKETS_FROM + LOG_BUCKETS_FROM.ilog2();
+        let bucket = |count: u32| {
+            if count < DISTINCT_BELOW {
+                count as usize
             } else {
-                child += 1;
-                nodes.at_mut(child - 1)
-            };
-            smallest.parent = parent as u16;
-            sum = sum.wrapping_add(smallest.count);
+                (highest_bit(count) + LOG_BUCKETS_FROM) as usize
+            }
+        };
+
+        let (mut present, mut largest) = ([0u8; 256], 0);
+        for (symbol, &count) in counts.iter().enumerate() {
+            *present.at_mut(self.last_leaf % 256) = symbol as u8;
+            self.last_leaf += usize::from(count != 0);
+            largest = largest.max(count);
         }
-        nodes.at_mut(parent).count = sum;
+        let present = present.iter().take(self.last_leaf).filter_map(|&symbol| {
+            let &count = counts.get(usize::from(symbol))?;
+            Some(Leaf {
+                count,
+                symbol,
+                bits: 0,
+            })
+        });
+
+        let mut starts = [0u16; 256];
+        for leaf in present.clone() {
+            *starts.at_mut(bucket(leaf.count)) += 1;
+        }
+        let used = starts.get_mut(..=bucket(largest)).unwrap_or_default();
+        let mut start = FIRST_LEAF as u16;
+        for entry in used.iter_mut().rev() {
+            start += core::mem::replace(entry, start);
+        }
+        let mut ends = starts;
+        for leaf in present {
+            let end = ends.at_mut(bucket(leaf.count));
+            *self.leaves.at_mut(usize::from(*end)) = leaf;
+            *end += 1;
+        }
+
+        for bucket in DISTINCT_BELOW as usize - 1..=bucket(largest) {
+            let range = usize::from(*starts.at(bucket))..usize::from(*ends.at(bucket));
+            quicksort(self.leaves.get_mut(range).unwrap_or_default());
+        }
     }
 
-    for node in (FIRST_PARENT..root).rev().chain(FIRST_LEAF..=last_leaf) {
-        let parent = usize::from(nodes.at(node).parent);
-        nodes.at_mut(node).bits = nodes.at(parent).bits + 1;
+    fn measure(&mut self) {
+        let root = self.last_leaf.saturating_sub(2);
+        let mut counts = [1u32 << 30; 256];
+        let (mut parent_of_leaf, mut parent_of_node) = ([0u8; 512], [0u8; 256]);
+        self.leaves.at_mut(0).count = 1 << 31;
+
+        let (mut leaf, mut node) = (self.last_leaf, 0);
+        for parent in 0..=root {
+            let mut sum = 0;
+            for _ in 0..2 {
+                let (of_leaf, of_node) = (self.leaves.at(leaf).count, *counts.at(node));
+                // The one that is not taken gets its parent later.
+                *parent_of_leaf.at_mut(leaf) = parent as u8;
+                *parent_of_node.at_mut(node) = parent as u8;
+                let takes_leaf = of_leaf < of_node;
+                sum += of_leaf.min(of_node);
+                leaf -= usize::from(takes_leaf);
+                node += usize::from(!takes_leaf);
+            }
+            *counts.at_mut(parent) = sum;
+        }
+
+        let mut depths = [0u8; 256];
+        for node in (0..root).rev() {
+            *depths.at_mut(node) = depths.at(usize::from(*parent_of_node.at(node))) + 1;
+        }
+        let leaves = self.leaves.iter_mut().zip(parent_of_leaf).skip(FIRST_LEAF);
+        for (leaf, parent) in leaves.take(self.last_leaf) {
+            leaf.bits = depths.at(usize::from(parent)) + 1;
+        }
     }
 }
 
 /// Returns the length of the longest code.
-fn limit_code_len(nodes: &mut Nodes, last_leaf: usize, limit: u32) -> u32 {
+fn limit_code_len(nodes: &mut Leaves, last_leaf: usize, limit: u32) -> u32 {
     const NONE: usize = 0;
-    let bits = |nodes: &Nodes, node: usize| u32::from(nodes.at(node).bits);
+    let bits = |nodes: &Leaves, node: usize| u32::from(nodes.at(node).bits);
     let longest = bits(nodes, last_leaf);
     if longest <= limit {
         return longest;
@@ -227,8 +252,11 @@ fn limit_code_len(nodes: &mut Nodes, last_leaf: usize, limit: u32) -> u32 {
 }
 
 /// `None` if there is nothing to gain, or no room.
-fn compress_weights(weights: &[u8], out: &mut [u8]) -> Result<Option<usize>> {
-    let histogram = Histogram::<{ fse::SYMBOLS }>::of(weights);
+fn compress_weights(
+    weights: &[u8],
+    histogram: &Histogram<RANKS>,
+    out: &mut [u8],
+) -> Result<Option<usize>> {
     if histogram.largest_count == weights.len() || histogram.largest_count == 1 {
         return Ok(None);
     }
@@ -238,7 +266,10 @@ fn compress_weights(weights: &[u8], out: &mut [u8]) -> Result<Option<usize>> {
     let out = out.get_mut(header_len..).unwrap_or_default();
     let mut table = fse::Tables::<64, 16>::EMPTY;
     let shape = table.build(0, &normalized);
-    let len = table.compress(shape, weights, out);
+    let len = with_bmi2(
+        #[inline(always)]
+        || table.compress(shape, weights, out),
+    );
     Ok(len.map(|len| header_len + len))
 }
 
@@ -270,80 +301,80 @@ impl Pending {
     }
 
     #[inline(always)]
-    fn flush(&mut self, writer: &mut WordWriter<'_>) {
+    fn flush(&mut self, writer: &mut WordWriter<'_>) -> Option<()> {
         let count = u32::from(self.count as u8);
-        writer.put(self.bits.wrapping_shr(count.wrapping_neg()), count / 8);
         self.count &= 7;
+        writer.put(self.bits.wrapping_shr(count.wrapping_neg()), count / 8)
     }
 }
 
 impl Table {
     pub(super) const EMPTY: Self = Self {
         codes: [Code(0); 256],
+        lens: [0; 256],
+        per_len: [0; RANKS],
         log: 0,
         max_symbol: 0,
     };
 
-    /// Gives symbols the codes that follow from their lengths. `per_len` counts the codes of each length.
-    fn assign_codes(&mut self, lens: &[u8], per_len: &[u16; RANKS], log: u32) {
+    /// Gives symbols the codes that follow from their lengths.
+    fn assign_codes(&mut self) {
         let mut next_value = [0u16; RANKS];
         let mut first = 0;
-        for len in (1..=log as usize).rev() {
+        for len in (1..=self.log as usize).rev() {
             *next_value.at_mut(len) = first;
-            first = (first + per_len.at(len)) >> 1;
+            first = (first + self.per_len.at(len)) >> 1;
         }
-        for (code, &len) in self.codes.iter_mut().zip(lens) {
+        let symbols = self.codes.iter_mut().zip(self.lens);
+        for (code, len) in symbols.take(self.max_symbol + 1) {
             let value = next_value.at_mut(usize::from(len));
             *code = Code::new(*value, len);
             *value += 1;
         }
-        (self.log, self.max_symbol) = (log, lens.len().saturating_sub(1));
+    }
+
+    fn set_lens(&mut self, lens: impl Iterator<Item = (u8, u8)>, log: u32, symbol_count: usize) {
+        (self.lens, self.per_len) = ([0; _], [0; _]);
+        for (symbol, len) in lens {
+            *self.lens.at_mut(usize::from(symbol)) = len;
+            *self.per_len.at_mut(usize::from(len)) += 1;
+        }
+        (self.log, self.max_symbol) = (log, symbol_count.saturating_sub(1));
     }
 
     /// `weights` are those of a valid description.
     pub(super) fn build_from_weights(&mut self, weights: &[u8], log: u32) {
-        let (mut lens, mut per_len) = ([0; 256], [0; RANKS]);
-        for (len, &weight) in lens.iter_mut().zip(weights) {
-            if weight != 0 {
-                *len = log as u8 + 1 - weight;
-                *per_len.at_mut(usize::from(*len)) += 1;
-            }
-        }
-        self.assign_codes(lens.get(..weights.len()).unwrap_or(&lens), &per_len, log);
+        let present = (0..=u8::MAX)
+            .zip(weights)
+            .filter(|&(_, &weight)| weight != 0);
+        let lens = present.map(|(symbol, weight)| (symbol, log as u8 + 1 - weight));
+        self.set_lens(lens, log, weights.len());
+        self.assign_codes();
     }
 
-    /// `counts` end with a symbol that occurs, and have another one.
-    fn build_limited(&mut self, counts: &[u32], limit: u32) {
-        let mut nodes = [Node::default(); 512];
-        sort_leaves(&mut nodes, counts);
-        let last_leaf = counts.iter().filter(|&&count| count != 0).count();
-        build_tree(&mut nodes, last_leaf);
-        let log = limit_code_len(&mut nodes, last_leaf, limit);
-
-        let (mut lens, mut per_len) = ([0; 256], [0; RANKS]);
-        for leaf in nodes.iter().skip(FIRST_LEAF).take(last_leaf) {
-            *lens.at_mut(usize::from(leaf.symbol)) = leaf.bits;
-            *per_len.at_mut(usize::from(leaf.bits)) += 1;
-        }
-        self.assign_codes(lens.get(..counts.len()).unwrap_or(&lens), &per_len, log);
+    fn set_limited_lens(&mut self, mut tree: Tree, limit: u32, symbol_count: usize) {
+        let log = limit_code_len(&mut tree.leaves, tree.last_leaf, limit);
+        let leaves = tree.leaves.iter().skip(FIRST_LEAF).take(tree.last_leaf);
+        self.set_lens(leaves.map(|it| (it.symbol, it.bits)), log, symbol_count);
     }
 
-    /// For `len` symbols, of which at least two differ.
+    /// For `len` symbols. `counts` end with one that occurs, and have another one.
     pub(super) fn build(&mut self, counts: &[u32], len: usize, tries_limits: bool) {
+        let tree = Tree::new(counts);
         let limit = if tries_limits {
-            self.best_limit(counts)
+            self.best_limit(&tree, counts)
         } else {
             fse::table_log_for(CODE_LEN_MAX, len, counts.len().saturating_sub(1), 1)
         };
-        self.build_limited(counts, limit);
+        self.set_limited_lens(tree, limit, counts.len());
+        self.assign_codes();
     }
 
-    fn best_limit(&mut self, counts: &[u32]) -> u32 {
-        let distinct = counts.iter().filter(|&&count| count != 0).count();
-        let shortest = highest_bit(distinct as u32) + 1;
+    fn best_limit(&mut self, tree: &Tree, counts: &[u32]) -> u32 {
+        let shortest = highest_bit(tree.last_leaf as u32) + 1;
         let (mut best, mut best_len) = (CODE_LEN_MAX, usize::MAX - 1);
         for limit in shortest..=CODE_LEN_MAX {
-            self.build_limited(counts, limit);
+            self.set_limited_lens(Tree { ..*tree }, limit, counts.len());
             if self.log < limit && limit > shortest {
                 break;
             }
@@ -363,18 +394,28 @@ impl Table {
 
     /// Returns the length of the description.
     pub(super) fn describe(&self, out: &mut [u8]) -> Result<usize> {
-        let mut weights = [0; 256];
+        let weight = |len: u8| {
+            if len == 0 {
+                0
+            } else {
+                self.log as u8 + 1 - len
+            }
+        };
+        let mut weights = self.lens.map(weight);
         // The last one follows from the others.
         let described = self.max_symbol;
-        for (weight, code) in weights.iter_mut().zip(&self.codes).take(described) {
-            if code.bits() != 0 {
-                *weight = (self.log + 1 - code.bits()) as u8;
-            }
+        let last = core::mem::take(weights.at_mut(described));
+        let mut per_weight = [0; RANKS];
+        for len in 1..=self.log as u8 {
+            *per_weight.at_mut(usize::from(weight(len))) =
+                u32::from(*self.per_len.at(usize::from(len)));
         }
+        *per_weight.at_mut(usize::from(last)) -= 1;
+        *per_weight.at_mut(0) = described as u32 - per_weight.iter().sum::<u32>();
 
         let (header, out) = out.split_first_mut().ok_or(Error::DstSizeTooSmall)?;
         let used = weights.get(..described).unwrap_or_default();
-        if let Some(len) = compress_weights(used, out)?
+        if let Some(len) = compress_weights(used, &Histogram::new(per_weight), out)?
             && len < described / 2
         {
             *header = len as u8;
@@ -395,24 +436,20 @@ impl Table {
 
     /// 0 if there is no code for it.
     pub(crate) fn code_len(&self, symbol: usize) -> u32 {
-        if symbol > self.max_symbol {
-            return 0;
-        }
-        self.codes.at(symbol).bits()
+        u32::from(*self.lens.at(symbol))
     }
 
     pub(super) fn compressed_len(&self, counts: &[u32]) -> usize {
-        let pairs = counts.iter().zip(&self.codes);
-        let bits: u32 = pairs.map(|(&count, code)| count * code.bits()).sum();
+        let pairs = counts.iter().zip(&self.lens);
+        let bits: u32 = pairs.map(|(&count, &len)| count * u32::from(len)).sum();
         (bits / 8) as usize
     }
 
     pub(super) fn has_codes_for(&self, counts: &[u32]) -> bool {
-        let pairs = counts.iter().zip(&self.codes);
-        let misses = pairs.fold(false, |misses, (&count, code)| {
-            misses | ((count != 0) & (code.bits() == 0))
-        });
-        counts.len() <= self.max_symbol + 1 && !misses
+        let pairs = counts.iter().zip(&self.lens);
+        !pairs.fold(false, |misses, (&count, &len)| {
+            misses | ((count != 0) & (len == 0))
+        })
     }
 
     /// `N` codes, 7 pending bits and, if `IS_ROOMY`, 4 more bits fit in 64.
@@ -421,7 +458,7 @@ impl Table {
         &self,
         symbols: &[u8],
         writer: &mut WordWriter<'_>,
-    ) -> Pending {
+    ) -> Option<Pending> {
         let code = |symbol: u8| *self.codes.at(usize::from(symbol));
         let add_group = |pending: &mut Pending, group: &[u8; N]| {
             for (index, &symbol) in group.iter().enumerate().rev() {
@@ -439,23 +476,23 @@ impl Table {
             for &symbol in rest.iter().rev() {
                 pending.add(code(symbol));
             }
-            pending.flush(writer);
+            pending.flush(writer)?;
         }
         let (pairs, single) = groups.as_chunks::<2>();
         if let [group] = single {
             add_group(&mut pending, group);
-            pending.flush(writer);
+            pending.flush(writer)?;
         }
         for [first, second] in pairs.iter().rev() {
             add_group(&mut pending, second);
-            pending.flush(writer);
+            pending.flush(writer)?;
             // Does not wait for the bits above.
             let mut more = Pending::default();
             add_group(&mut more, first);
             pending.append(more);
-            pending.flush(writer);
+            pending.flush(writer)?;
         }
-        pending
+        Some(pending)
     }
 
     #[inline(always)]
@@ -469,9 +506,9 @@ impl Table {
             8 => self.encode::<7, false>(symbols, &mut writer),
             7 => self.encode::<8, false>(symbols, &mut writer),
             _ => self.encode::<9, true>(symbols, &mut writer),
-        };
+        }?;
         pending.add(Code::END_MARK);
-        pending.flush(&mut writer);
+        pending.flush(&mut writer)?;
         writer.finish(pending.count > 0)
     }
 

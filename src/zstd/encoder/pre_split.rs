@@ -87,6 +87,7 @@ fn split_by_chunks<const RATE: usize, const N: usize>(block: &Block) -> usize {
 }
 
 /// How much of `block` to compress as one.
+#[inline(never)]
 pub(crate) fn block_len(block: &Block, strategy: Strategy) -> usize {
     match strategy {
         Strategy::Fast => split_by_borders(block),

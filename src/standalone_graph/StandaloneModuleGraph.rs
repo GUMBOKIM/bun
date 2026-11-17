@@ -3906,8 +3906,9 @@ pub(crate) fn serialize_json_source_map_for_standalone(
 
         let offset = string_payload.len();
 
-        let bound = bun_zstd::compress_bound(utf8.len()).ok_or(crate::Error::SourceMapTooLarge)?;
-        string_payload.reserve(bound);
+        // Not just what this one needs, as more follow.
+        string_payload
+            .reserve(bun_zstd::compress_bound(utf8.len()).ok_or(crate::Error::SourceMapTooLarge)?);
         if let Err(err) = bun_zstd::compress_append(string_payload, utf8, 1) {
             Output::panic(format_args!(
                 "Unexpected error compressing sourcemap: {}",

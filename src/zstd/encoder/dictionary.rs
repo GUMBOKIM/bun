@@ -10,15 +10,15 @@ use crate::array::At;
 use crate::bytes::{highest_bit, u32_at};
 use crate::entropy::fse::{Normalized, SYMBOLS};
 use crate::entropy::{CodeKind, Entropy, Reuse};
-use crate::matches::{MatchState, Owner};
+use crate::matches::{MatchState, Owner, Usage};
 use crate::parameters::{Purpose, Request};
 use crate::sequences::Repeats;
-use crate::vec;
+use crate::vec::{self, Shared};
 use crate::window::WORD_LEN;
 
 /// Ready for frames to start from.
 pub(crate) struct Dictionary {
-    bytes: Vec<u8>,
+    bytes: Shared<Vec<u8>>,
     content: Range<usize>,
     pub(crate) id: u32,
     pub(crate) state: MatchState,
@@ -92,11 +92,16 @@ fn read_tables<'a>(mut bytes: &'a [u8], entropy: &mut Entropy) -> Option<(Repeat
 }
 
 impl Dictionary {
-    /// Takes `bytes` unless it fails. Without the magic number, they are all content.
-    pub(crate) fn new(bytes: &mut Vec<u8>, request: &Request) -> Result<Self> {
+    /// Without the magic number, it is all content.
+    pub(crate) fn new(bytes: &Shared<Vec<u8>>, request: &Request) -> Result<Self> {
         let tuning = request.tuning(None, Purpose::Dictionary { len: bytes.len() });
         let mut state = MatchState::new(tuning);
-        state.reset(tuning, tuning.prefers_rows(), Owner::Dictionary, 0)?;
+        let usage = Usage {
+            owner: Owner::Dictionary,
+            preceding_len: 0,
+            may_be_short: false,
+        };
+        state.reset(tuning, tuning.prefers_rows(), &usage)?;
         let mut entropy = vec::boxed(Entropy::EMPTY)?;
 
         let (id, repeats, content) = match bytes.split_first_chunk::<WORD_LEN>() {
@@ -114,7 +119,7 @@ impl Dictionary {
         }
         Ok(Self {
             content: bytes.len() - content.len()..bytes.len(),
-            bytes: core::mem::take(bytes),
+            bytes: Shared::clone(bytes),
             id,
             state,
             entropy,

@@ -82,13 +82,13 @@ impl Repeats {
 
 /// A length as the format has it: a code, and how many bits follow. See [`CodeKind::first_symbol`].
 #[derive(Clone, Copy)]
-pub(crate) struct LengthCode(u16);
+pub(crate) struct LengthCode(u32);
 
 impl LengthCode {
-    const BITS_SHIFT: u32 = 11;
+    const BITS_SHIFT: u32 = 27;
 
     const fn new(kind: CodeKind, code: u32, bits: u32) -> Self {
-        Self((kind.first_symbol() as u32 + code | bits << Self::BITS_SHIFT) as u16)
+        Self((kind.first_symbol() as u32 + code) | (bits << Self::BITS_SHIFT))
     }
 
     /// For the lengths from 0 on, given the bits of each code.
@@ -138,7 +138,7 @@ impl LengthCode {
 
     #[inline(always)]
     pub(crate) fn bits(self) -> u32 {
-        u32::from(self.0) >> Self::BITS_SHIFT
+        self.0 >> Self::BITS_SHIFT
     }
 }
 
@@ -289,14 +289,10 @@ impl Sequences {
     pub(crate) fn clear_for(&mut self, block_len: usize, min_match: u32) -> Result<()> {
         let shortest = if min_match == 3 { 3 } else { 4 };
         vec::clear_for(&mut self.list, block_len / shortest)?;
-        vec::refill(&mut self.literals, 0, block_len + OVERCOPY)
+        vec::grow(&mut self.literals, 0, block_len + OVERCOPY)
     }
 
-    /// `block` is what was searched.
-    pub(crate) fn literals<'a>(&'a self, block: &'a [u8]) -> &'a [u8] {
-        if self.list.is_empty() {
-            return block;
-        }
+    pub(crate) fn literals(&self) -> &[u8] {
         self.literals.get(..self.literals_len).unwrap_or_default()
     }
 
@@ -314,13 +310,10 @@ impl Sequences {
         debug_assert!(pushed.is_ok());
     }
 
-    /// `block` is what was searched.
-    pub(crate) fn finish(&mut self, block: &[u8]) -> Result<()> {
+    /// `block` is what was searched, and `end` where the last match ends.
+    pub(crate) fn finish(&mut self, block: &[u8], end: u32) -> Result<()> {
         let (list, literals) = (self.list.as_mut_slice(), self.literals.as_mut_slice());
         let counts = &mut self.counts;
-        if list.is_empty() {
-            return Ok(());
-        }
         *counts = [0; _];
         let literals_len = with_bmi2(
             #[inline(always)]
@@ -343,7 +336,7 @@ impl Sequences {
                     count(counts, coded);
                     *sequence = coded;
                 }
-                let last = block.get(from as usize..)?;
+                let last = block.get(from as usize..).filter(|_| from == end)?;
                 put(literals.get_mut(to as usize..)?, last)?;
                 Some(to as usize + last.len())
             },

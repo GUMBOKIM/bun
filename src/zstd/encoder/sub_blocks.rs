@@ -189,6 +189,7 @@ fn try_write(
     Ok(true)
 }
 
+#[inline(never)]
 pub(crate) fn write(
     writer: &mut BlockWriter,
     content: &Content<'_>,

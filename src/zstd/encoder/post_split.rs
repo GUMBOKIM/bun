@@ -105,6 +105,7 @@ fn replace_lost_repeats(sequences: &mut [Sequence], decoder: &mut Repeats, searc
 }
 
 /// `repeats` are the recent offsets after `all`.
+#[inline(never)]
 pub(crate) fn write(
     writer: &mut BlockWriter,
     mut bytes: &[u8],
@@ -116,12 +117,12 @@ pub(crate) fn write(
 ) -> Result<()> {
     let whole = Part {
         sequences: 0..all.list.len(),
-        literals: 0..all.literals(bytes).len(),
+        literals: 0..all.literals().len(),
     };
     let mut splitter = Splitter {
         writer,
         sequences: &all.list,
-        literals: all.literals(bytes),
+        literals: all.literals(),
         tuning,
         splits: [0; SPLITS_MAX],
         count: 0,
@@ -136,7 +137,7 @@ pub(crate) fn write(
         let content = Content {
             bytes,
             sequences: &all.list,
-            literals: all.literals(bytes),
+            literals: all.literals(),
             counts: &all.counts,
             repeats,
         };

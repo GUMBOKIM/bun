@@ -10,4 +10,5 @@ path = "lib.rs"
 workspace = true
 
 [dependencies]
+bun_pod = { workspace = true, features = ["alloc"] }
 bun_zstd_decoder.workspace = true

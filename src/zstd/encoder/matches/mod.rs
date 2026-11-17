@@ -16,6 +16,7 @@ mod tree;
 use core::cell::Cell;
 use core::marker::ConstParamTy;
 
+use bun_pod::Pod;
 use bun_zstd_decoder::Result;
 
 use crate::entropy::Entropy;
@@ -28,7 +29,6 @@ use long_distance::Candidates;
 /// The more bytes in a row do not match, the more are skipped.
 const SKIP_LOG: u32 = 8;
 const WORD: u32 = WORD_LEN as u32;
-const CACHE_LINE_LEN: usize = 64;
 
 /// What there is to search besides the prefix.
 #[derive(ConstParamTy, Clone, Copy, PartialEq, Eq)]
@@ -40,19 +40,46 @@ enum Reach {
     Attached,
 }
 
-/// `len` elements of `memory`, from the start of a cache line.
-fn aligned<T>(memory: &[T], len: usize) -> core::ops::Range<usize> {
-    let start = memory.as_ptr().align_offset(CACHE_LINE_LEN);
-    start..start.saturating_add(len)
+#[derive(Clone, Copy)]
+#[repr(C, align(64))]
+struct CacheLine([u8; 64]);
+
+bun_pod::impl_pod!(CacheLine);
+
+#[derive(Default)]
+struct Memory(Vec<CacheLine>);
+
+impl Memory {
+    fn lines_for<T>(len: usize) -> usize {
+        (len * size_of::<T>()).div_ceil(size_of::<CacheLine>())
+    }
+
+    /// What is added is 0.
+    fn grow<T>(&mut self, len: usize, may_stay_unused: bool) -> Result<()> {
+        let lines = Self::lines_for::<T>(len);
+        if may_stay_unused && self.0.len() < lines {
+            self.0 = vec::zeroed(lines)?;
+        }
+        vec::grow(&mut self.0, CacheLine([0; _]), lines)
+    }
+
+    fn get<T: Pod>(&self) -> &[T] {
+        bun_pod::try_cast_slice(&self.0).unwrap_or_default()
+    }
+
+    fn get_mut<T: Pod>(&mut self) -> &mut [T] {
+        bun_pod::try_cast_slice_mut(&mut self.0).unwrap_or_default()
+    }
 }
 
 #[derive(Default)]
 struct Tables {
-    indices: Vec<u32>,
+    /// All are below the next index of the window, those that no table takes up as well.
+    indices: Memory,
     hash_len: usize,
     chain_len: usize,
     hash3_len: usize,
-    tags: Vec<u8>,
+    tags: Memory,
     tags_len: usize,
 }
 
@@ -68,30 +95,32 @@ impl Tables {
         self.hash_len + self.chain_len + self.hash3_len
     }
 
+    /// For when indices start lower again.
+    fn drop_unused(&mut self) {
+        let used = Memory::lines_for::<u32>(self.indices_len());
+        self.indices.0.truncate(used);
+    }
+
     fn split(&self) -> (&[u32], &[u32], &[u8]) {
-        let indices = self.indices.get(aligned(&self.indices, self.indices_len()));
-        let indices = indices.and_then(|it| it.split_at_checked(self.hash_len));
+        let indices = self.indices.get().split_at_checked(self.hash_len);
         let (hash, rest) = indices.unwrap_or_default();
-        let tags = self.tags.get(aligned(&self.tags, self.tags_len));
-        let chain = rest.get(..self.chain_len);
+        let (chain, tags) = (
+            rest.get(..self.chain_len),
+            self.tags.get().get(..self.tags_len),
+        );
         (hash, chain.unwrap_or_default(), tags.unwrap_or_default())
     }
 
     fn split_mut(&mut self) -> TablesMut<'_> {
-        let indices = aligned(&self.indices, self.indices_len());
-        let indices = self.indices.get_mut(indices).unwrap_or_default();
-        let (hash, rest) = indices
-            .split_at_mut_checked(self.hash_len)
-            .unwrap_or_default();
-        let (chain, hash3) = rest
-            .split_at_mut_checked(self.chain_len)
-            .unwrap_or_default();
-        let tags = aligned(&self.tags, self.tags_len);
+        let mut indices = self.indices.get_mut();
+        let [hash, chain, hash3] = [self.hash_len, self.chain_len, self.hash3_len]
+            .map(|len| indices.split_off_mut(..len).unwrap_or_default());
+        let tags = self.tags.get_mut().get_mut(..self.tags_len);
         TablesMut {
             hash,
             chain,
             hash3,
-            tags: self.tags.get_mut(tags).unwrap_or_default(),
+            tags: tags.unwrap_or_default(),
         }
     }
 }
@@ -238,6 +267,14 @@ pub(crate) enum Owner {
     Dictionary,
 }
 
+pub(crate) struct Usage {
+    pub(crate) owner: Owner,
+    /// Of what is going to be loaded.
+    pub(crate) preceding_len: usize,
+    /// Whether the input may leave most of the tables unused.
+    pub(crate) may_be_short: bool,
+}
+
 pub(crate) struct MatchState {
     pub(crate) tuning: Tuning,
     pub(crate) uses_rows: bool,
@@ -264,19 +301,19 @@ impl MatchState {
         }
     }
 
-    pub(crate) fn reset(
-        &mut self,
-        tuning: Tuning,
-        uses_rows: bool,
-        owner: Owner,
-        block_len: usize,
-    ) -> Result<()> {
+    /// What the tables hold stays, out of reach.
+    pub(crate) fn reset(&mut self, tuning: Tuning, uses_rows: bool, usage: &Usage) -> Result<()> {
+        // Clearing the tables is faster than lowering their indices.
+        if self.window.would_overflow(usage.preceding_len + (16 << 20)) {
+            self.tables.indices.0.clear();
+            self.window.next = FIRST_INDEX;
+        }
         (self.tuning, self.uses_rows) = (tuning, uses_rows);
-        self.window = Window::starting_at(FIRST_INDEX);
+        self.window = Window::starting_at(self.window.next);
         self.dictionary_end = 0;
-        self.next_to_index = FIRST_INDEX;
+        self.next_to_index = self.window.next;
 
-        let is_optimal = owner == Owner::Frame && tuning.strategy >= Strategy::Optimal;
+        let is_optimal = usage.owner == Owner::Frame && tuning.strategy >= Strategy::Optimal;
         let has_chain = tuning.strategy != Strategy::Fast && !uses_rows;
         let has_hash3 = is_optimal && tuning.min_match == 3;
         let tables = &mut self.tables;
@@ -284,24 +321,34 @@ impl MatchState {
         tables.chain_len = usize::from(has_chain) << tuning.chain_log;
         tables.hash3_len = usize::from(has_hash3) << tuning.window_log.min(17);
         tables.tags_len = usize::from(uses_rows) << tuning.hash_log;
-        let indices_len = tables.indices_len() + CACHE_LINE_LEN / size_of::<u32>();
-        vec::refill(&mut tables.indices, 0, indices_len)?;
-        if uses_rows {
-            vec::refill(&mut tables.tags, 0, tables.tags_len + CACHE_LINE_LEN)?;
-        }
+        let indices_len = tables.indices_len();
+        tables
+            .indices
+            .grow::<u32>(indices_len, usage.may_be_short)?;
+        tables
+            .tags
+            .grow::<u8>(tables.tags_len, usage.may_be_short)?;
 
-        match (&mut self.optimal, owner) {
-            (Some(optimal), Owner::Frame) => optimal.reset(block_len),
-            (None, Owner::Frame) if is_optimal => {
-                self.optimal.insert(optimal::State::new()?).reset(block_len)
-            }
-            _ => Ok(()),
+        match &mut self.optimal {
+            Some(optimal) => optimal.forget(),
+            None if is_optimal => self.optimal = Some(optimal::State::new()?),
+            None => {}
+        }
+        Ok(())
+    }
+
+    /// Makes room for searching `len` bytes.
+    pub(crate) fn reserve(&mut self, len: usize) -> Result<()> {
+        match &mut self.optimal {
+            Some(optimal) => optimal.reserve(len),
+            None => Ok(()),
         }
     }
 
     /// Goes on from where the tables of a dictionary, which have the same sizes, are.
     pub(crate) fn copy_from(&mut self, dictionary: &Self) {
         let (hash, chain, tags) = dictionary.tables.split();
+        self.tables.drop_unused();
         let to = self.tables.split_mut();
         let has_tags = self.tuning.strategy <= Strategy::DoubleFast;
         let shift = if has_tags { TAG_BITS } else { 0 };
@@ -310,6 +357,7 @@ impl MatchState {
                 *to = from >> shift;
             }
         }
+        to.hash3.fill(0);
         for (to, from) in to.tags.iter_mut().zip(tags) {
             *to = *from;
         }
@@ -320,7 +368,7 @@ impl MatchState {
 
     /// Leaves room below the input for the indices of a dictionary.
     pub(crate) fn attach(&mut self, dictionary: &Self) {
-        self.window = Window::starting_at(dictionary.window.next);
+        self.window = Window::starting_at(dictionary.window.next.max(self.window.next));
         self.dictionary_end = self.window.next;
     }
 
@@ -407,6 +455,7 @@ impl MatchState {
             }
         };
         let has_marks = self.tuning.strategy == Strategy::TreeLazy2;
+        self.tables.drop_unused();
         let tables = self.tables.split_mut();
         for index in tables.hash.iter_mut().chain(tables.hash3) {
             *index = lower(*index);

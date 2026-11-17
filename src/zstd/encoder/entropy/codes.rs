@@ -493,34 +493,34 @@ fn encode(
     let add_extra_bits = |writer: &mut BitWriter<'_>, sequence: &Sequence| {
         let (mut bits, mut count) = sequence.extra_bits();
         if count > ROOM_AFTER_STATES {
-            writer.flush();
+            writer.flush()?;
             if count > ROOM_AFTER_FLUSH {
                 core::hint::cold_path();
                 writer.add(bits as u32, 32);
-                writer.flush();
+                writer.flush()?;
                 (bits, count) = (bits >> 32, count - 32);
             }
         }
         writer.add_all(bits, count);
-        writer.flush();
+        writer.flush()
     };
 
     let (last, rest) = sequences.split_last()?;
     let [mut literal_state, mut offset_state, mut match_state] =
         last.symbols().map(|symbol| tables.first_state(symbol));
-    add_extra_bits(&mut writer, last);
+    add_extra_bits(&mut writer, last)?;
 
     for sequence in rest.iter().rev() {
         let [literal_symbol, offset_symbol, match_symbol] = sequence.symbols();
         tables.encode(&mut writer, &mut offset_state, offset_symbol);
         tables.encode(&mut writer, &mut match_state, match_symbol);
         tables.encode(&mut writer, &mut literal_state, literal_symbol);
-        add_extra_bits(&mut writer, sequence);
+        add_extra_bits(&mut writer, sequence)?;
     }
 
     let [literal_shape, offset_shape, match_shape] = *shapes;
-    match_shape.finish(&mut writer, match_state);
-    offset_shape.finish(&mut writer, offset_state);
-    literal_shape.finish(&mut writer, literal_state);
+    match_shape.finish(&mut writer, match_state)?;
+    offset_shape.finish(&mut writer, offset_state)?;
+    literal_shape.finish(&mut writer, literal_state)?;
     writer.finish()
 }

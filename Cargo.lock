@@ -2291,6 +2291,7 @@ version = "0.0.0"
 name = "bun_zstd_encoder"
 version = "0.0.0"
 dependencies = [
+ "bun_pod",
  "bun_zstd_decoder",
 ]
 

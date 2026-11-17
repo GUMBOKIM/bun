@@ -1,7 +1,5 @@
 //! Looks for the cheapest way through all matches that there are.
 
-use core::convert::Infallible;
-
 use bun_zstd_decoder::{Result, with_bmi2};
 
 use super::hash::Hasher;
@@ -66,11 +64,14 @@ impl State {
         })
     }
 
-    pub(super) fn reset(&mut self, block_len: usize) -> Result<()> {
-        let len = block_len.min(HORIZON as usize) + 3;
+    pub(super) fn forget(&mut self) {
         self.prices.forget();
+    }
+
+    pub(super) fn reserve(&mut self, block_len: usize) -> Result<()> {
+        let len = block_len.min(HORIZON as usize) + 3;
         vec::clear_for(&mut self.matches, len)?;
-        vec::refill(&mut self.stretches, Stretch::default(), len)
+        vec::grow(&mut self.stretches, Stretch::default(), len)
     }
 }
 
@@ -148,13 +149,14 @@ fn parse<const REACH: Reach, const IS_ACCURATE: bool>(
     let (anchor, next_to_index) = with_bmi2(
         #[inline(always)]
         move || {
-            let (mut anchor, mut finder) = (finder.history.start, finder);
-            finder.parse::<REACH, IS_ACCURATE>(optimal, &mut anchor, sequences, repeats);
+            let mut finder = finder;
+            let anchor = finder.parse::<REACH, IS_ACCURATE>(optimal, sequences, repeats);
             (anchor, finder.tree.next_to_index)
         },
     );
     state.next_to_index = next_to_index;
-    anchor
+    // Which the sequences do not add up to.
+    anchor.unwrap_or(u32::MAX)
 }
 
 struct Finder<'a> {
@@ -332,6 +334,7 @@ impl Finder<'_> {
         Some(())
     }
 
+    /// Returns where the last match ends.
     #[inline(always)]
     fn parse<const REACH: Reach, const IS_ACCURATE: bool>(
         &mut self,
@@ -340,11 +343,14 @@ impl Finder<'_> {
             matches,
             stretches,
         }: &mut State,
-        anchor: &mut u32,
         sequences: &mut Sequences,
         repeats: &mut Repeats,
-    ) -> Option<Infallible> {
-        self.history = self.history.with_prefix_of::<WORD_LEN>()?;
+    ) -> Option<u32> {
+        let mut anchor = self.history.start;
+        let Some(history) = self.history.with_prefix_of::<WORD_LEN>() else {
+            return Some(anchor);
+        };
+        self.history = history;
         let History { prefix, start, .. } = self.history;
         let limit = self.history.end() - WORD;
         let min_match = self.min_match;
@@ -352,7 +358,7 @@ impl Finder<'_> {
         let mut at = start + u32::from(start == 0);
 
         'block: while at < limit {
-            let literal_len = at - *anchor;
+            let literal_len = at - anchor;
             self.find::<REACH>(at, *repeats, literal_len != 0, matches)?;
             let Some(&longest) = matches.last() else {
                 at += 1;
@@ -543,15 +549,15 @@ impl Finder<'_> {
                 .0
                 .get(stored_start as usize..=stored_end as usize)?
             {
-                let start = *anchor + stored.literal_len;
-                let literals = prefix.get(*anchor as usize..start as usize)?;
+                let start = anchor + stored.literal_len;
+                let literals = prefix.get(anchor as usize..start as usize)?;
                 prices.add(literals, stored.offset, stored.match_len);
                 sequences.push(stored.literal_len, stored.offset, stored.match_len);
-                *anchor = start + stored.match_len;
+                anchor = start + stored.match_len;
             }
-            at = *anchor;
+            at = anchor;
             prices.update::<IS_ACCURATE>();
         }
-        None
+        Some(anchor)
     }
 }

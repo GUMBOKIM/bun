@@ -4,7 +4,7 @@ use bun_zstd_decoder::format::{BLOCK_HEADER_LEN, BlockType};
 use bun_zstd_decoder::{Error, Output, Result};
 
 use crate::bytes::is_one_byte_repeated;
-use crate::entropy::{Changes, CodeKind, Entropy, Reuse, looks_random};
+use crate::entropy::{Changes, CodeKind, Entropy, Reuse};
 use crate::parameters::Tuning;
 use crate::sequences::{CodeCounts, Repeats, Sequence};
 use crate::{vec, worst_case_len};
@@ -83,6 +83,10 @@ impl BlockWriter {
         }
     }
 
+    fn can_repeat_byte(&self, bytes: &[u8]) -> bool {
+        !self.is_at_start && is_one_byte_repeated(bytes)
+    }
+
     /// As one block.
     pub(crate) fn write(
         &mut self,
@@ -92,21 +96,16 @@ impl BlockWriter {
         out: &mut Output<'_>,
     ) -> Result<()> {
         const REPEATED_LEN_MAX: usize = 25;
-        let compressed = if content.sequences.is_empty() && looks_random(content.literals) {
-            None
-        } else {
-            let (start, rest) = room_for_block(out, worst_case_len(content.bytes.len()))?;
-            let compressed = self.entropy.compress(content, tuning, rest)?;
-            compressed.inspect(|&(len, _)| *start = header(BlockType::Compressed, len, is_last))
-        };
-        match compressed {
-            _ if !self.is_at_start
-                && compressed.is_none_or(|(len, _)| len < REPEATED_LEN_MAX)
-                && is_one_byte_repeated(content.bytes) =>
+        let (start, rest) = room_for_block(out, worst_case_len(content.bytes.len()))?;
+        match self.entropy.compress(content, tuning, rest)? {
+            compressed
+                if compressed.is_none_or(|(len, _)| len < REPEATED_LEN_MAX)
+                    && self.can_repeat_byte(content.bytes) =>
             {
                 write_repeated(content.bytes, is_last, out)?;
             }
             Some((len, changes)) => {
+                *start = header(BlockType::Compressed, len, is_last);
                 out.commit(BLOCK_HEADER_LEN + len);
                 self.accept(changes, content.repeats);
             }

@@ -129,7 +129,7 @@ impl Candidates {
         search: &Search<'_>,
         sequences: &mut Sequences,
         repeats: &mut Repeats,
-    ) {
+    ) -> u32 {
         let history = &search.history;
         let end = history.end();
         if state.tuning.strategy >= Strategy::Optimal {
@@ -138,9 +138,9 @@ impl Candidates {
                 long_matches,
                 ..*search
             };
-            state.search(&search, sequences, repeats);
+            let anchor = state.search(&search, sequences, repeats);
             self.skip(history.block().len(), state);
-            return;
+            return anchor;
         }
 
         let part = |start, end| Search {
@@ -160,7 +160,7 @@ impl Candidates {
             at = start + candidate.match_len;
         }
         state.index_up_to(history, at);
-        state.search(&part(at, end), sequences, repeats);
+        state.search(&part(at, end), sequences, repeats)
     }
 }
 
@@ -220,12 +220,6 @@ impl<'a> Cursor<'a> {
 }
 
 #[derive(Clone, Copy, Default)]
-struct Entry {
-    index: u32,
-    checksum: u32,
-}
-
-#[derive(Clone, Copy, Default)]
 struct Split {
     start: u32,
     bucket: usize,
@@ -276,7 +270,8 @@ pub(crate) struct Finder {
     parameters: LongDistance,
     window_log: u32,
     window: Window,
-    entries: Vec<Entry>,
+    /// Indices and checksums.
+    entries: Vec<[u32; 2]>,
     /// For each bucket of entries, which one is replaced next.
     oldest: Vec<u8>,
 }
@@ -287,8 +282,8 @@ impl Finder {
             parameters,
             window_log,
             window: Window::starting_at(FIRST_INDEX),
-            entries: vec::filled(Entry::default(), 1 << parameters.hash_log)?,
-            oldest: vec::filled(0, 1 << (parameters.hash_log - parameters.bucket_log))?,
+            entries: vec::zeroed(1 << parameters.hash_log)?,
+            oldest: vec::zeroed(1 << (parameters.hash_log - parameters.bucket_log))?,
         })
     }
 
@@ -299,8 +294,8 @@ impl Finder {
     fn make_room_for(&mut self, len: usize) {
         if self.window.would_overflow(len) {
             let by = self.window.lower_indices(0, self.window_log);
-            for entry in &mut self.entries {
-                entry.index = entry.index.saturating_sub(by);
+            for [index, _] in &mut self.entries {
+                *index = index.saturating_sub(by);
             }
         }
     }
@@ -347,7 +342,7 @@ impl Finder {
         Ok(())
     }
 
-    fn insert(&mut self, bucket: usize, entry: Entry) {
+    fn insert(&mut self, bucket: usize, entry: [u32; 2]) {
         let bucket_log = self.parameters.bucket_log;
         if let Some(oldest) = self.oldest.get_mut(bucket)
             && let Some(slot) = self
@@ -371,23 +366,23 @@ impl Finder {
         let bucket = split.bucket << bucket_log..(split.bucket + 1) << bucket_log;
         let mut best = None;
         let mut best_len = 0;
-        for entry in self.entries.get(bucket)? {
-            if entry.checksum != split.checksum || entry.index <= lowest {
+        for &[index, checksum] in self.entries.get(bucket)? {
+            if checksum != split.checksum || index <= lowest {
                 continue;
             }
-            let after = history.match_len_at_index(split.start, entry.index, 0);
+            let after = history.match_len_at_index(split.start, index, 0);
             if after < self.parameters.min_match {
                 continue;
             }
-            let max = (split.start - anchor).min(entry.index - lowest);
-            let mut before = history.match_len_before_index(split.start, entry.index, max);
-            if entry.index - before == history.prefix_index {
+            let max = (split.start - anchor).min(index - lowest);
+            let mut before = history.match_len_before_index(split.start, index, max);
+            if index - before == history.prefix_index {
                 let unmatched = anchor as usize..(split.start - before) as usize;
                 before += common_suffix(history.prefix.get(unmatched)?, history.older) as u32;
             }
             if before + after > best_len {
                 best_len = before + after;
-                best = Some((entry.index, before, after));
+                best = Some((index, before, after));
             }
         }
         best
@@ -428,8 +423,7 @@ impl Finder {
                 let found = (split.start >= anchor)
                     .then(|| self.best_match(history, lowest, anchor, split))
                     .flatten();
-                let checksum = split.checksum;
-                self.insert(split.bucket, Entry { index, checksum });
+                self.insert(split.bucket, [index, split.checksum]);
                 let Some((earlier, before, after)) = found else {
                     continue;
                 };

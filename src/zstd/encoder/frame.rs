@@ -7,8 +7,9 @@ use bun_zstd_decoder::{Error, Output, Result, XxHash64};
 
 use crate::block::{self, BlockWriter, Content, append};
 use crate::dictionary::Dictionary;
+use crate::entropy::looks_random;
 use crate::matches::long_distance::{self, Candidates};
-use crate::matches::{MatchState, Owner, Search};
+use crate::matches::{MatchState, Owner, Search, Usage};
 use crate::parameters::{Plan, Purpose};
 use crate::sequences::{Repeats, Sequences};
 use crate::window::{Input, WORD_LEN};
@@ -108,10 +109,15 @@ impl FrameWriter {
         self.stage = Stage::BeforeHeader;
         self.dictionary_id = dictionary.map_or(0, |it| it.id);
         self.is_dictionary_attached = false;
-        self.state
-            .reset(tuning, plan.uses_rows, Owner::Frame, self.block_len_max)?;
-        self.sequences
-            .clear_for(self.block_len_max, tuning.min_match)?;
+        let usage = Usage {
+            owner: Owner::Frame,
+            preceding_len: match start {
+                Start::Frame(_) => 0,
+                Start::Part(earlier) => earlier.len(),
+            },
+            may_be_short: input_len.is_none(),
+        };
+        self.state.reset(tuning, plan.uses_rows, &usage)?;
         self.blocks.is_at_start = true;
         self.long_finder = None;
         self.long_matches.clear();
@@ -295,12 +301,17 @@ impl FrameWriter {
             return block::write_raw(bytes, is_last, out);
         }
 
-        let repeats = self.find_sequences(input, dictionary, start, len)?;
+        let (matched_len, repeats) = self.find_sequences(input, dictionary, start, len)?;
+        if matched_len == 0 && self.plan.target_block_len == 0 && looks_random(bytes) {
+            self.blocks.distrust_offset_table();
+            return block::write_raw(bytes, is_last, out);
+        }
+        self.sequences.finish(bytes, matched_len)?;
         let (blocks, tuning) = (&mut self.blocks, &self.plan.tuning);
         let content = Content {
             bytes,
             sequences: &self.sequences.list,
-            literals: self.sequences.literals(bytes),
+            literals: self.sequences.literals(),
             counts: &self.sequences.counts,
             repeats,
         };
@@ -315,14 +326,14 @@ impl FrameWriter {
         }
     }
 
-    /// Returns the recent offsets after them.
+    /// Returns how far they go, and the recent offsets after them.
     fn find_sequences(
         &mut self,
         input: &Input<'_>,
         dictionary: Option<&Dictionary>,
         start: usize,
         len: usize,
-    ) -> Result<Repeats> {
+    ) -> Result<(u32, Repeats)> {
         let state = &mut self.state;
         state.skip_indexing(state.window.next, 384);
         let mut search = Search {
@@ -340,19 +351,19 @@ impl FrameWriter {
         }
 
         let (sequences, mut repeats) = (&mut self.sequences, self.blocks.repeats);
-        sequences.list.clear();
+        sequences.clear_for(len, state.tuning.min_match)?;
+        state.reserve(len)?;
         if let Some(finder) = &mut self.long_finder {
             self.long_matches.clear();
             finder.find(input, start, len, &mut self.long_matches)?;
         }
-        if self.long_finder.is_some() || !self.long_matches.are_used_up() {
+        let end = if self.long_finder.is_some() || !self.long_matches.are_used_up() {
             self.long_matches
-                .search(state, &search, sequences, &mut repeats);
+                .search(state, &search, sequences, &mut repeats)
         } else {
-            state.search(&search, sequences, &mut repeats);
-        }
-        sequences.finish(search.history.block())?;
+            state.search(&search, sequences, &mut repeats)
+        };
         state.window.next += len as u32;
-        Ok(repeats)
+        Ok((end.wrapping_sub(search.history.start), repeats))
     }
 }

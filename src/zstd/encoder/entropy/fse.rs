@@ -278,9 +278,9 @@ impl Shape {
     };
 
     #[inline(always)]
-    pub(super) fn finish(self, writer: &mut BitWriter<'_>, state: u32) {
+    pub(super) fn finish(self, writer: &mut BitWriter<'_>, state: u32) -> Option<()> {
         writer.add(state, self.log);
-        writer.flush();
+        writer.flush()
     }
 }
 
@@ -488,6 +488,7 @@ impl<const ALL_STATES: usize, const ALL_SYMBOLS: usize> Tables<ALL_STATES, ALL_S
     }
 
     /// With two states that take turns. `None` if there is nothing to gain, or no room.
+    #[inline(always)]
     pub(super) fn compress(&self, shape: Shape, symbols: &[u8], out: &mut [u8]) -> Option<usize> {
         let &[ref rest @ .., before_last, last] = symbols else {
             return None;
@@ -505,10 +506,10 @@ impl<const ALL_STATES: usize, const ALL_SYMBOLS: usize> Tables<ALL_STATES, ALL_S
         for &[first, second] in pairs.iter().rev() {
             self.encode(&mut writer, &mut due, second);
             self.encode(&mut writer, &mut other, first);
-            writer.flush();
+            writer.flush()?;
         }
-        shape.finish(&mut writer, due);
-        shape.finish(&mut writer, other);
+        shape.finish(&mut writer, due)?;
+        shape.finish(&mut writer, other)?;
         writer.finish()
     }
 }

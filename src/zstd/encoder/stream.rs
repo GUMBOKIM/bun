@@ -5,9 +5,10 @@ use bun_zstd_decoder::{Error, Output, Result, Status};
 use crate::dictionary::Dictionary;
 use crate::frame::{FrameWriter, Start};
 use crate::parameters::{DEFAULT_LEVEL, JOB_LEN_MIN, Plan, Purpose, Request};
+use crate::vec::{self, Shared};
 use crate::window::Input;
-use crate::workers::{Shared, Workers};
-use crate::{vec, worst_case_len};
+use crate::workers::{Pool, Workers};
+use crate::worst_case_len;
 
 /// The values are those of `ZSTD_EndDirective`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,10 +43,8 @@ impl Backlog {
         room: usize,
         write: impl FnOnce(&mut Output<'_>) -> Result<()>,
     ) -> Result<()> {
-        if self.bytes.is_empty() {
-            self.bytes = vec::filled(0, room)?;
-        }
-        let mut out = Output::slice(&mut self.bytes);
+        vec::grow(&mut self.bytes, 0, room)?;
+        let mut out = Output::slice(self.bytes.get_mut(..room).unwrap_or_default());
         write(&mut out)?;
         self.left = 0..out.written();
         Ok(())
@@ -78,21 +77,38 @@ struct Buffered {
 }
 
 impl Buffered {
-    fn new(plan: Plan, input_len: Option<u64>, dictionary: Option<&Dictionary>) -> Result<Self> {
-        let writer = FrameWriter::new(plan, input_len, Start::Frame(dictionary))?;
-        let block_len = writer.block_len_max();
-        Ok(Self {
-            buffer: Vec::new(),
-            capacity: writer.window_len() + block_len,
-            older: Older::InDictionary,
-            start: 0,
-            filled: 0,
-            // If that is all, the end of the frame does not need a block of its own.
-            target: block_len + usize::from(input_len == Some(block_len as u64)),
-            backlog: Backlog::default(),
-            has_ended: false,
-            writer,
-        })
+    /// With the memory of the frame before, if there was one.
+    fn new(
+        plan: Plan,
+        input_len: Option<u64>,
+        dictionary: Option<&Dictionary>,
+        earlier: Option<Box<Self>>,
+    ) -> Result<Box<Self>> {
+        let start = Start::Frame(dictionary);
+        let mut frame = match earlier {
+            Some(mut frame) => {
+                frame.writer.restart(plan, input_len, start)?;
+                frame
+            }
+            None => vec::boxed(Self {
+                writer: FrameWriter::new(plan, input_len, start)?,
+                buffer: Vec::new(),
+                capacity: 0,
+                older: Older::InDictionary,
+                start: 0,
+                filled: 0,
+                target: 0,
+                backlog: Backlog::default(),
+                has_ended: false,
+            })?,
+        };
+        let block_len = frame.writer.block_len_max();
+        frame.capacity = frame.writer.window_len() + block_len;
+        (frame.older, frame.start, frame.filled) = (Older::InDictionary, 0, 0);
+        // If that is all, the end of the frame does not need a block of its own.
+        frame.target = block_len + usize::from(input_len == Some(block_len as u64));
+        frame.has_ended = false;
+        Ok(frame)
     }
 
     /// What is left of the older segment, if the buffer is overwritten up to `overwritten`.
@@ -110,10 +126,16 @@ impl Buffered {
     }
 
     fn fill(&mut self, input: &mut &[u8]) -> Result<()> {
-        if self.buffer.capacity() == 0 {
-            vec::clear_for(&mut self.buffer, self.capacity)?;
-        }
+        const SHORT_LEN: usize = 16 << 10;
         let len = input.len().min(self.target - self.filled);
+        if self.filled + len > self.buffer.capacity() {
+            let is_short = self.filled + len <= SHORT_LEN;
+            let capacity = self
+                .capacity
+                .min(if is_short { SHORT_LEN } else { usize::MAX });
+            self.buffer
+                .try_reserve_exact(capacity - self.buffer.len())?;
+        }
         let mut taken = input.split_off(..len).unwrap_or_default();
         let used = self.buffer.get_mut(self.filled..).unwrap_or_default();
         let overwritten = taken.split_off(..len.min(used.len())).unwrap_or_default();
@@ -207,10 +229,12 @@ pub struct Encoder {
     request: Request,
     /// Of the next frame.
     pledged_len: Option<u64>,
-    /// Until the first frame starts, when the parameters are known.
-    dictionary_bytes: Vec<u8>,
+    dictionary_bytes: Option<Shared<Vec<u8>>>,
+    /// From when the first frame starts, as the parameters are known then.
     dictionary: Option<Shared<Dictionary>>,
     frame: Option<Frame>,
+    finished: Option<Box<Buffered>>,
+    pool: Pool,
     error: Option<Error>,
 }
 
@@ -219,9 +243,11 @@ impl Encoder {
         Self {
             request: Request::new(DEFAULT_LEVEL),
             pledged_len: None,
-            dictionary_bytes: Vec::new(),
+            dictionary_bytes: None,
             dictionary: None,
             frame: None,
+            finished: None,
+            pool: Pool::default(),
             error: None,
         }
     }
@@ -237,8 +263,10 @@ impl Encoder {
     /// For all frames from the next one on.
     pub fn load_dictionary(&mut self, dictionary: &[u8]) -> Result<()> {
         self.ensure_idle()?;
-        self.dictionary = None;
-        self.dictionary_bytes = vec::copied(dictionary)?;
+        (self.dictionary, self.dictionary_bytes) = (None, None);
+        if !dictionary.is_empty() {
+            self.dictionary_bytes = Some(vec::shared(vec::copied(dictionary)?)?);
+        }
         Ok(())
     }
 
@@ -261,10 +289,8 @@ impl Encoder {
     }
 
     fn start_frame(&mut self, input_len: Option<u64>) -> Result<Frame> {
-        if !self.dictionary_bytes.is_empty() {
-            let dictionary = Dictionary::new(&mut self.dictionary_bytes, &self.request)?;
-            let dictionary = Shared::try_new(dictionary).map_err(|_| Error::MemoryAllocation)?;
-            self.dictionary = Some(dictionary);
+        if let (Some(bytes), None) = (&self.dictionary_bytes, &self.dictionary) {
+            self.dictionary = Some(vec::shared(Dictionary::new(bytes, &self.request)?)?);
         }
         let dictionary = self.dictionary.as_deref();
         let copied = dictionary.filter(|it| !it.is_attached_for(input_len));
@@ -278,8 +304,7 @@ impl Encoder {
             let workers = Workers::new(plan, &self.request, input_len, self.dictionary.as_ref())?;
             return Ok(Frame::Parallel(vec::boxed(workers)?));
         }
-        let buffered = Buffered::new(plan, input_len, dictionary)?;
-        Ok(Frame::Buffered(vec::boxed(buffered)?))
+        Buffered::new(plan, input_len, dictionary, self.finished.take()).map(Frame::Buffered)
     }
 
     fn try_step(
@@ -305,12 +330,15 @@ impl Encoder {
                 (status, frame.has_ended)
             }
             Frame::Parallel(frame) => (
-                frame.step(input, out, directive)?,
+                frame.step(&mut self.pool, input, out, directive)?,
                 directive == EndDirective::End,
             ),
         };
-        if has_ended && status == Status::Complete {
-            self.frame = None;
+        if has_ended
+            && status == Status::Complete
+            && let Some(Frame::Buffered(frame)) = self.frame.take()
+        {
+            self.finished = Some(frame);
         }
         Ok(status)
     }

@@ -45,6 +45,7 @@ pub(crate) fn add<const N: usize>(counts: &mut [u32; N], symbols: &[u8]) {
 }
 
 /// With four tables, a symbol that repeats does not wait for its last count to be stored.
+#[inline(never)]
 fn count_interleaved<const N: usize>(symbols: &[u8]) -> [u32; N] {
     let mut tables = [[0u32; N]; 4];
     let (words, rest) = symbols.as_chunks();

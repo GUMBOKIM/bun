@@ -1,10 +1,10 @@
-use crate::bytes::chunk_at_mut;
+use crate::bytes::{chunk_at_mut, likely};
 
 const WORD_LEN: usize = 8;
 
-/// Takes a word at a time, of which some bytes count. Running out of room shows at the end.
+/// Takes a word at a time, of which some bytes count. `None` means that there is no room.
 pub(super) struct WordWriter<'a> {
-    /// The compiler sees its length as `last + WORD_LEN`, and that it need not check it.
+    /// The compiler sees its length as `last + WORD_LEN`, and compares the position with `last`.
     out: &'a mut [u8],
     last: u32,
     position: u32,
@@ -22,15 +22,13 @@ impl<'a> WordWriter<'a> {
     }
 
     #[inline(always)]
-    pub(super) fn put(&mut self, word: u64, len: u32) {
-        let position = self.position.min(self.last);
-        if let Some(bytes) = chunk_at_mut(self.out, position) {
-            *bytes = word.to_le_bytes();
-        }
-        self.position = position + len;
+    pub(super) fn put(&mut self, word: u64, len: u32) -> Option<()> {
+        *likely(chunk_at_mut(self.out, self.position))? = word.to_le_bytes();
+        self.position += len;
+        Some(())
     }
 
-    /// The length of what was written, if there was room for it.
+    /// The length of what was written.
     #[inline(always)]
     pub(super) fn finish(self, has_partial_byte: bool) -> Option<usize> {
         (self.position < self.last).then(|| self.position as usize + usize::from(has_partial_byte))
@@ -69,17 +67,18 @@ impl<'a> BitWriter<'a> {
 
     /// Leaves at most 7 bits pending.
     #[inline(always)]
-    pub(super) fn flush(&mut self) {
-        self.words.put(self.bits, self.count / 8);
+    pub(super) fn flush(&mut self) -> Option<()> {
+        self.words.put(self.bits, self.count / 8)?;
         self.bits = self.bits.wrapping_shr(self.count & !7);
         self.count %= 8;
+        Some(())
     }
 
-    /// The length of the stream, if there was room for it.
+    /// The length of the stream.
     #[inline(always)]
     pub(super) fn finish(mut self) -> Option<usize> {
         self.add(1, 1);
-        self.flush();
+        self.flush()?;
         self.words.finish(self.count > 0)
     }
 }
